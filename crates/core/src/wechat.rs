@@ -94,7 +94,6 @@ fn build_account(account_dir: &Path) -> Result<WechatAccount> {
     let image_dat_count = attach_dir
         .as_deref()
         .map(count_image_dat_files)
-        .transpose()?
         .unwrap_or(0);
 
     Ok(WechatAccount {
@@ -108,10 +107,12 @@ fn build_account(account_dir: &Path) -> Result<WechatAccount> {
     })
 }
 
-fn count_image_dat_files(attach_dir: &Path) -> Result<u64> {
+fn count_image_dat_files(attach_dir: &Path) -> u64 {
     let mut count = 0u64;
     for entry in WalkDir::new(attach_dir).follow_links(false) {
-        let entry = entry?;
+        let Ok(entry) = entry else {
+            continue;
+        };
         if !entry.file_type().is_file() || !is_dat_file(entry.path()) {
             continue;
         }
@@ -126,7 +127,7 @@ fn count_image_dat_files(attach_dir: &Path) -> Result<u64> {
             count += 1;
         }
     }
-    Ok(count)
+    count
 }
 
 fn canonical_existing_dir(path: &Path) -> Result<PathBuf> {

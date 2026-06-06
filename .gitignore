@@ -2,3 +2,5 @@
 references/external/
 target/
 .DS_Store
+wechat-image-keys.local.md
+wechat-image-samples.local/
