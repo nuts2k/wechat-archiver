@@ -1,2 +1,4 @@
 .codegraph/
 references/external/
+target/
+.DS_Store

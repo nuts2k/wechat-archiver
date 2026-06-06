@@ -1,0 +1,20 @@
+mod archive;
+mod config;
+mod error;
+mod hash;
+mod image;
+mod index;
+mod manifest;
+mod scanner;
+mod status;
+mod types;
+mod verify;
+mod wechat;
+
+pub use config::{ArchiveConfig, DatDecodeOptions, ResolvedConfig};
+pub use error::{ArchiverError, Result};
+pub use scanner::extract_images;
+pub use status::{archive_status, ArchiveStatus};
+pub use types::{ExtractSummary, ManifestEvent, ScanAction};
+pub use verify::{verify_archive, VerifySummary};
+pub use wechat::{discover_wechat, DiscoverOptions, WechatAccount, WechatDiscovery};
