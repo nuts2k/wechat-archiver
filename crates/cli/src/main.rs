@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use wechat_archiver_core::{
-    archive_status, discover_wechat, extract_images, verify_archive, ArchiveConfig, ArchiveStatus,
-    DatDecodeOptions, DiscoverOptions, ExtractSummary, VerifySummary, WechatDiscovery,
+    archive_status, discover_wechat, extract_images, extract_message_db_images, verify_archive,
+    ArchiveConfig, ArchiveStatus, DatDecodeOptions, DiscoverOptions, ExtractSummary,
+    MessageDbExtractConfig, VerifySummary, WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -78,6 +79,33 @@ enum Commands {
         json: bool,
     },
 
+    /// 从已解密/普通 SQLite 微信消息库枚举图片消息并归档。
+    ExtractDbImages {
+        /// 单个微信账号目录，通常是 xwechat_files/<wxid>。
+        #[arg(long)]
+        account: PathBuf,
+
+        /// 独立归档目录，不能位于 account 内部，也不能包含 account。
+        #[arg(long)]
+        archive: PathBuf,
+
+        /// 只读枚举和解码，不写入 archive。
+        #[arg(long)]
+        dry_run: bool,
+
+        /// V2 图片 .dat AES key，显式提供才会尝试解码 V2。
+        #[arg(long)]
+        image_aes_key: Option<String>,
+
+        /// V1/V2 图片 .dat 尾段 XOR key，默认 0x88。
+        #[arg(long, default_value = "0x88")]
+        image_xor_key: String,
+
+        /// 输出 JSON。
+        #[arg(long)]
+        json: bool,
+    },
+
     /// 查看归档索引统计。
     Status {
         /// 独立归档目录。
@@ -134,6 +162,22 @@ fn main() -> Result<()> {
         } => {
             let summary = extract_images(ArchiveConfig {
                 source_dir: source,
+                archive_dir: archive,
+                dry_run,
+                dat_options: parse_dat_options(image_aes_key, &image_xor_key)?,
+            })?;
+            print_extract_summary(&summary, json)?;
+        }
+        Commands::ExtractDbImages {
+            account,
+            archive,
+            dry_run,
+            image_aes_key,
+            image_xor_key,
+            json,
+        } => {
+            let summary = extract_message_db_images(MessageDbExtractConfig {
+                account_dir: account,
                 archive_dir: archive,
                 dry_run,
                 dat_options: parse_dat_options(image_aes_key, &image_xor_key)?,

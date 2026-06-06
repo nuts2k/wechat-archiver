@@ -45,7 +45,7 @@ Rust core library
 
 ```text
 macOS 微信本地数据
-  -> 解密/读取消息库
+  -> 读取已解密/普通 SQLite 消息库
   -> 枚举图片、视频、语音、文件消息
   -> 定位原始媒体或解密 .dat
   -> 计算 sha256 / 感知 hash / 元数据
@@ -126,24 +126,35 @@ wechat-archive/
 
 目标是先安全跑通最常见、最占空间的一类媒体。
 
-功能：
+当前已实现：
 
 - 建立 Rust workspace、核心库和 CLI 入口。
 - 将扫描、归档、索引、校验逻辑放在可被 Tauri 复用的核心库中。
-- 读取 macOS 微信本地数据库。
-- 枚举图片类消息。
-- 定位图片原文件或解密 `.dat` 文件。
+- 只读发现 macOS 微信 4.x 常见账号目录。
+- 只读递归扫描普通图片和 `.dat` 图片源目录。
+- 只读读取已解密/普通 SQLite 消息库：`message_*.db` 和 `message_resource.db`。
+- 基于 `ChatName2Id`、`MessageResourceInfo`、`Msg_<md5(talker)>` 枚举图片类消息。
+- 定位 `msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5>.dat`，并兼容 `_h`、`_W`、`_w`、`_t` 变体。
+- 支持普通图片、旧 XOR `.dat`、V1 AES `.dat`，V2 AES `.dat` 仅在用户显式提供 key 时解码。
 - 计算 `sha256`。
 - 复制到归档目录。
 - 写入 SQLite 索引。
-- 支持增量扫描。
 - 支持校验归档文件完整性。
+- 对未知 `.dat` 记录 `unsupported`，对消息库中存在但本地 `.dat` 缺失的资源记录 `failed`。
+
+当前边界：
+
+- 不自动解密 SQLCipher 微信数据库。
+- 不提取微信进程密钥、不重签微信、不提升权限。
+- 不写入、不删除、不覆盖任何微信源目录文件。
+- 当前只覆盖图片；视频、文件、语音仍在第 2 阶段。
 
 建议命令：
 
 ```bash
 wechat-archiver scan
 wechat-archiver extract-images
+wechat-archiver extract-db-images
 wechat-archiver status
 wechat-archiver verify
 ```

@@ -78,7 +78,7 @@ pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
     Ok(summary)
 }
 
-fn apply_result(summary: &mut ExtractSummary, result: Result<ScanAction>) -> Result<()> {
+pub(crate) fn apply_result(summary: &mut ExtractSummary, result: Result<ScanAction>) -> Result<()> {
     match result? {
         ScanAction::Archived => summary.archived += 1,
         ScanAction::AlreadyArchived => summary.already_archived += 1,
@@ -137,7 +137,7 @@ fn process_direct_image(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_dat_image(
+pub(crate) fn process_dat_image(
     path: &Path,
     source_root: &Path,
     archive_root: &Path,
@@ -243,7 +243,7 @@ fn build_event(
     }
 }
 
-fn persist(
+pub(crate) fn persist(
     conn: Option<&Connection>,
     manifest: Option<&mut ManifestWriter>,
     event: &ManifestEvent,

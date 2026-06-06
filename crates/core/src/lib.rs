@@ -5,6 +5,7 @@ mod hash;
 mod image;
 mod index;
 mod manifest;
+mod message_db;
 mod scanner;
 mod status;
 mod types;
@@ -13,6 +14,7 @@ mod wechat;
 
 pub use config::{ArchiveConfig, DatDecodeOptions, ResolvedConfig};
 pub use error::{ArchiverError, Result};
+pub use message_db::{extract_message_db_images, MessageDbExtractConfig};
 pub use scanner::extract_images;
 pub use status::{archive_status, ArchiveStatus};
 pub use types::{ExtractSummary, ManifestEvent, ScanAction};
