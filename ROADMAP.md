@@ -247,11 +247,10 @@ wechat-archiver extract --type voice
 - `extract-db-files` 当前从消息库枚举文件附件，定位 `msg/file/<YYYY-MM>/<file_name>`，并记录消息来源字段。
 - `extract-db-voices` 当前从消息库枚举 `local_type=34` 语音消息，读取 `media_*.db/VoiceInfo.voice_data` 原始 BLOB，并记录消息来源字段。
 - `voice` 入口当前扫描直接语音/音频文件；对微信账号目录或 `msg/attach` 只在存在 `msg/voice` 或 `msg/audio` 专用目录时扫描，避免把 `msg/file` 中的音乐附件误归为语音消息。
-- 多类型组合当前暂未执行，避免一个 CLI 命令生成多个 run 和多份 summary；后续应先设计聚合 summary。
+- `extract --type image,video,file,voice` 支持多类型顺序执行，并输出聚合 summary 和各类型子 summary。
 
 计划：
 
-- 将 `extract --type image,video,file,voice` 扩展为可聚合的多媒体归档入口。
 - 视频归档增强：提取时长和分辨率。
 - 文件归档增强：解析更完整的 appmsg 元数据，补充大小、发送人等上下文。
 - 语音归档增强：在已支持原始 BLOB 归档的基础上，补充时长、发送人，再支持可选转换为 `wav` 或 `mp3`。
@@ -264,6 +263,7 @@ wechat-archiver extract --type voice
 - 图片、视频、文件、语音可以进入同一套 archive/index/manifest。
 - dry-run 可准确估算候选数量、可归档数量和失败原因。
 - 非 dry-run 不写微信源目录，只写独立 archive。
+- 多类型聚合 summary 可以保留每个子任务的 run_id、manifest 和 index 路径，便于未来 Tauri 展示。
 
 ### P2：索引增强与可浏览视图
 
@@ -358,6 +358,6 @@ wechat-archiver extract --type voice
 建议继续推进 P1 到 P2 的衔接：
 
 - 先为 `extract-db-voices` 补充真实已解密样本 dry-run 回归，确认 `VoiceInfo` 分片和 `local_id/create_time` 匹配策略。
-- 然后做多类型聚合 summary，让 `extract --type image,video,file,voice` 可以一次运行并输出统一结果。
 - 语音后续增强重点是时长、发送人和可选转码/转写，而不是继续扩大直接文件扫描范围。
+- 然后进入 P2 索引增强，优先做 schema 版本和按 hash/source 反查能力。
 - 所有路线都应继续保持 dry-run、结构化错误、manifest/index 和安全边界一致。

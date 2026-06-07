@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
     archive_status, count_message_db_media, derive_image_key, discover_wechat, extract_files,
@@ -112,7 +113,7 @@ enum Commands {
 
     /// 统一媒体抽取入口；当前已接入 image、video、file、voice。
     Extract {
-        /// 媒体类型，支持逗号分隔；当前每次只执行一种类型。
+        /// 媒体类型，支持逗号分隔；多类型会按给定顺序逐个运行并输出聚合结果。
         #[arg(long = "type", value_enum, value_delimiter = ',', required = true)]
         media_types: Vec<MediaType>,
 
@@ -382,8 +383,13 @@ fn main() -> Result<()> {
         Commands::Extract { media_types, args } => {
             ensure_supported_extract_types(&media_types)?;
             let json = args.json;
-            let summary = run_extract(media_types[0], args)?;
-            print_extract_summary(&summary, json)?;
+            if media_types.len() == 1 {
+                let summary = run_extract(media_types[0], args)?;
+                print_extract_summary(&summary, json)?;
+            } else {
+                let summary = run_extract_many(&media_types, args)?;
+                print_aggregate_extract_summary(&summary, json)?;
+            }
         }
         Commands::ExtractImages { args } => {
             let json = args.json;
@@ -485,14 +491,8 @@ fn main() -> Result<()> {
 
 fn ensure_supported_extract_types(media_types: &[MediaType]) -> Result<()> {
     anyhow::ensure!(
-        media_types.len() == 1,
-        "extract --type currently accepts one media type per run; got: {}",
-        media_types
-            .iter()
-            .copied()
-            .map(media_type_name)
-            .collect::<Vec<_>>()
-            .join(",")
+        !media_types.is_empty(),
+        "extract --type requires at least one media type"
     );
     let unsupported = media_types
         .iter()
@@ -535,6 +535,31 @@ fn run_extract(media_type: MediaType, args: ImageExtractArgs) -> Result<ExtractS
     }
 }
 
+fn run_extract_many(
+    media_types: &[MediaType],
+    args: ImageExtractArgs,
+) -> Result<AggregateExtractSummary> {
+    let source_dir = args.source.clone();
+    let archive_dir = args.archive.clone();
+    let dry_run = args.dry_run;
+    let mut items = Vec::new();
+
+    for media_type in media_types {
+        let summary = run_extract(*media_type, args.clone())?;
+        items.push(MediaTypeExtractSummary {
+            media_type: media_type_name(*media_type).to_string(),
+            summary,
+        });
+    }
+
+    Ok(AggregateExtractSummary::new(
+        source_dir,
+        archive_dir,
+        dry_run,
+        items,
+    ))
+}
+
 fn image_archive_config_from_args(args: ImageExtractArgs) -> Result<ArchiveConfig> {
     Ok(ArchiveConfig {
         source_dir: args.source,
@@ -548,6 +573,73 @@ fn image_archive_config_from_args(args: ImageExtractArgs) -> Result<ArchiveConfi
         )?,
         explain_unsupported: false,
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AggregateExtractSummary {
+    source_dir: PathBuf,
+    archive_dir: PathBuf,
+    dry_run: bool,
+    media_types: Vec<String>,
+    scanned_files: u64,
+    candidates: u64,
+    would_archive: u64,
+    archived: u64,
+    already_archived: u64,
+    unsupported: u64,
+    failed: u64,
+    summaries: Vec<MediaTypeExtractSummary>,
+}
+
+impl AggregateExtractSummary {
+    fn new(
+        source_dir: PathBuf,
+        archive_dir: PathBuf,
+        dry_run: bool,
+        summaries: Vec<MediaTypeExtractSummary>,
+    ) -> Self {
+        Self {
+            source_dir,
+            archive_dir,
+            dry_run,
+            media_types: summaries
+                .iter()
+                .map(|summary| summary.media_type.clone())
+                .collect(),
+            scanned_files: summaries
+                .iter()
+                .map(|summary| summary.summary.scanned_files)
+                .sum(),
+            candidates: summaries
+                .iter()
+                .map(|summary| summary.summary.candidates)
+                .sum(),
+            would_archive: summaries
+                .iter()
+                .map(|summary| summary.summary.would_archive)
+                .sum(),
+            archived: summaries
+                .iter()
+                .map(|summary| summary.summary.archived)
+                .sum(),
+            already_archived: summaries
+                .iter()
+                .map(|summary| summary.summary.already_archived)
+                .sum(),
+            unsupported: summaries
+                .iter()
+                .map(|summary| summary.summary.unsupported)
+                .sum(),
+            failed: summaries.iter().map(|summary| summary.summary.failed).sum(),
+            summaries,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MediaTypeExtractSummary {
+    media_type: String,
+    summary: ExtractSummary,
 }
 
 fn direct_media_archive_config_from_args(args: ImageExtractArgs) -> ArchiveConfig {
@@ -697,6 +789,44 @@ fn print_extract_summary(summary: &ExtractSummary, json: bool) -> Result<()> {
     }
     if let Some(path) = &summary.manifest_path {
         println!("manifest: {}", path.display());
+    }
+    Ok(())
+}
+
+fn print_aggregate_extract_summary(summary: &AggregateExtractSummary, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(summary)?);
+        return Ok(());
+    }
+
+    println!("source: {}", summary.source_dir.display());
+    println!("archive: {}", summary.archive_dir.display());
+    println!("dry_run: {}", summary.dry_run);
+    println!("media_types: {}", summary.media_types.join(","));
+    println!("scanned_files: {}", summary.scanned_files);
+    println!("candidates: {}", summary.candidates);
+    println!("would_archive: {}", summary.would_archive);
+    println!("archived: {}", summary.archived);
+    println!("already_archived: {}", summary.already_archived);
+    println!("unsupported: {}", summary.unsupported);
+    println!("failed: {}", summary.failed);
+    println!("summaries:");
+    for item in &summary.summaries {
+        println!("  media_type: {}", item.media_type);
+        println!("    run_id: {}", item.summary.run_id);
+        println!("    scanned_files: {}", item.summary.scanned_files);
+        println!("    candidates: {}", item.summary.candidates);
+        println!("    would_archive: {}", item.summary.would_archive);
+        println!("    archived: {}", item.summary.archived);
+        println!("    already_archived: {}", item.summary.already_archived);
+        println!("    unsupported: {}", item.summary.unsupported);
+        println!("    failed: {}", item.summary.failed);
+        if let Some(path) = &item.summary.index_path {
+            println!("    index: {}", path.display());
+        }
+        if let Some(path) = &item.summary.manifest_path {
+            println!("    manifest: {}", path.display());
+        }
     }
     Ok(())
 }
@@ -1046,12 +1176,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multi_type_extract_until_summary_model_exists() {
-        let error = ensure_supported_extract_types(&[MediaType::Image, MediaType::Video])
-            .expect_err("multi-type extraction is not wired yet");
+    fn accepts_multi_type_extract() {
+        ensure_supported_extract_types(&[MediaType::Image, MediaType::Video]).unwrap();
+    }
 
-        assert!(error
-            .to_string()
-            .contains("currently accepts one media type per run; got: image,video"));
+    #[test]
+    fn aggregates_multi_type_extract_summaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("image.jpg"), b"\xff\xd8\xffimage\xff\xd9").unwrap();
+        std::fs::write(source.join("video.mp4"), b"video").unwrap();
+        std::fs::write(source.join("document.pdf"), b"file").unwrap();
+        std::fs::write(source.join("voice.silk"), b"\x02voice").unwrap();
+
+        let summary = run_extract_many(
+            &[
+                MediaType::Image,
+                MediaType::Video,
+                MediaType::File,
+                MediaType::Voice,
+            ],
+            ImageExtractArgs {
+                source,
+                archive: archive.clone(),
+                dry_run: true,
+                image_aes_key: None,
+                image_xor_key: "0x88".to_string(),
+                wxgf_mode: WxgfMode::Jpg,
+                wxgf_ffmpeg_path: None,
+                json: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.media_types, vec!["image", "video", "file", "voice"]);
+        assert_eq!(summary.summaries.len(), 4);
+        assert_eq!(summary.summaries[0].summary.candidates, 1);
+        assert_eq!(summary.summaries[1].summary.candidates, 1);
+        assert_eq!(summary.summaries[2].summary.candidates, 4);
+        assert_eq!(summary.summaries[3].summary.candidates, 1);
+        assert_eq!(summary.candidates, 7);
+        assert_eq!(summary.would_archive, 7);
+        assert_eq!(summary.archived, 0);
+        assert!(!archive.exists());
     }
 }

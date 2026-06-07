@@ -714,6 +714,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "tempfile",
  "wechat-archiver-core",
 ]
 

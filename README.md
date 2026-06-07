@@ -127,6 +127,18 @@ cargo run -p wechat-archiver -- extract --type image \
 
 `extract --type image` 是后续扩展视频、文件、语音的统一入口，当前行为与旧命令 `extract-images` 一致。`extract-images` 仍保留用于兼容现有脚本。
 
+也可以一次指定多个直接媒体类型，CLI 会按给定顺序逐个运行，并输出聚合 summary 和各类型子 summary：
+
+```bash
+cargo run -p wechat-archiver -- extract --type image,video,file,voice \
+  --source "/path/to/wechat/source" \
+  --archive "/path/to/wechat-archive" \
+  --dry-run \
+  --json
+```
+
+多类型聚合复用各单类型抽取器；总计中的 `candidates`、`scanned_files` 等字段是各类型结果相加，不代表跨类型去重后的唯一文件数。
+
 归档直接视频文件：
 
 ```bash

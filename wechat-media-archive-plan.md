@@ -205,6 +205,8 @@ wechat-archiver extract --chat "某个群名"
 wechat-archiver extract --since 2025-01-01
 ```
 
+当前 `extract --type image,video,file,voice` 已支持按类型顺序执行并输出聚合 summary；总计字段是各子任务相加，不代表跨类型去重后的唯一文件数。
+
 ### 第 3 阶段：去重和 AI 管理
 
 目标是把媒体资产变成可治理的数据集。
