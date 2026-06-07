@@ -141,6 +141,7 @@ wechat-archive/
 - 计算 `sha256`。
 - 复制到归档目录。
 - 写入 SQLite 索引。
+- 消息库图片归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
 - 支持校验归档文件完整性。
 - 对未知 `.dat` 记录 `unsupported`，对消息库中存在但本地 `.dat` 缺失的资源记录 `failed`。
 

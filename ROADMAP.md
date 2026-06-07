@@ -136,13 +136,14 @@ wechat-archive/
 - `index.sqlite` 保存当前索引状态。
 - `manifests/*.jsonl` 保存每次运行审计记录。
 - `index.sqlite` 和 manifest 独立记录 `source_kind` 与 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。
+- `index.sqlite` 和 manifest 支持可空消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；当前消息库图片归档会写入 `talker/local_id/create_time`，`sender` 暂不猜测。
 - 支持 `status` 查看索引统计。
 - 支持 `verify` 重新计算归档对象 hash。
 - 支持重复对象去重：相同 `sha256` 不重复写入对象文件。
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 记录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
+- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 和消息来源记录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
 - 已通过：
 
 ```bash
@@ -157,6 +158,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 - 当前主线仍是图片归档。
 - `extract-db-images` 只支持已解密/普通 SQLite 数据库，不支持直接读取 SQLCipher 加密库。
+- 消息来源字段当前只由消息库图片归档写入 `talker/local_id/create_time`；直接 video/file/voice 和 `message_sender` 仍待后续消息库来源增强。
 - V2 图片 AES key 可通过 `derive-image-key` 只读派生，但抽取命令仍需要用户显式提供。
 - `derive-image-key` 不自动保存 key；本机 key 文档应继续保存在 `.gitignore` 覆盖的本地文件中。
 - `wxgf jpg/mp4` 依赖 `ffmpeg`，没有可用 `ffmpeg` 时应使用 `raw` 或 `off`。
@@ -319,6 +321,7 @@ wechat-archiver extract --type voice
 
 建议继续推进 P1 的消息库来源增强：
 
-- 开始做消息库来源增强，为 video/file/voice 补充会话、时间、发送人等上下文。
+- 继续做消息库来源增强，为 video/file/voice 补充会话、时间、发送人等上下文。
+- 下一步应优先识别消息库中 video/file 的本地路径或资源引用，并复用已落地的消息来源字段。
 - 语音下一步重点是解析消息库语音 BLOB，而不是继续扩大直接文件扫描范围。
 - 两条路线都应继续保持 dry-run、结构化错误、manifest/index 和安全边界一致。

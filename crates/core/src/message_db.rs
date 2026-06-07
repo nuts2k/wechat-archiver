@@ -8,7 +8,9 @@ use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions};
 use crate::error::{ArchiverError, IoContext, Result};
 use crate::index::{index_path, open_index};
 use crate::manifest::ManifestWriter;
-use crate::scanner::{apply_result, persist, process_dat_image, ScanOutcome};
+use crate::scanner::{
+    apply_result, persist, process_dat_image_with_message_source, MessageSource, ScanOutcome,
+};
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 
 #[derive(Debug, Clone)]
@@ -101,13 +103,14 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
         }
 
         summary.candidates += 1;
+        let message_source = message_source_from_key(&resource.key);
         let result = match find_dat_file(
             &attach_root,
             &resource.key.talker,
             &resource.file_md5,
             resource.key.create_time,
         ) {
-            Some(dat_path) => process_dat_image(
+            Some(dat_path) => process_dat_image_with_message_source(
                 &dat_path,
                 &resolved.source_dir,
                 &resolved.archive_dir,
@@ -117,6 +120,7 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
                 &resolved.dat_options,
                 conn.as_ref(),
                 manifest.as_mut(),
+                Some(&message_source),
             ),
             None => record_missing_dat(
                 &resource,
@@ -124,6 +128,7 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
                 &run_id,
                 conn.as_ref(),
                 manifest.as_mut(),
+                &message_source,
             ),
         };
         apply_result(&mut summary, result)?;
@@ -135,6 +140,15 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
     summary.finish_unsupported_explanation();
 
     Ok(summary)
+}
+
+fn message_source_from_key(key: &MessageKey) -> MessageSource {
+    MessageSource {
+        talker: Some(key.talker.clone()),
+        sender: None,
+        local_id: Some(key.local_id),
+        create_time: Some(key.create_time),
+    }
 }
 
 fn query_image_resources(resource_db: &Path) -> Result<Vec<ImageResource>> {
@@ -265,6 +279,7 @@ fn record_missing_dat(
     run_id: &str,
     conn: Option<&Connection>,
     manifest: Option<&mut ManifestWriter>,
+    message_source: &MessageSource,
 ) -> Result<ScanOutcome> {
     let source_relative_path = format!(
         "db_storage/message:talker={}:local_id={}:create_time={}:md5={}",
@@ -282,6 +297,10 @@ fn record_missing_dat(
         source_relative_path,
         source_kind: "message_db_image".to_string(),
         media_type: "image".to_string(),
+        message_talker: message_source.talker.clone(),
+        message_sender: message_source.sender.clone(),
+        message_local_id: message_source.local_id,
+        message_create_time: message_source.create_time,
         decoder: None,
         action: ScanAction::Failed,
         archive_path: None,
@@ -590,6 +609,40 @@ mod tests {
         assert_eq!(sha256_file(&dat_path).unwrap(), dat_hash_before);
         assert_eq!(sha256_file(&db_path).unwrap(), db_hash_before);
 
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (stored_talker, stored_sender, stored_local_id, stored_create_time): (
+            String,
+            Option<String>,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                r#"
+                SELECT message_talker, message_sender, message_local_id, message_create_time
+                FROM media_items
+                WHERE source_kind = 'message_db_image'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_talker, talker);
+        assert_eq!(stored_sender, None);
+        assert_eq!(stored_local_id, local_id);
+        assert_eq!(stored_create_time, create_time);
+
+        let manifest_path = summary.manifest_path.clone().unwrap();
+        let manifest = fs::read_to_string(manifest_path).unwrap();
+        let event = manifest
+            .lines()
+            .map(|line| serde_json::from_str::<ManifestEvent>(line).unwrap())
+            .find(|event| event.source_kind == "message_db_image")
+            .unwrap();
+        assert_eq!(event.message_talker.as_deref(), Some(talker));
+        assert_eq!(event.message_sender, None);
+        assert_eq!(event.message_local_id, Some(local_id));
+        assert_eq!(event.message_create_time, Some(create_time));
+
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
         assert_eq!(verify.ok, 1);
@@ -654,6 +707,22 @@ mod tests {
         assert_eq!(summary.scanned_files, 1);
         assert_eq!(summary.candidates, 1);
         assert_eq!(summary.failed, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (message_talker, message_local_id, message_create_time): (String, i64, i64) = conn
+            .query_row(
+                r#"
+                SELECT message_talker, message_local_id, message_create_time
+                FROM media_items
+                WHERE verify_status = 'failed'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(message_talker, "wxid_friend");
+        assert_eq!(message_local_id, 11);
+        assert_eq!(message_create_time, 1_779_472_800);
 
         let status = archive_status(&archive).unwrap();
         assert_eq!(status.total_records, 1);

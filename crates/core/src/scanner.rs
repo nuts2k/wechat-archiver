@@ -13,6 +13,14 @@ use crate::manifest::ManifestWriter;
 use crate::media::{direct_file_extension, direct_video_extension, direct_voice_extension};
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MessageSource {
+    pub talker: Option<String>,
+    pub sender: Option<String>,
+    pub local_id: Option<i64>,
+    pub create_time: Option<i64>,
+}
+
 pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
     let resolved = config.resolve()?;
     let mut run = ScanRun::new(&resolved, "extract-images")?;
@@ -386,6 +394,7 @@ fn process_direct_media(
         source_kind,
         media_type,
         None,
+        None,
         action.clone(),
         archive_path,
         Some(sha256),
@@ -410,6 +419,33 @@ pub(crate) fn process_dat_image(
     dat_options: &DatDecodeOptions,
     conn: Option<&Connection>,
     manifest: Option<&mut ManifestWriter>,
+) -> Result<ScanOutcome> {
+    process_dat_image_with_message_source(
+        path,
+        source_root,
+        archive_root,
+        run_id,
+        source_kind,
+        dry_run,
+        dat_options,
+        conn,
+        manifest,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_dat_image_with_message_source(
+    path: &Path,
+    source_root: &Path,
+    archive_root: &Path,
+    run_id: &str,
+    source_kind: &str,
+    dry_run: bool,
+    dat_options: &DatDecodeOptions,
+    conn: Option<&Connection>,
+    manifest: Option<&mut ManifestWriter>,
+    message_source: Option<&MessageSource>,
 ) -> Result<ScanOutcome> {
     let rel = relative_path(path, source_root)?;
 
@@ -447,6 +483,7 @@ pub(crate) fn process_dat_image(
                 &rel,
                 source_kind,
                 "image",
+                message_source,
                 Some(decoder),
                 action.clone(),
                 archive_path,
@@ -467,6 +504,7 @@ pub(crate) fn process_dat_image(
                 &rel,
                 source_kind,
                 "image",
+                message_source,
                 Some(decoder),
                 ScanAction::WouldArchive,
                 None,
@@ -487,6 +525,7 @@ pub(crate) fn process_dat_image(
                 &rel,
                 source_kind,
                 "image",
+                message_source,
                 None,
                 ScanAction::Unsupported,
                 None,
@@ -510,6 +549,7 @@ fn build_event(
     source_relative_path: &str,
     source_kind: &str,
     media_type: &str,
+    message_source: Option<&MessageSource>,
     decoder: Option<&str>,
     action: ScanAction,
     archive_path: Option<String>,
@@ -520,6 +560,7 @@ fn build_event(
     verify_status: &str,
     error: Option<String>,
 ) -> ManifestEvent {
+    let message_source = message_source.cloned().unwrap_or_default();
     ManifestEvent {
         event: "media_item".to_string(),
         run_id: run_id.to_string(),
@@ -528,6 +569,10 @@ fn build_event(
         source_relative_path: source_relative_path.to_string(),
         source_kind: source_kind.to_string(),
         media_type: media_type.to_string(),
+        message_talker: message_source.talker,
+        message_sender: message_source.sender,
+        message_local_id: message_source.local_id,
+        message_create_time: message_source.create_time,
         decoder: decoder.map(str::to_string),
         action,
         archive_path,
@@ -553,6 +598,10 @@ pub(crate) fn persist(
                 source_relative_path: event.source_relative_path.clone(),
                 source_kind: event.source_kind.clone(),
                 media_type: event.media_type.clone(),
+                message_talker: event.message_talker.clone(),
+                message_sender: event.message_sender.clone(),
+                message_local_id: event.message_local_id,
+                message_create_time: event.message_create_time,
                 decoder: event.decoder.clone(),
                 archive_path: event.archive_path.clone(),
                 sha256: event.sha256.clone(),

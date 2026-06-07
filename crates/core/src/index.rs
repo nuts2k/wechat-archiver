@@ -10,6 +10,10 @@ pub(crate) struct MediaRecord {
     pub source_relative_path: String,
     pub source_kind: String,
     pub media_type: String,
+    pub message_talker: Option<String>,
+    pub message_sender: Option<String>,
+    pub message_local_id: Option<i64>,
+    pub message_create_time: Option<i64>,
     pub decoder: Option<String>,
     pub archive_path: Option<String>,
     pub sha256: Option<String>,
@@ -55,6 +59,10 @@ fn initialize(conn: &Connection) -> Result<()> {
             source_relative_path TEXT NOT NULL,
             source_kind TEXT NOT NULL,
             media_type TEXT NOT NULL,
+            message_talker TEXT,
+            message_sender TEXT,
+            message_local_id INTEGER,
+            message_create_time INTEGER,
             decoder TEXT,
             archive_path TEXT,
             sha256 TEXT,
@@ -83,6 +91,7 @@ fn initialize(conn: &Connection) -> Result<()> {
         "#,
     )?;
     ensure_decoder_column(conn)?;
+    ensure_message_metadata_columns(conn)?;
     Ok(())
 }
 
@@ -114,6 +123,35 @@ fn ensure_decoder_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_message_metadata_columns(conn: &Connection) -> Result<()> {
+    ensure_column(conn, "message_talker", "TEXT")?;
+    ensure_column(conn, "message_sender", "TEXT")?;
+    ensure_column(conn, "message_local_id", "INTEGER")?;
+    ensure_column(conn, "message_create_time", "INTEGER")?;
+    conn.execute(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_media_items_message
+            ON media_items(message_talker, message_create_time, message_local_id)
+        "#,
+        [],
+    )?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, column_name: &str, column_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(media_items)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == column_name) {
+        conn.execute(
+            &format!("ALTER TABLE media_items ADD COLUMN {column_name} {column_type}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<()> {
     let timestamp_epoch_ms = record.timestamp_epoch_ms.min(i64::MAX as u128) as i64;
     conn.execute(
@@ -123,6 +161,10 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             source_relative_path,
             source_kind,
             media_type,
+            message_talker,
+            message_sender,
+            message_local_id,
+            message_create_time,
             decoder,
             archive_path,
             sha256,
@@ -134,7 +176,7 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             created_at_ms,
             updated_at_ms
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)
         ON CONFLICT(source_path)
         DO UPDATE SET
             archive_path = excluded.archive_path,
@@ -143,6 +185,10 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             source_relative_path = excluded.source_relative_path,
             source_kind = excluded.source_kind,
             media_type = excluded.media_type,
+            message_talker = excluded.message_talker,
+            message_sender = excluded.message_sender,
+            message_local_id = excluded.message_local_id,
+            message_create_time = excluded.message_create_time,
             decoder = excluded.decoder,
             extension = excluded.extension,
             decrypt_status = excluded.decrypt_status,
@@ -155,6 +201,10 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             record.source_relative_path,
             record.source_kind,
             record.media_type,
+            record.message_talker,
+            record.message_sender,
+            record.message_local_id,
+            record.message_create_time,
             record.decoder,
             record.archive_path,
             record.sha256,
@@ -167,4 +217,85 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_index_migrates_message_metadata_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path();
+        let index = index_path(archive);
+        let conn = Connection::open(&index).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE media_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                source_relative_path TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                decoder TEXT,
+                archive_path TEXT,
+                sha256 TEXT,
+                size_bytes INTEGER,
+                extension TEXT,
+                decrypt_status TEXT NOT NULL,
+                verify_status TEXT NOT NULL,
+                error TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+
+            INSERT INTO media_items (
+                source_path,
+                source_relative_path,
+                source_kind,
+                media_type,
+                decoder,
+                decrypt_status,
+                verify_status,
+                created_at_ms,
+                updated_at_ms
+            )
+            VALUES (
+                '/tmp/source/image.dat',
+                'image.dat',
+                'message_db_image',
+                'image',
+                'legacy_xor',
+                'decoded',
+                'ok',
+                1,
+                1
+            );
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = open_index(archive).unwrap();
+        let columns = migrated
+            .prepare("PRAGMA table_info(media_items)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        for column in [
+            "message_talker",
+            "message_sender",
+            "message_local_id",
+            "message_create_time",
+        ] {
+            assert!(columns.iter().any(|existing| existing == column));
+        }
+
+        let source_path: String = migrated
+            .query_row("SELECT source_path FROM media_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source_path, "/tmp/source/image.dat");
+    }
 }
