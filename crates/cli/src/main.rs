@@ -513,7 +513,11 @@ fn main() -> Result<()> {
         Commands::Verify { archive, json } => {
             let summary = verify_archive(&archive)?;
             print_verify_summary(&summary, json)?;
-            if summary.missing > 0 || summary.mismatched > 0 {
+            if summary.missing > 0
+                || summary.unreadable > 0
+                || summary.mismatched > 0
+                || summary.index_failed > 0
+            {
                 std::process::exit(2);
             }
         }
@@ -958,7 +962,18 @@ fn print_status(status: &ArchiveStatus, json: bool) -> Result<()> {
     println!("failed_records: {}", status.failed_records);
     println!("unique_objects: {}", status.unique_objects);
     println!("unique_bytes: {}", status.unique_bytes);
+    print_status_counts("media_type_counts", &status.media_type_counts);
+    print_status_counts("source_kind_counts", &status.source_kind_counts);
+    print_status_counts("decrypt_status_counts", &status.decrypt_status_counts);
+    print_status_counts("verify_status_counts", &status.verify_status_counts);
     Ok(())
+}
+
+fn print_status_counts(label: &str, counts: &[wechat_archiver_core::StatusCount]) {
+    println!("{label}:");
+    for count in counts {
+        println!("  {}: {}", count.value, count.count);
+    }
 }
 
 fn print_index_lookup(lookup: &IndexLookup, json: bool) -> Result<()> {
@@ -1036,11 +1051,25 @@ fn print_verify_summary(summary: &VerifySummary, json: bool) -> Result<()> {
     println!("checked: {}", summary.checked);
     println!("ok: {}", summary.ok);
     println!("missing: {}", summary.missing);
+    println!("unreadable: {}", summary.unreadable);
     println!("mismatched: {}", summary.mismatched);
+    println!("index_checked: {}", summary.index_checked);
+    println!("index_ok: {}", summary.index_ok);
+    println!("index_failed: {}", summary.index_failed);
     for failure in &summary.failures {
         println!(
             "failure: {} expected={} actual={:?} error={}",
             failure.archive_path, failure.expected_sha256, failure.actual_sha256, failure.error
+        );
+    }
+    for failure in &summary.index_failures {
+        println!(
+            "index_failure: id={} source_path={} archive_path={:?} sha256={:?} error={}",
+            failure.media_item_id,
+            failure.source_path,
+            failure.archive_path,
+            failure.sha256,
+            failure.error
         );
     }
     Ok(())

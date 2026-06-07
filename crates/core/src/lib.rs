@@ -28,9 +28,9 @@ pub use message_db::{
     MessageDbNextAction,
 };
 pub use scanner::{extract_files, extract_images, extract_videos, extract_voices};
-pub use status::{archive_status, ArchiveStatus};
+pub use status::{archive_status, ArchiveStatus, StatusCount};
 pub use types::{
     ExtractSummary, ManifestEvent, ScanAction, UnsupportedExplanation, UnsupportedReasonSummary,
 };
-pub use verify::{verify_archive, VerifySummary};
+pub use verify::{verify_archive, IndexVerifyFailure, VerifyFailure, VerifySummary};
 pub use wechat::{discover_wechat, DiscoverOptions, WechatAccount, WechatDiscovery};

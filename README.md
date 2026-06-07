@@ -277,6 +277,8 @@ cargo run -p wechat-archiver -- status \
   --archive "/path/to/wechat-archive"
 ```
 
+`status` 会输出总记录数、唯一对象数、唯一字节数，并按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组统计，便于快速判断归档内容构成和失败类型。
+
 按归档对象 hash 反查所有来源，或按源路径查询当前索引状态：
 
 ```bash
@@ -296,6 +298,8 @@ cargo run -p wechat-archiver -- lookup \
 cargo run -p wechat-archiver -- verify \
   --archive "/path/to/wechat-archive"
 ```
+
+`verify` 会重新计算归档对象 sha256，并检查 `verify_status=ok` 的索引记录是否存在完整的 `archive_path`、`sha256`、对象文件，以及 `archive_path` 文件名中的 hash 是否与索引一致。发现对象缺失、不可读、hash 不一致或索引引用异常时，命令会返回退出码 `2`。
 
 所有命令支持 `--json` 输出结构化结果。
 

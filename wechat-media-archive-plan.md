@@ -79,7 +79,7 @@ wechat-archive/
 说明：
 
 - `objects` 只按内容 hash 存一份真实文件。
-- `index.sqlite` 保存消息、来源、文件、hash、归档路径等结构化信息，并通过 `schema_migrations` 记录显式 schema 版本迁移；索引 API 支持只读按 `sha256` 或 `source_path` 反查归档记录。
+- `index.sqlite` 保存消息、来源、文件、hash、归档路径等结构化信息，并通过 `schema_migrations` 记录显式 schema 版本迁移；索引 API 支持只读按 `sha256` 或 `source_path` 反查归档记录，并支持 `status` 分组统计和 `verify` 索引引用完整性检查。
 - `manifests` 保存每次扫描和归档结果，便于审计和回滚。
 - `views` 可以通过软链接或索引生成“按联系人、群、年份、类型”的视图。
 - `staging` 用于临时解密、转换和校验，成功后再移动到正式归档区。
@@ -147,7 +147,8 @@ wechat-archive/
 - 复制到归档目录。
 - 写入 SQLite 索引，并保持 schema 迁移可追踪、可幂等复跑。
 - 消息库图片、视频、文件附件和语音归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
-- 支持校验归档文件完整性。
+- 支持 `status` 查看索引总量、唯一对象、唯一字节数，并按媒体类型、来源类型、解密状态和校验状态分组。
+- 支持 `verify` 重新计算归档对象 hash，并检查 `verify_status=ok` 索引记录的 `archive_path`、`sha256`、对象存在性和路径/hash 一致性。
 - 对未知 `.dat` 记录 `unsupported`，对消息库中存在但本地 `.dat` 缺失的资源记录 `failed`。
 
 当前边界：
@@ -177,7 +178,7 @@ wechat-archiver lookup
 wechat-archiver verify
 ```
 
-说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`count-db-media` 用于在已解密/普通 SQLite 消息库上估算 image/video/file/voice 候选量，不读取微信媒体目录、不写归档目录。`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定。图片、视频和文件仍从 `--account/msg` 定位，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。`lookup` 只读打开索引，支持按 `sha256` 反查来源或按 `source_path` 查归档状态。`extract-images` 保留用于兼容旧脚本。
+说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`count-db-media` 用于在已解密/普通 SQLite 消息库上估算 image/video/file/voice 候选量，不读取微信媒体目录、不写归档目录。`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定。图片、视频和文件仍从 `--account/msg` 定位，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。`lookup` 只读打开索引，支持按 `sha256` 反查来源或按 `source_path` 查归档状态。`status` 输出归档总量和按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组的索引健康统计。`verify` 覆盖对象 hash 校验和索引引用完整性检查，异常时返回非零退出码。`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 
@@ -272,7 +273,7 @@ wechat-archiver/
 - `media`：图片 `.dat` 解密、媒体路径定位、MIME 和扩展名识别。
 - `archive`：内容寻址存储、文件复制、临时目录和原子移动。
 - `index`：SQLite schema、增量扫描状态、来源反查。
-- `verify`：sha256 校验、归档一致性检查。
+- `verify`：sha256 校验、索引引用完整性检查、归档一致性检查。
 - `manifest`：每次扫描和归档的 JSONL 审计记录。
 - `task`：任务进度、错误收集、取消信号，方便未来接入 Tauri。
 
