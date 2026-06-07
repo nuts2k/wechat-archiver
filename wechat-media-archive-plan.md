@@ -163,7 +163,7 @@ wechat-archiver status
 wechat-archiver verify
 ```
 
-说明：`extract --type image` 复用图片归档流程，`extract --type video` 当前只扫描直接视频文件；`extract-images` 保留用于兼容旧脚本。
+说明：`extract --type image` 复用图片归档流程。`extract --type video` 当前扫描直接视频文件；当 source 是账号目录或 `msg/attach` 时，会自动扫描同账号 `msg/video`。`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 

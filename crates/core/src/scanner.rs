@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use walkdir::WalkDir;
@@ -63,34 +63,78 @@ pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
 pub fn extract_videos(config: ArchiveConfig) -> Result<ExtractSummary> {
     let resolved = config.resolve()?;
     let mut run = ScanRun::new(&resolved, "extract-videos")?;
+    let video_sources = video_scan_sources(&resolved.source_dir);
 
-    for entry in WalkDir::new(&resolved.source_dir).follow_links(false) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        run.summary.scanned_files += 1;
+    for source in video_sources {
+        for entry in WalkDir::new(&source.scan_dir).follow_links(false) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            run.summary.scanned_files += 1;
 
-        let path = entry.path();
-        if let Some(extension) = direct_video_extension(path) {
-            run.summary.candidates += 1;
-            let result = process_direct_media(
-                path,
-                extension,
-                &resolved.source_dir,
-                &resolved.archive_dir,
-                &run.run_id,
-                resolved.dry_run,
-                run.conn.as_ref(),
-                run.manifest.as_mut(),
-                "direct_video",
-                "video",
-            );
-            apply_result(&mut run.summary, result)?;
+            let path = entry.path();
+            if let Some(extension) = direct_video_extension(path) {
+                run.summary.candidates += 1;
+                let result = process_direct_media(
+                    path,
+                    extension,
+                    &source.relative_root,
+                    &resolved.archive_dir,
+                    &run.run_id,
+                    resolved.dry_run,
+                    run.conn.as_ref(),
+                    run.manifest.as_mut(),
+                    "direct_video",
+                    "video",
+                );
+                apply_result(&mut run.summary, result)?;
+            }
         }
     }
 
     run.finish()
+}
+
+#[derive(Debug, Clone)]
+struct VideoScanSource {
+    scan_dir: PathBuf,
+    relative_root: PathBuf,
+}
+
+fn video_scan_sources(source_dir: &Path) -> Vec<VideoScanSource> {
+    if let Some(account_dir) = account_dir_from_attach_dir(source_dir) {
+        let video_dir = account_dir.join("msg").join("video");
+        if video_dir.is_dir() {
+            return vec![VideoScanSource {
+                scan_dir: video_dir,
+                relative_root: account_dir,
+            }];
+        }
+    }
+
+    let account_video_dir = source_dir.join("msg").join("video");
+    if account_video_dir.is_dir() {
+        return vec![VideoScanSource {
+            scan_dir: account_video_dir,
+            relative_root: source_dir.to_path_buf(),
+        }];
+    }
+
+    vec![VideoScanSource {
+        scan_dir: source_dir.to_path_buf(),
+        relative_root: source_dir.to_path_buf(),
+    }]
+}
+
+fn account_dir_from_attach_dir(source_dir: &Path) -> Option<PathBuf> {
+    let attach = source_dir.file_name()?.to_str()?;
+    let msg_dir = source_dir.parent()?;
+    let msg = msg_dir.file_name()?.to_str()?;
+    if attach.eq_ignore_ascii_case("attach") && msg.eq_ignore_ascii_case("msg") {
+        return msg_dir.parent().map(Path::to_path_buf);
+    }
+    None
 }
 
 struct ScanRun {
@@ -600,6 +644,65 @@ mod tests {
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
         assert_eq!(verify.ok, 1);
+    }
+
+    #[test]
+    fn video_extract_from_attach_scans_sibling_msg_video() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("xwechat_files").join("wxid");
+        let attach = account.join("msg").join("attach");
+        let video_dir = account.join("msg").join("video").join("2026-02");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&attach).unwrap();
+        std::fs::create_dir_all(&video_dir).unwrap();
+        std::fs::write(attach.join("ignored.mp4"), b"attach-video-is-not-used").unwrap();
+        std::fs::write(video_dir.join("clip.mp4"), b"real-video").unwrap();
+
+        let summary = extract_videos(ArchiveConfig {
+            source_dir: attach,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let relative_path: String = conn
+            .query_row(
+                "SELECT source_relative_path FROM media_items WHERE media_type = 'video'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relative_path, "msg/video/2026-02/clip.mp4");
+    }
+
+    #[test]
+    fn video_extract_from_account_scans_msg_video() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("xwechat_files").join("wxid");
+        let video_dir = account.join("msg").join("video").join("2026-02");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        std::fs::write(video_dir.join("clip.mov"), b"real-video").unwrap();
+
+        let summary = extract_videos(ArchiveConfig {
+            source_dir: account,
+            archive_dir: archive,
+            dry_run: true,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.would_archive, 1);
     }
 
     #[test]

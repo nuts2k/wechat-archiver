@@ -97,7 +97,7 @@ cargo run -p wechat-archiver -- extract --type video \
   --archive "/path/to/wechat-archive"
 ```
 
-当前视频归档只扫描源目录中的 `mp4`、`mov`、`m4v` 文件并复制到内容寻址归档库，记录 `source_kind=direct_video`、`media_type=video`。暂不解析消息库视频来源，也不提取时长和分辨率。
+当前视频归档会复制 `mp4`、`mov`、`m4v` 到内容寻址归档库，记录 `source_kind=direct_video`、`media_type=video`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，会自动扫描同账号的 `msg/video`；其他目录则只扫描传入目录本身。暂不解析消息库视频来源，也不提取时长和分辨率。
 
 按消息库枚举并归档图片：
 

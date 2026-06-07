@@ -85,6 +85,7 @@ Rust core library
 
 - 支持统一媒体抽取入口 `extract --type video`。
 - 当前视频归档为直接文件扫描最小版，支持 `mp4`、`mov`、`m4v`。
+- 当 `--source` 是微信账号目录或该账号的 `msg/attach` 时，自动扫描同账号 `msg/video`；其他目录只扫描传入目录本身。
 - 视频对象复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
 - 当前记录 `source_kind=direct_video`、`media_type=video`；暂不解析消息库视频来源，也不提取时长和分辨率。
 
@@ -185,7 +186,7 @@ wechat-archiver extract --type video
 ```
 
 - `image` 入口复用现有图片归档流程。
-- `video` 入口当前扫描直接视频文件，复制本地视频、计算 hash，并记录到同一套 archive/index/manifest。
+- `video` 入口当前扫描直接视频文件；对微信账号目录或 `msg/attach` 会自动定位同账号 `msg/video`，复制本地视频、计算 hash，并记录到同一套 archive/index/manifest。
 - `file`、`voice` 等类型当前会明确返回尚未支持，不会静默跳过或生成不完整归档。
 - 多类型组合当前暂未执行，避免一个 CLI 命令生成多个 run 和多份 summary；后续应先设计聚合 summary。
 
