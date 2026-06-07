@@ -25,7 +25,7 @@
 - 对未知 `.dat`、缺少 V2 key 或无法识别文件记录为 `unsupported`，不会写出不可信的垃圾文件；对消息库中存在但本地 `.dat` 缺失的资源记录为 `failed`。
 - 归档文件写入独立 archive 目录，使用内容寻址路径 `objects/sha256/<prefix>/<sha256>.<ext>`。
 - 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind`、独立 `decoder` 和可用的消息来源字段；索引库通过 `schema_migrations` 记录显式 schema 版本迁移。
-- 支持 `status` 查看索引统计，支持 `verify` 重新计算归档对象 hash。
+- 支持 `status` 查看索引统计，支持 `lookup` 按 `sha256` 或源路径反查索引记录，支持 `verify` 重新计算归档对象 hash。
 
 当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`count-db-media`、`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；图片、视频和文件附件仍只从 `--account` 下的 `msg/*` 读取，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。
 
@@ -277,6 +277,19 @@ cargo run -p wechat-archiver -- status \
   --archive "/path/to/wechat-archive"
 ```
 
+按归档对象 hash 反查所有来源，或按源路径查询当前索引状态：
+
+```bash
+cargo run -p wechat-archiver -- lookup \
+  --archive "/path/to/wechat-archive" \
+  --sha256 "abcd1234..."
+
+cargo run -p wechat-archiver -- lookup \
+  --archive "/path/to/wechat-archive" \
+  --source-path "/path/to/wechat/source/image.dat" \
+  --json
+```
+
 校验归档对象：
 
 ```bash
@@ -301,7 +314,7 @@ wechat-archive/
   views/
 ```
 
-`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`index.sqlite` 通过 `schema_migrations` 记录已应用的 schema 版本，便于后续安全升级旧归档库。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。通过消息库归档的图片、视频、文件附件和语音还会记录可用的消息来源字段：`message_talker`、`message_local_id`、`message_create_time`；`message_sender` 已预留但当前不猜测不同微信版本的发送人列。
+`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`index.sqlite` 通过 `schema_migrations` 记录已应用的 schema 版本，便于后续安全升级旧归档库。`lookup` 会只读打开索引，可按 `sha256` 反查所有来源，也可按 `source_path` 查询单个源文件的当前归档状态。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。通过消息库归档的图片、视频、文件附件和语音还会记录可用的消息来源字段：`message_talker`、`message_local_id`、`message_create_time`；`message_sender` 已预留但当前不猜测不同微信版本的发送人列。
 
 ## 外部项目参考
 

@@ -1,17 +1,18 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
     archive_status, count_message_db_media, derive_image_key, discover_wechat, extract_files,
     extract_images, extract_message_db_files, extract_message_db_images, extract_message_db_videos,
-    extract_message_db_voices, extract_videos, extract_voices, inspect_message_db, verify_archive,
-    ArchiveConfig, ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions,
-    ExtractSummary, ImageKeyDerivation, ImageKeyMethod, MessageDbExtractConfig,
-    MessageDbInspectConfig, MessageDbInspection, MessageDbMediaCountConfig,
-    MessageDbMediaCountSummary, MessageDbMediaTypeCount, VerifySummary, WechatDiscovery,
+    extract_message_db_voices, extract_videos, extract_voices, inspect_message_db, lookup_index,
+    verify_archive, ArchiveConfig, ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions,
+    DiscoverOptions, ExtractSummary, ImageKeyDerivation, ImageKeyMethod, IndexLookup,
+    IndexLookupQuery, MessageDbExtractConfig, MessageDbInspectConfig, MessageDbInspection,
+    MessageDbMediaCountConfig, MessageDbMediaCountSummary, MessageDbMediaTypeCount, VerifySummary,
+    WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -246,6 +247,9 @@ enum Commands {
         json: bool,
     },
 
+    /// 按 sha256 或源路径反查归档索引记录。
+    Lookup(LookupArgs),
+
     /// 校验已归档对象是否仍与索引 sha256 一致。
     Verify {
         /// 独立归档目录。
@@ -256,6 +260,30 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(group(
+    ArgGroup::new("lookup_key")
+        .required(true)
+        .args(["sha256", "source_path"])
+))]
+struct LookupArgs {
+    /// 独立归档目录。
+    #[arg(long)]
+    archive: PathBuf,
+
+    /// 按归档对象 sha256 查询所有来源。
+    #[arg(long)]
+    sha256: Option<String>,
+
+    /// 按微信源文件完整路径查询当前索引状态。
+    #[arg(long)]
+    source_path: Option<PathBuf>,
+
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -477,6 +505,11 @@ fn main() -> Result<()> {
             let status = archive_status(&archive)?;
             print_status(&status, json)?;
         }
+        Commands::Lookup(args) => {
+            let json = args.json;
+            let lookup = run_lookup(args)?;
+            print_index_lookup(&lookup, json)?;
+        }
         Commands::Verify { archive, json } => {
             let summary = verify_archive(&archive)?;
             print_verify_summary(&summary, json)?;
@@ -487,6 +520,17 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_lookup(args: LookupArgs) -> Result<IndexLookup> {
+    let query = match (args.sha256, args.source_path) {
+        (Some(sha256), None) => IndexLookupQuery::Sha256(sha256),
+        (None, Some(source_path)) => {
+            IndexLookupQuery::SourcePath(source_path.to_string_lossy().to_string())
+        }
+        _ => unreachable!("clap ArgGroup ensures exactly one lookup key"),
+    };
+    Ok(lookup_index(&args.archive, query)?)
 }
 
 fn ensure_supported_extract_types(media_types: &[MediaType]) -> Result<()> {
@@ -917,6 +961,71 @@ fn print_status(status: &ArchiveStatus, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_index_lookup(lookup: &IndexLookup, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(lookup)?);
+        return Ok(());
+    }
+
+    println!("archive: {}", lookup.archive_dir.display());
+    println!("index: {}", lookup.index_path.display());
+    match &lookup.query {
+        IndexLookupQuery::Sha256(sha256) => println!("query_sha256: {sha256}"),
+        IndexLookupQuery::SourcePath(source_path) => println!("query_source_path: {source_path}"),
+    }
+    println!("matched_records: {}", lookup.matched_records);
+    for record in &lookup.records {
+        println!("record: id={}", record.id);
+        println!("  source_path: {}", record.source_path);
+        println!("  source_relative_path: {}", record.source_relative_path);
+        println!("  source_kind: {}", record.source_kind);
+        println!("  media_type: {}", record.media_type);
+        println!("  archive_path: {}", optional_string(&record.archive_path));
+        println!("  sha256: {}", optional_string(&record.sha256));
+        println!("  size_bytes: {}", optional_u64(record.size_bytes));
+        println!("  extension: {}", optional_string(&record.extension));
+        println!("  decoder: {}", optional_string(&record.decoder));
+        println!("  decrypt_status: {}", record.decrypt_status);
+        println!("  verify_status: {}", record.verify_status);
+        println!(
+            "  message_talker: {}",
+            optional_string(&record.message_talker)
+        );
+        println!(
+            "  message_sender: {}",
+            optional_string(&record.message_sender)
+        );
+        println!(
+            "  message_local_id: {}",
+            optional_i64(record.message_local_id)
+        );
+        println!(
+            "  message_create_time: {}",
+            optional_i64(record.message_create_time)
+        );
+        println!("  error: {}", optional_string(&record.error));
+        println!("  created_at_ms: {}", record.created_at_ms);
+        println!("  updated_at_ms: {}", record.updated_at_ms);
+    }
+    Ok(())
+}
+
+fn optional_string(value: &Option<String>) -> &str {
+    value.as_deref().unwrap_or("-")
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn optional_i64(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn print_verify_summary(summary: &VerifySummary, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(summary)?);
@@ -1052,6 +1161,72 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_lookup_by_sha256_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "lookup",
+            "--archive",
+            "/tmp/wechat-archive",
+            "--sha256",
+            "abc123",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Lookup(args) => {
+                assert_eq!(args.archive, PathBuf::from("/tmp/wechat-archive"));
+                assert_eq!(args.sha256.as_deref(), Some("abc123"));
+                assert_eq!(args.source_path, None);
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_lookup_by_source_path_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "lookup",
+            "--archive",
+            "/tmp/wechat-archive",
+            "--source-path",
+            "/tmp/source/image.jpg",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Lookup(args) => {
+                assert_eq!(args.archive, PathBuf::from("/tmp/wechat-archive"));
+                assert_eq!(args.sha256, None);
+                assert_eq!(
+                    args.source_path,
+                    Some(PathBuf::from("/tmp/source/image.jpg"))
+                );
+                assert!(!args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_lookup_with_both_query_keys() {
+        let result = Cli::try_parse_from([
+            "wechat-archiver",
+            "lookup",
+            "--archive",
+            "/tmp/wechat-archive",
+            "--sha256",
+            "abc123",
+            "--source-path",
+            "/tmp/source/image.jpg",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]

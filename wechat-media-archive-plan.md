@@ -79,7 +79,7 @@ wechat-archive/
 说明：
 
 - `objects` 只按内容 hash 存一份真实文件。
-- `index.sqlite` 保存消息、来源、文件、hash、归档路径等结构化信息，并通过 `schema_migrations` 记录显式 schema 版本迁移。
+- `index.sqlite` 保存消息、来源、文件、hash、归档路径等结构化信息，并通过 `schema_migrations` 记录显式 schema 版本迁移；索引 API 支持只读按 `sha256` 或 `source_path` 反查归档记录。
 - `manifests` 保存每次扫描和归档结果，便于审计和回滚。
 - `views` 可以通过软链接或索引生成“按联系人、群、年份、类型”的视图。
 - `staging` 用于临时解密、转换和校验，成功后再移动到正式归档区。
@@ -173,10 +173,11 @@ wechat-archiver extract-db-videos
 wechat-archiver extract-db-files
 wechat-archiver extract-db-voices
 wechat-archiver status
+wechat-archiver lookup
 wechat-archiver verify
 ```
 
-说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`count-db-media` 用于在已解密/普通 SQLite 消息库上估算 image/video/file/voice 候选量，不读取微信媒体目录、不写归档目录。`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定。图片、视频和文件仍从 `--account/msg` 定位，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。`extract-images` 保留用于兼容旧脚本。
+说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`count-db-media` 用于在已解密/普通 SQLite 消息库上估算 image/video/file/voice 候选量，不读取微信媒体目录、不写归档目录。`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定。图片、视频和文件仍从 `--account/msg` 定位，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。`lookup` 只读打开索引，支持按 `sha256` 反查来源或按 `source_path` 查归档状态。`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 
