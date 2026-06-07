@@ -4,12 +4,13 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
-    archive_status, derive_image_key, discover_wechat, extract_files, extract_images,
-    extract_message_db_files, extract_message_db_images, extract_message_db_videos, extract_videos,
-    extract_voices, inspect_message_db, verify_archive, ArchiveConfig, ArchiveStatus,
-    DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions, ExtractSummary, ImageKeyDerivation,
-    ImageKeyMethod, MessageDbExtractConfig, MessageDbInspectConfig, MessageDbInspection,
-    VerifySummary, WechatDiscovery,
+    archive_status, count_message_db_media, derive_image_key, discover_wechat, extract_files,
+    extract_images, extract_message_db_files, extract_message_db_images, extract_message_db_videos,
+    extract_videos, extract_voices, inspect_message_db, verify_archive, ArchiveConfig,
+    ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions, ExtractSummary,
+    ImageKeyDerivation, ImageKeyMethod, MessageDbExtractConfig, MessageDbInspectConfig,
+    MessageDbInspection, MessageDbMediaCountConfig, MessageDbMediaCountSummary,
+    MessageDbMediaTypeCount, VerifySummary, WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -46,6 +47,21 @@ enum Commands {
 
     /// 只读诊断微信消息库是否可被当前 SQLite 路径读取。
     InspectDb {
+        /// 单个微信账号目录，通常是 xwechat_files/<wxid>。
+        #[arg(long)]
+        account: PathBuf,
+
+        /// 已解密/普通 SQLite 消息库目录；不传时使用 account/db_storage/message。
+        #[arg(long)]
+        message_db_dir: Option<PathBuf>,
+
+        /// 输出 JSON。
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// 只读统计已解密/普通 SQLite 消息库中的媒体候选数量。
+    CountDbMedia {
         /// 单个微信账号目录，通常是 xwechat_files/<wxid>。
         #[arg(long)]
         account: PathBuf,
@@ -304,6 +320,17 @@ fn main() -> Result<()> {
                 message_db_dir,
             })?;
             print_message_db_inspection(&inspection, json)?;
+        }
+        Commands::CountDbMedia {
+            account,
+            message_db_dir,
+            json,
+        } => {
+            let summary = count_message_db_media(MessageDbMediaCountConfig {
+                account_dir: account,
+                message_db_dir,
+            })?;
+            print_message_db_media_count(&summary, json)?;
         }
         Commands::Scan {
             source,
@@ -662,6 +689,34 @@ fn print_message_db_inspection(inspection: &MessageDbInspection, json: bool) -> 
     Ok(())
 }
 
+fn print_message_db_media_count(summary: &MessageDbMediaCountSummary, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(summary)?);
+        return Ok(());
+    }
+
+    println!("account: {}", summary.account_dir.display());
+    println!("message_db_dir: {}", summary.message_db_dir.display());
+    println!(
+        "message_db_dir_overridden: {}",
+        summary.message_db_dir_overridden
+    );
+    print_media_type_count("image", summary.image);
+    print_media_type_count("video", summary.video);
+    print_media_type_count("file", summary.file);
+    print_media_type_count("voice", summary.voice);
+    println!("note: 该命令只读消息库，不读取、复制或 hash account/msg 下的媒体文件。");
+    println!("note: voice 当前只统计消息表 local_type=34 行数，暂不解析语音资源 BLOB。");
+    Ok(())
+}
+
+fn print_media_type_count(label: &str, count: MessageDbMediaTypeCount) {
+    println!(
+        "{label}: resource_candidates={} message_rows={} matched_messages={}",
+        count.resource_candidates, count.message_rows, count.matched_messages
+    );
+}
+
 fn print_message_db_file(label: &str, file: &wechat_archiver_core::MessageDbFileInspection) {
     println!(
         "{label}: {} status={:?} sqlite_header={} tables={:?}",
@@ -784,6 +839,36 @@ mod tests {
 
         match cli.command {
             Commands::InspectDb {
+                account,
+                message_db_dir,
+                json,
+            } => {
+                assert_eq!(account, PathBuf::from("/tmp/xwechat_files/wxid"));
+                assert_eq!(
+                    message_db_dir,
+                    Some(PathBuf::from("/tmp/decrypted-message"))
+                );
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_count_db_media_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "count-db-media",
+            "--account",
+            "/tmp/xwechat_files/wxid",
+            "--message-db-dir",
+            "/tmp/decrypted-message",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::CountDbMedia {
                 account,
                 message_db_dir,
                 json,

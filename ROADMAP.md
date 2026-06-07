@@ -177,7 +177,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 - 当前主线仍是图片归档。
 - `extract-db-images`、`extract-db-videos` 和 `extract-db-files` 只支持已解密/普通 SQLite 数据库，不支持直接读取 SQLCipher 加密库。
-- `inspect-db` 只能诊断当前消息库是否可读，不会自动解密，也不会统计加密库里的真实媒体数量。
+- `inspect-db` 只能诊断当前消息库是否可读，不会自动解密；`count-db-media` 可统计已解密/普通 SQLite 消息库，但不会统计加密库里的真实媒体数量。
 - `--message-db-dir` 只改变消息库读取位置；媒体文件仍从 `--account` 下的微信目录定位。
 - 消息来源字段当前由消息库图片、视频和文件附件归档写入 `talker/local_id/create_time`；直接 file/voice 和 `message_sender` 仍待后续消息库来源增强。
 - V2 图片 AES key 可通过 `derive-image-key` 只读派生，但抽取命令仍需要用户显式提供。
@@ -230,6 +230,7 @@ wechat-archiver extract --type voice
 
 - `image` 入口复用现有图片归档流程。
 - `inspect-db` 能在抽取前诊断消息库路径是否可读，避免只看到 `file is not a database`。
+- `count-db-media` 能在已解密/普通 SQLite 消息库上只读统计 image/video/file/voice 候选数量，不创建归档目录，不读取媒体文件。
 - `video` 入口当前扫描直接视频文件；对微信账号目录或 `msg/attach` 会自动定位同账号 `msg/video`，复制本地视频、计算 hash，并记录到同一套 archive/index/manifest。
 - `extract-db-videos` 当前从消息库枚举视频资源，定位 `msg/video/<YYYY-MM>/<md5>.mp4`，并记录消息来源字段。
 - `file` 入口当前扫描直接文件附件；对微信账号目录或 `msg/attach` 会自动定位同账号 `msg/file`，复制本地文件、计算 hash，并记录到同一套 archive/index/manifest。
@@ -345,7 +346,7 @@ wechat-archiver extract --type voice
 
 建议继续推进 P1 的消息库来源增强：
 
-- 继续做消息库来源增强，为 file/voice 补充会话、时间、发送人等上下文。
-- 下一步应优先识别消息库中文件附件的本地路径或资源引用，并复用已落地的消息来源字段。
+- 继续做消息库来源增强，为 voice 补充会话、时间、发送人等上下文。
+- 下一步应优先解析消息库语音 BLOB 或资源引用，并复用已落地的消息来源字段。
 - 语音下一步重点是解析消息库语音 BLOB，而不是继续扩大直接文件扫描范围。
 - 两条路线都应继续保持 dry-run、结构化错误、manifest/index 和安全边界一致。

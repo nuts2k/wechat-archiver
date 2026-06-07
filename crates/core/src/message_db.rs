@@ -33,6 +33,30 @@ pub struct MessageDbInspectConfig {
     pub message_db_dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MessageDbMediaCountConfig {
+    pub account_dir: PathBuf,
+    pub message_db_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MessageDbMediaCountSummary {
+    pub account_dir: PathBuf,
+    pub message_db_dir: PathBuf,
+    pub message_db_dir_overridden: bool,
+    pub image: MessageDbMediaTypeCount,
+    pub video: MessageDbMediaTypeCount,
+    pub file: MessageDbMediaTypeCount,
+    pub voice: MessageDbMediaTypeCount,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct MessageDbMediaTypeCount {
+    pub resource_candidates: u64,
+    pub message_rows: u64,
+    pub matched_messages: u64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MessageDbInspection {
     pub account_dir: PathBuf,
@@ -415,6 +439,82 @@ pub fn inspect_message_db(config: MessageDbInspectConfig) -> Result<MessageDbIns
     ))
 }
 
+pub fn count_message_db_media(
+    config: MessageDbMediaCountConfig,
+) -> Result<MessageDbMediaCountSummary> {
+    let inspection = inspect_message_db(MessageDbInspectConfig {
+        account_dir: config.account_dir,
+        message_db_dir: config.message_db_dir,
+    })?;
+    if inspection.status != MessageDbInspectionStatus::Ready {
+        return Err(ArchiverError::Other(format!(
+            "message database is not ready for media counting: status={}; message={}; next_action={}",
+            inspection_status_code(inspection.status),
+            inspection.message,
+            next_action_code(inspection.next_action)
+        )));
+    }
+
+    let message_dbs = message_db_paths(&inspection.message_db_dir)?;
+
+    let image_resources = query_image_resources(&inspection.resource_db.path)?;
+    let (image_messages, _) = query_image_message_keys(&message_dbs, &image_resources)?;
+    let image = MessageDbMediaTypeCount {
+        resource_candidates: image_resources.len() as u64,
+        message_rows: count_message_rows_for_type(&message_dbs, 3)?,
+        matched_messages: matched_message_count(
+            image_resources.iter().map(|resource| &resource.key),
+            &image_messages,
+        ),
+    };
+
+    let video_resources = query_video_resources(&inspection.resource_db.path)?;
+    let video_resource_keys = video_resources
+        .iter()
+        .map(|resource| resource.key.clone())
+        .collect::<Vec<_>>();
+    let (video_messages, _) = query_message_keys_for_type(&message_dbs, &video_resource_keys, 43)?;
+    let video = MessageDbMediaTypeCount {
+        resource_candidates: video_resources.len() as u64,
+        message_rows: count_message_rows_for_type(&message_dbs, 43)?,
+        matched_messages: matched_message_count(
+            video_resources.iter().map(|resource| &resource.key),
+            &video_messages,
+        ),
+    };
+
+    let file_resources = query_file_resources(&inspection.resource_db.path)?;
+    let file_resource_keys = file_resources
+        .iter()
+        .map(|resource| resource.key.clone())
+        .collect::<Vec<_>>();
+    let (file_messages, _) = query_message_keys_for_type(&message_dbs, &file_resource_keys, 49)?;
+    let file = MessageDbMediaTypeCount {
+        resource_candidates: file_resources.len() as u64,
+        message_rows: count_message_rows_for_type(&message_dbs, 49)?,
+        matched_messages: matched_message_count(
+            file_resources.iter().map(|resource| &resource.key),
+            &file_messages,
+        ),
+    };
+
+    let voice = MessageDbMediaTypeCount {
+        resource_candidates: 0,
+        message_rows: count_message_rows_for_type(&message_dbs, 34)?,
+        matched_messages: 0,
+    };
+
+    Ok(MessageDbMediaCountSummary {
+        account_dir: inspection.account_dir,
+        message_db_dir: inspection.message_db_dir,
+        message_db_dir_overridden: inspection.message_db_dir_overridden,
+        image,
+        video,
+        file,
+        voice,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct MessageDbSource {
     message_dir: PathBuf,
@@ -551,7 +651,7 @@ fn inspect_message_db_dir(
 fn inspection_message(status: MessageDbInspectionStatus) -> String {
     match status {
         MessageDbInspectionStatus::Ready => {
-            "消息库是当前可读的普通 SQLite，可继续运行 extract-db-* 或先 dry-run。"
+            "消息库是当前可读的普通 SQLite，可继续运行 count-db-media、extract-db-* 或先 dry-run。"
                 .to_string()
         }
         MessageDbInspectionStatus::Missing => {
@@ -572,6 +672,16 @@ fn inspection_message(status: MessageDbInspectionStatus) -> String {
     }
 }
 
+fn inspection_status_code(status: MessageDbInspectionStatus) -> &'static str {
+    match status {
+        MessageDbInspectionStatus::Ready => "ready",
+        MessageDbInspectionStatus::Missing => "missing",
+        MessageDbInspectionStatus::EncryptedOrNotSqlite => "encrypted_or_not_sqlite",
+        MessageDbInspectionStatus::Unsupported => "unsupported",
+        MessageDbInspectionStatus::Error => "error",
+    }
+}
+
 fn inspection_next_action(status: MessageDbInspectionStatus) -> MessageDbNextAction {
     match status {
         MessageDbInspectionStatus::Ready => MessageDbNextAction::RunExtractDb,
@@ -581,6 +691,14 @@ fn inspection_next_action(status: MessageDbInspectionStatus) -> MessageDbNextAct
         MessageDbInspectionStatus::EncryptedOrNotSqlite | MessageDbInspectionStatus::Error => {
             MessageDbNextAction::ProvideDecryptedMessageDbDir
         }
+    }
+}
+
+fn next_action_code(next_action: MessageDbNextAction) -> &'static str {
+    match next_action {
+        MessageDbNextAction::RunExtractDb => "run_extract_db",
+        MessageDbNextAction::ProvideDecryptedMessageDbDir => "provide_decrypted_message_db_dir",
+        MessageDbNextAction::CheckMessageDbPath => "check_message_db_path",
     }
 }
 
@@ -893,6 +1011,40 @@ fn query_message_keys_for_type(
     }
 
     Ok((keys, scanned_rows))
+}
+
+fn count_message_rows_for_type(message_dbs: &[PathBuf], local_type: i64) -> Result<u64> {
+    let mut count = 0u64;
+    for db_path in message_dbs {
+        let conn = open_readonly_db(db_path)?;
+        for table_name in message_table_names(&conn)? {
+            if !table_has_column(&conn, &table_name, "local_type")? {
+                continue;
+            }
+            let sql = format!(
+                r#"
+                SELECT COUNT(*)
+                FROM {}
+                WHERE local_type = ?1 OR local_type % 4294967296 = ?1
+                "#,
+                quote_identifier(&table_name)
+            );
+            let table_count = conn.query_row(&sql, [local_type], |row| row.get::<_, u64>(0))?;
+            count += table_count;
+        }
+    }
+    Ok(count)
+}
+
+fn matched_message_count<'a>(
+    resource_keys: impl IntoIterator<Item = &'a MessageKey>,
+    message_keys: &BTreeSet<MessageKey>,
+) -> u64 {
+    let resource_keys = resource_keys.into_iter().cloned().collect::<BTreeSet<_>>();
+    message_keys
+        .iter()
+        .filter(|key| resource_keys.contains(*key))
+        .count() as u64
 }
 
 fn query_video_resources(resource_db: &Path) -> Result<Vec<VideoResource>> {
@@ -1354,6 +1506,20 @@ fn table_has_column(conn: &Connection, table_name: &str, column_name: &str) -> R
         }
     }
     Ok(false)
+}
+
+fn message_table_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut names = Vec::new();
+    for row in rows {
+        let name = row?;
+        if name.starts_with("Msg_") {
+            names.push(name);
+        }
+    }
+    Ok(names)
 }
 
 fn message_table_name(talker: &str) -> String {
@@ -2147,6 +2313,113 @@ mod tests {
     }
 
     #[test]
+    fn counts_message_db_media_without_reading_media_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let talker = "room@example";
+        create_media_count_fixture_account(&account, talker);
+
+        let summary = count_message_db_media(MessageDbMediaCountConfig {
+            account_dir: account.clone(),
+            message_db_dir: None,
+        })
+        .unwrap();
+
+        assert_eq!(summary.account_dir, account.canonicalize().unwrap());
+        assert_eq!(
+            summary.message_db_dir,
+            account
+                .join("db_storage")
+                .join("message")
+                .canonicalize()
+                .unwrap()
+        );
+        assert!(!summary.message_db_dir_overridden);
+        assert_eq!(
+            summary.image,
+            MessageDbMediaTypeCount {
+                resource_candidates: 1,
+                message_rows: 1,
+                matched_messages: 1,
+            }
+        );
+        assert_eq!(
+            summary.video,
+            MessageDbMediaTypeCount {
+                resource_candidates: 1,
+                message_rows: 2,
+                matched_messages: 1,
+            }
+        );
+        assert_eq!(
+            summary.file,
+            MessageDbMediaTypeCount {
+                resource_candidates: 1,
+                message_rows: 1,
+                matched_messages: 1,
+            }
+        );
+        assert_eq!(
+            summary.voice,
+            MessageDbMediaTypeCount {
+                resource_candidates: 0,
+                message_rows: 1,
+                matched_messages: 0,
+            }
+        );
+        assert!(!account.join("msg").exists());
+    }
+
+    #[test]
+    fn counts_message_db_media_from_external_message_db_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let decrypted_message_dir = tmp.path().join("decrypted-message");
+        create_media_count_fixture_account(&account, "room@example");
+        copy_dir(
+            &account.join("db_storage").join("message"),
+            &decrypted_message_dir,
+        );
+        fs::remove_dir_all(account.join("db_storage")).unwrap();
+
+        let summary = count_message_db_media(MessageDbMediaCountConfig {
+            account_dir: account,
+            message_db_dir: Some(decrypted_message_dir.clone()),
+        })
+        .unwrap();
+
+        assert_eq!(
+            summary.message_db_dir,
+            decrypted_message_dir.canonicalize().unwrap()
+        );
+        assert!(summary.message_db_dir_overridden);
+        assert_eq!(summary.image.resource_candidates, 1);
+        assert_eq!(summary.video.message_rows, 2);
+        assert_eq!(summary.file.matched_messages, 1);
+        assert_eq!(summary.voice.message_rows, 1);
+    }
+
+    #[test]
+    fn count_message_db_media_reports_encrypted_or_not_sqlite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let message_dir = account.join("db_storage").join("message");
+        fs::create_dir_all(&message_dir).unwrap();
+        fs::write(message_dir.join("message_resource.db"), b"not sqlite").unwrap();
+        fs::write(message_dir.join("message_0.db"), b"not sqlite").unwrap();
+
+        let error = count_message_db_media(MessageDbMediaCountConfig {
+            account_dir: account,
+            message_db_dir: None,
+        })
+        .expect_err("encrypted or non-SQLite message db should not be counted");
+
+        let message = error.to_string();
+        assert!(message.contains("status=encrypted_or_not_sqlite"));
+        assert!(message.contains("next_action=provide_decrypted_message_db_dir"));
+    }
+
+    #[test]
     fn file_attachment_names_must_be_safe_leaf_names() {
         assert!(plausible_file_attachment_name("report.pdf"));
         assert!(plausible_file_attachment_name("2026 final.xlsx"));
@@ -2532,6 +2805,121 @@ mod tests {
         blob.push(0);
         blob.extend_from_slice(b"suffix");
         blob
+    }
+
+    fn create_media_count_fixture_account(account: &Path, talker: &str) {
+        let message_dir = account.join("db_storage").join("message");
+        fs::create_dir_all(&message_dir).unwrap();
+        create_media_count_message_db(&message_dir.join("message_0.db"), talker);
+        create_media_count_resource_db(&message_dir.join("message_resource.db"), talker);
+    }
+
+    fn create_media_count_message_db(path: &Path, talker: &str) {
+        let conn = Connection::open(path).unwrap();
+        let table_name = message_table_name(talker);
+        conn.execute(
+            &format!(
+                "CREATE TABLE {} (local_id INTEGER, create_time INTEGER, local_type INTEGER)",
+                quote_identifier(&table_name)
+            ),
+            [],
+        )
+        .unwrap();
+        for (local_id, create_time, local_type) in [
+            (101, 1_779_472_800, 3),
+            (102, 1_779_472_801, 43),
+            (103, 1_779_472_802, 49),
+            (104, 1_779_472_803, 34),
+            (999, 1_779_472_804, 43),
+        ] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {} (local_id, create_time, local_type) VALUES (?1, ?2, ?3)",
+                    quote_identifier(&table_name)
+                ),
+                params![local_id, create_time, (1_i64 << 32) + local_type],
+            )
+            .unwrap();
+        }
+    }
+
+    fn create_media_count_resource_db(path: &Path, talker: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE ChatName2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE MessageResourceInfo (
+                message_id INTEGER,
+                chat_id INTEGER,
+                message_local_id INTEGER,
+                message_create_time INTEGER,
+                message_local_type INTEGER,
+                packed_info BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE MessageResourceDetail (
+                message_id INTEGER,
+                type INTEGER,
+                packed_info BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ChatName2Id(rowid, user_name) VALUES (?1, ?2)",
+            params![1, talker],
+        )
+        .unwrap();
+        for (message_id, local_id, create_time, local_type, packed_info) in [
+            (
+                101,
+                101,
+                1_779_472_800,
+                3,
+                packed_md5("11111111111111111111111111111111"),
+            ),
+            (102, 102, 1_779_472_801, 43, Vec::<u8>::new()),
+            (
+                103,
+                103,
+                1_779_472_802,
+                49,
+                packed_file_name("统计报告.pdf"),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO MessageResourceInfo (
+                    message_id,
+                    chat_id,
+                    message_local_id,
+                    message_create_time,
+                    message_local_type,
+                    packed_info
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    message_id,
+                    1,
+                    local_id,
+                    create_time,
+                    (1_i64 << 32) + local_type,
+                    packed_info
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO MessageResourceDetail(message_id, type, packed_info) VALUES (?1, ?2, ?3)",
+            params![102, 2, packed_md5("22222222222222222222222222222222")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO MessageResourceDetail(message_id, type, packed_info) VALUES (?1, ?2, ?3)",
+            params![103, 0, packed_file_name("统计报告.pdf")],
+        )
+        .unwrap();
     }
 
     fn copy_dir(from: &Path, to: &Path) {

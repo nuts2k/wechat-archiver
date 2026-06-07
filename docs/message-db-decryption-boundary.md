@@ -21,6 +21,17 @@ wechat-archiver inspect-db \
 确认 `status=ready` 后，再运行：
 
 ```bash
+wechat-archiver count-db-media \
+  --account "/path/to/xwechat_files/<wxid>" \
+  --message-db-dir "/path/to/decrypted/message" \
+  --json
+```
+
+`count-db-media` 不需要归档目录，不创建索引或 manifest，也不会读取、复制或 hash `--account/msg` 下的媒体文件。它只统计已解密/普通 SQLite 消息库里的候选数量；语音当前只统计 `local_type=34` 消息行，暂不解析语音资源 BLOB。
+
+确认候选量后，再运行：
+
+```bash
 wechat-archiver extract-db-videos \
   --account "/path/to/xwechat_files/<wxid>" \
   --message-db-dir "/path/to/decrypted/message" \
@@ -33,6 +44,5 @@ wechat-archiver extract-db-videos \
 
 ## 后续可做
 
-- 增强 `inspect-db` 的汇总字段，例如各类消息候选计数。
-- 增加只读 `count-db-media` 命令，在已解密消息库上统计 image/video/file/voice 候选数量。
+- 增强 `inspect-db` 的汇总字段，必要时复用 `count-db-media` 的各类消息候选计数。
 - 如果未来实现数据库解密，也必须作为单独显式命令，默认 dry-run，并要求用户明确提供密钥或已授权的解密材料；不得隐式读取进程内存或修改微信应用。

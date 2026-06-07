@@ -10,6 +10,7 @@
 - 只读递归扫描用户指定的源目录。
 - 只读读取已解密/普通 SQLite 消息库：`db_storage/message/message_*.db` 和 `message_resource.db`。
 - 支持 `inspect-db` 只读诊断消息库目录，区分普通 SQLite、缺失、非 SQLite 或疑似加密库。
+- 支持 `count-db-media` 只读统计已解密/普通 SQLite 消息库中的 image/video/file/voice 候选数量，不读取、复制或 hash 媒体文件。
 - 基于 `MessageResourceInfo` 和 `Msg_<md5(talker)>` 枚举图片消息，定位 `msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5>.dat`。
 - 基于消息库资源信息枚举视频和文件附件，分别定位 `msg/video/<YYYY-MM>/<md5>.mp4` 和 `msg/file/<YYYY-MM>/<file_name>`。
 - 归档普通图片：`jpg`、`jpeg`、`png`、`gif`、`bmp`、`webp`、`tif`、`tiff`、`heic`、`heif`。
@@ -25,7 +26,7 @@
 - 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind`、独立 `decoder` 和可用的消息来源字段。
 - 支持 `status` 查看索引统计，支持 `verify` 重新计算归档对象 hash。
 
-当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`extract-db-images`、`extract-db-videos` 和 `extract-db-files` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；媒体文件仍只从 `--account` 下的 `msg/*` 读取。
+当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`count-db-media`、`extract-db-images`、`extract-db-videos` 和 `extract-db-files` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；媒体文件仍只从 `--account` 下的 `msg/*` 读取。
 
 ## 安全边界
 
@@ -84,6 +85,17 @@ cargo run -p wechat-archiver -- inspect-db \
 如果输出 `status=encrypted_or_not_sqlite`，通常表示微信 4.x SQLCipher/WCDB 加密库。本项目不会读取微信进程内存、不会提权、不会重签微信，也不会内置密钥提取流程；下一步应由用户通过独立可信流程准备已解密消息库副本，然后先用 `inspect-db --message-db-dir` 校验，再运行 `extract-db-* --message-db-dir`。
 
 消息库解密边界和已解密副本工作流见 [docs/message-db-decryption-boundary.md](docs/message-db-decryption-boundary.md)。
+
+只读统计已解密/普通 SQLite 消息库里的媒体候选数量：
+
+```bash
+cargo run -p wechat-archiver -- count-db-media \
+  --account "/path/to/xwechat_files/<wxid>" \
+  --message-db-dir "/path/to/decrypted/message" \
+  --json
+```
+
+`count-db-media` 不需要 `--archive`，不会创建归档目录、索引或 manifest，也不会读取、复制或 hash `--account/msg` 下的媒体文件。输出中的 `resource_candidates` 表示资源库可解析候选数，`message_rows` 表示消息表对应 `local_type` 行数，`matched_messages` 表示两边能按 `talker/local_id/create_time` 匹配的消息数。语音当前只统计消息表 `local_type=34` 行数，暂不解析语音资源 BLOB，因此 `voice.resource_candidates=0`、`voice.matched_messages=0`。
 
 只读扫描，不写入归档目录：
 
