@@ -155,11 +155,14 @@ wechat-archive/
 
 ```bash
 wechat-archiver scan
+wechat-archiver extract --type image
 wechat-archiver extract-images
 wechat-archiver extract-db-images
 wechat-archiver status
 wechat-archiver verify
 ```
+
+说明：`extract --type image` 是统一媒体抽取入口的第一步，当前复用图片归档流程；`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 

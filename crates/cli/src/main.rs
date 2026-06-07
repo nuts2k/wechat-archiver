@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
     archive_status, derive_image_key, discover_wechat, extract_images, extract_message_db_images,
@@ -77,39 +77,20 @@ enum Commands {
         json: bool,
     },
 
+    /// 统一媒体抽取入口；当前已接入 image，其他类型后续扩展。
+    Extract {
+        /// 媒体类型，支持逗号分隔；当前仅 image 已实现。
+        #[arg(long = "type", value_enum, value_delimiter = ',', required = true)]
+        media_types: Vec<MediaType>,
+
+        #[command(flatten)]
+        args: ImageExtractArgs,
+    },
+
     /// 归档普通图片和可识别旧 XOR .dat 图片。
     ExtractImages {
-        /// 微信本地数据目录或待扫描目录。
-        #[arg(long)]
-        source: PathBuf,
-
-        /// 独立归档目录，不能位于 source 内部，也不能包含 source。
-        #[arg(long)]
-        archive: PathBuf,
-
-        /// 只扫描和解码，不写入 archive。
-        #[arg(long)]
-        dry_run: bool,
-
-        /// V2 图片 .dat AES key，显式提供才会尝试解码 V2。
-        #[arg(long)]
-        image_aes_key: Option<String>,
-
-        /// V1/V2 图片 .dat 尾段 XOR key，默认 0x88。
-        #[arg(long, default_value = "0x88")]
-        image_xor_key: String,
-
-        /// wxgf 私有图片处理模式：jpg 调用 ffmpeg 输出首帧 JPG，raw 归档原始 wxgf，off 关闭。
-        #[arg(long, value_enum, default_value = "jpg")]
-        wxgf_mode: WxgfMode,
-
-        /// ffmpeg 可执行文件路径；不传时使用 PATH 中的 ffmpeg。
-        #[arg(long)]
-        wxgf_ffmpeg_path: Option<PathBuf>,
-
-        /// 输出 JSON。
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        args: ImageExtractArgs,
     },
 
     /// 从已解密/普通 SQLite 微信消息库枚举图片消息并归档。
@@ -170,6 +151,49 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Clone, Args)]
+struct ImageExtractArgs {
+    /// 微信本地数据目录或待扫描目录。
+    #[arg(long)]
+    source: PathBuf,
+
+    /// 独立归档目录，不能位于 source 内部，也不能包含 source。
+    #[arg(long)]
+    archive: PathBuf,
+
+    /// 只扫描和解码，不写入 archive。
+    #[arg(long)]
+    dry_run: bool,
+
+    /// V2 图片 .dat AES key，显式提供才会尝试解码 V2。
+    #[arg(long)]
+    image_aes_key: Option<String>,
+
+    /// V1/V2 图片 .dat 尾段 XOR key，默认 0x88。
+    #[arg(long, default_value = "0x88")]
+    image_xor_key: String,
+
+    /// wxgf 私有图片处理模式：jpg 调用 ffmpeg 输出首帧 JPG，raw 归档原始 wxgf，off 关闭。
+    #[arg(long, value_enum, default_value = "jpg")]
+    wxgf_mode: WxgfMode,
+
+    /// ffmpeg 可执行文件路径；不传时使用 PATH 中的 ffmpeg。
+    #[arg(long)]
+    wxgf_ffmpeg_path: Option<PathBuf>,
+
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MediaType {
+    Image,
+    Video,
+    File,
+    Voice,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum WxgfMode {
     Off,
@@ -227,28 +251,15 @@ fn main() -> Result<()> {
             })?;
             print_extract_summary(&summary, json)?;
         }
-        Commands::ExtractImages {
-            source,
-            archive,
-            dry_run,
-            image_aes_key,
-            image_xor_key,
-            wxgf_mode,
-            wxgf_ffmpeg_path,
-            json,
-        } => {
-            let summary = extract_images(ArchiveConfig {
-                source_dir: source,
-                archive_dir: archive,
-                dry_run,
-                dat_options: parse_dat_options(
-                    image_aes_key,
-                    &image_xor_key,
-                    wxgf_mode,
-                    wxgf_ffmpeg_path,
-                )?,
-                explain_unsupported: false,
-            })?;
+        Commands::Extract { media_types, args } => {
+            ensure_supported_extract_types(&media_types)?;
+            let json = args.json;
+            let summary = run_image_extract(args)?;
+            print_extract_summary(&summary, json)?;
+        }
+        Commands::ExtractImages { args } => {
+            let json = args.json;
+            let summary = run_image_extract(args)?;
             print_extract_summary(&summary, json)?;
         }
         Commands::ExtractDbImages {
@@ -289,6 +300,45 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn ensure_supported_extract_types(media_types: &[MediaType]) -> Result<()> {
+    let unsupported = media_types
+        .iter()
+        .copied()
+        .filter(|media_type| *media_type != MediaType::Image)
+        .map(media_type_name)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        unsupported.is_empty(),
+        "extract --type currently supports only image; unsupported types: {}",
+        unsupported.join(",")
+    );
+    Ok(())
+}
+
+fn media_type_name(media_type: MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "image",
+        MediaType::Video => "video",
+        MediaType::File => "file",
+        MediaType::Voice => "voice",
+    }
+}
+
+fn run_image_extract(args: ImageExtractArgs) -> Result<ExtractSummary> {
+    Ok(extract_images(ArchiveConfig {
+        source_dir: args.source,
+        archive_dir: args.archive,
+        dry_run: args.dry_run,
+        dat_options: parse_dat_options(
+            args.image_aes_key,
+            &args.image_xor_key,
+            args.wxgf_mode,
+            args.wxgf_ffmpeg_path,
+        )?,
+        explain_unsupported: false,
+    })?)
 }
 
 fn print_image_key_derivation(result: &ImageKeyDerivation, json: bool) -> Result<()> {
@@ -467,4 +517,72 @@ fn print_verify_summary(summary: &VerifySummary, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_unified_extract_image_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "extract",
+            "--type",
+            "image",
+            "--source",
+            "/tmp/wechat-source",
+            "--archive",
+            "/tmp/wechat-archive",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Extract { media_types, args } => {
+                assert_eq!(media_types, vec![MediaType::Image]);
+                assert_eq!(args.source, PathBuf::from("/tmp/wechat-source"));
+                assert_eq!(args.archive, PathBuf::from("/tmp/wechat-archive"));
+                assert!(args.dry_run);
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_comma_separated_extract_types() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "extract",
+            "--type",
+            "image,video,voice",
+            "--source",
+            "/tmp/wechat-source",
+            "--archive",
+            "/tmp/wechat-archive",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Extract { media_types, .. } => {
+                assert_eq!(
+                    media_types,
+                    vec![MediaType::Image, MediaType::Video, MediaType::Voice]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unimplemented_extract_types_before_running() {
+        let error = ensure_supported_extract_types(&[MediaType::Image, MediaType::Video])
+            .expect_err("video is not implemented yet");
+
+        assert!(error
+            .to_string()
+            .contains("currently supports only image; unsupported types: video"));
+    }
 }

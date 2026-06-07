@@ -59,6 +59,7 @@ Rust core library
 ### 图片扫描与归档
 
 - 支持 `scan` dry-run。
+- 支持统一媒体抽取入口 `extract --type image`，当前复用图片归档流程。
 - 支持 `extract-images` 从指定源目录扫描图片。
 - 支持 `extract-db-images` 从已解密/普通 SQLite 消息库枚举图片消息并定位本地 `.dat`。
 - 支持普通图片扩展名：`jpg`、`jpeg`、`png`、`gif`、`bmp`、`webp`、`tif`、`tiff`、`heic`、`heif`。
@@ -117,7 +118,7 @@ wechat-archive/
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only，以及 manifest/index 的 `decoder` 记录。
+- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 记录，以及统一 `extract --type` CLI 解析。
 - 已通过：
 
 ```bash
@@ -136,7 +137,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 - `derive-image-key` 不自动保存 key；本机 key 文档应继续保存在 `.gitignore` 覆盖的本地文件中。
 - `wxgf jpg/mp4` 依赖 `ffmpeg`，没有可用 `ffmpeg` 时应使用 `raw` 或 `off`。
 - `wxgf jpg` 当前输出首帧 JPG，不保留可能存在的动态效果。
-- 视频、文件、语音、表情、收藏、朋友圈等尚未形成统一归档命令。
+- 统一 `extract` 入口当前只接入图片；视频、文件、语音、表情、收藏、朋友圈等尚未接入归档流程。
 - 尚未实现 Tauri 桌面客户端。
 - 尚未实现归档后的清理建议或删除操作。
 
@@ -166,14 +167,20 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 目标：从“图片归档器”扩展为“媒体归档器”。
 
-计划：
+已完成：
 
-- 增加统一命令，例如：
+- 增加统一命令第一步：
 
 ```bash
-wechat-archiver extract --type image,video,file,voice
+wechat-archiver extract --type image
 ```
 
+- 该入口复用现有图片归档流程，保持 dry-run、结构化错误、manifest/index 和安全边界一致。
+- `video`、`file`、`voice` 等类型当前会明确返回尚未支持，不会静默跳过或生成不完整归档。
+
+计划：
+
+- 将 `extract --type image,video,file,voice` 扩展为多媒体归档入口。
 - 视频归档：复制本地视频、计算 hash、记录时长和分辨率。
 - 文件归档：保留原始文件名、扩展名、大小、来源消息。
 - 语音归档：先保存原始格式，再支持可选转换为 `wav` 或 `mp3`。
