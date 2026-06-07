@@ -68,6 +68,10 @@ enum Commands {
         #[arg(long)]
         wxgf_ffmpeg_path: Option<PathBuf>,
 
+        /// 输出 unsupported 原因计数和样例路径。
+        #[arg(long)]
+        explain_unsupported: bool,
+
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
@@ -206,6 +210,7 @@ fn main() -> Result<()> {
             image_xor_key,
             wxgf_mode,
             wxgf_ffmpeg_path,
+            explain_unsupported,
             json,
         } => {
             let summary = extract_images(ArchiveConfig {
@@ -218,6 +223,7 @@ fn main() -> Result<()> {
                     wxgf_mode,
                     wxgf_ffmpeg_path,
                 )?,
+                explain_unsupported,
             })?;
             print_extract_summary(&summary, json)?;
         }
@@ -241,6 +247,7 @@ fn main() -> Result<()> {
                     wxgf_mode,
                     wxgf_ffmpeg_path,
                 )?,
+                explain_unsupported: false,
             })?;
             print_extract_summary(&summary, json)?;
         }
@@ -264,6 +271,7 @@ fn main() -> Result<()> {
                     wxgf_mode,
                     wxgf_ffmpeg_path,
                 )?,
+                explain_unsupported: false,
             })?;
             print_extract_summary(&summary, json)?;
         }
@@ -406,6 +414,15 @@ fn print_extract_summary(summary: &ExtractSummary, json: bool) -> Result<()> {
     println!("already_archived: {}", summary.already_archived);
     println!("unsupported: {}", summary.unsupported);
     println!("failed: {}", summary.failed);
+    if let Some(explanation) = &summary.unsupported_explanation {
+        println!("unsupported_reasons:");
+        for reason in &explanation.reasons {
+            println!("  {}: {}", reason.reason, reason.count);
+            for sample in &reason.samples {
+                println!("    sample: {sample}");
+            }
+        }
+    }
     if let Some(path) = &summary.index_path {
         println!("index: {}", path.display());
     }

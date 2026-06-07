@@ -21,6 +21,9 @@ pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
         resolved.archive_dir.clone(),
         resolved.dry_run,
     );
+    if resolved.explain_unsupported {
+        summary.enable_unsupported_explanation();
+    }
 
     let mut conn = None;
     let mut manifest = None;
@@ -74,15 +77,50 @@ pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
     if let Some(writer) = manifest.as_mut() {
         writer.flush()?;
     }
+    summary.finish_unsupported_explanation();
 
     Ok(summary)
 }
 
-pub(crate) fn apply_result(summary: &mut ExtractSummary, result: Result<ScanAction>) -> Result<()> {
-    match result? {
+#[derive(Debug, Clone)]
+pub(crate) struct ScanOutcome {
+    pub action: ScanAction,
+    pub unsupported_reason: Option<String>,
+    pub unsupported_sample: Option<String>,
+}
+
+impl ScanOutcome {
+    pub(crate) fn new(action: ScanAction) -> Self {
+        Self {
+            action,
+            unsupported_reason: None,
+            unsupported_sample: None,
+        }
+    }
+
+    fn unsupported(reason: impl Into<String>, sample: impl Into<String>) -> Self {
+        Self {
+            action: ScanAction::Unsupported,
+            unsupported_reason: Some(reason.into()),
+            unsupported_sample: Some(sample.into()),
+        }
+    }
+}
+
+pub(crate) fn apply_result(
+    summary: &mut ExtractSummary,
+    result: Result<ScanOutcome>,
+) -> Result<()> {
+    let result = result?;
+    match result.action {
         ScanAction::Archived => summary.archived += 1,
         ScanAction::AlreadyArchived => summary.already_archived += 1,
-        ScanAction::Unsupported => summary.unsupported += 1,
+        ScanAction::Unsupported => {
+            summary.unsupported += 1;
+            if let Some(reason) = result.unsupported_reason {
+                summary.record_unsupported(reason, result.unsupported_sample);
+            }
+        }
         ScanAction::Failed => summary.failed += 1,
         ScanAction::WouldArchive => summary.would_archive += 1,
     }
@@ -99,7 +137,7 @@ fn process_direct_image(
     dry_run: bool,
     conn: Option<&Connection>,
     manifest: Option<&mut ManifestWriter>,
-) -> Result<ScanAction> {
+) -> Result<ScanOutcome> {
     let rel = relative_path(path, source_root)?;
     let (sha256, size_bytes) = sha256_file(path)?;
 
@@ -133,7 +171,7 @@ fn process_direct_image(
         None,
     );
     persist(conn, manifest, &event)?;
-    Ok(action)
+    Ok(ScanOutcome::new(action))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -146,7 +184,7 @@ pub(crate) fn process_dat_image(
     dat_options: &DatDecodeOptions,
     conn: Option<&Connection>,
     manifest: Option<&mut ManifestWriter>,
-) -> Result<ScanAction> {
+) -> Result<ScanOutcome> {
     let rel = relative_path(path, source_root)?;
 
     match decode_dat(path, dat_options)? {
@@ -186,7 +224,7 @@ pub(crate) fn process_dat_image(
                 None,
             );
             persist(conn, manifest, &event)?;
-            Ok(action)
+            Ok(ScanOutcome::new(action))
         }
         DatDecode::Unsupported { reason } => {
             let event = build_event(
@@ -204,7 +242,7 @@ pub(crate) fn process_dat_image(
                 Some(reason.to_string()),
             );
             persist(conn, manifest, &event)?;
-            Ok(ScanAction::Unsupported)
+            Ok(ScanOutcome::unsupported(reason, rel))
         }
     }
 }
@@ -313,6 +351,7 @@ mod tests {
             archive_dir: archive.clone(),
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
         })
         .unwrap();
 
@@ -344,6 +383,7 @@ mod tests {
             archive_dir: archive.clone(),
             dry_run: true,
             dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
         })
         .unwrap();
 
@@ -366,6 +406,7 @@ mod tests {
                 archive_dir: archive.clone(),
                 dry_run: false,
                 dat_options: DatDecodeOptions::default(),
+                explain_unsupported: false,
             })
             .unwrap();
 
@@ -377,5 +418,43 @@ mod tests {
         assert_eq!(status.total_records, 1);
         assert_eq!(status.unsupported_records, 1);
         assert_eq!(status.archived_records, 0);
+    }
+
+    #[test]
+    fn explain_unsupported_groups_reasons_and_samples() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("unknown.dat"), b"not-a-supported-dat").unwrap();
+        std::fs::write(
+            source.join("missing-key.dat"),
+            [b"\x07\x08V2\x08\x07".as_slice(), &[0; 16]].concat(),
+        )
+        .unwrap();
+
+        let summary = extract_images(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive,
+            dry_run: true,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: true,
+        })
+        .unwrap();
+
+        assert_eq!(summary.candidates, 2);
+        assert_eq!(summary.unsupported, 2);
+        let explanation = summary.unsupported_explanation.unwrap();
+        assert_eq!(explanation.reasons.len(), 2);
+        assert!(explanation.reasons.iter().any(|reason| {
+            reason.reason == "xor_key_not_detected"
+                && reason.count == 1
+                && reason.samples == ["unknown.dat"]
+        }));
+        assert!(explanation.reasons.iter().any(|reason| {
+            reason.reason == "v2_aes_key_missing"
+                && reason.count == 1
+                && reason.samples == ["missing-key.dat"]
+        }));
     }
 }

@@ -69,6 +69,7 @@ Rust core library
 - `derive-image-key` 支持在 `kvcomm` 不可用时基于账号目录 wxid 后缀搜索候选。
 - 支持 V2 AES `.dat` 在用户显式传入 `--image-aes-key` 时解码。
 - 支持 V1/V2 尾段 XOR key 参数 `--image-xor-key`。
+- 支持 `scan --explain-unsupported` 输出无法归档原因计数和样例路径。
 - 支持 `wxgf` 私有图片格式：
 - `--wxgf-mode jpg`：默认模式，提取内部 HEVC 分片并调用 `ffmpeg` 转首帧 JPG。
 - `--wxgf-mode raw`：归档解密后的原始 `wxgf`。
@@ -143,7 +144,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 计划：
 
-- 增加 `scan --explain-unsupported` 或类似报告，输出各类失败原因计数和样例。
 - 优化 dry-run 性能：`wxgf jpg` dry-run 可只验证分区和 ffmpeg 可用性，避免全量转码耗时过长。
 - 在 manifest/index 中记录更细的 decoder：`legacy_xor`、`v1_aes`、`v2_aes`、`wxgf_jpg`、`wxgf_raw`、`wxgf_mp4`。
 - 为 `ffmpeg` 缺失、执行失败、输出格式异常提供更清晰的用户提示。

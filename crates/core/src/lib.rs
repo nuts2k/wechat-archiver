@@ -19,6 +19,8 @@ pub use image_key::{derive_image_key, DeriveImageKeyOptions, ImageKeyDerivation,
 pub use message_db::{extract_message_db_images, MessageDbExtractConfig};
 pub use scanner::extract_images;
 pub use status::{archive_status, ArchiveStatus};
-pub use types::{ExtractSummary, ManifestEvent, ScanAction};
+pub use types::{
+    ExtractSummary, ManifestEvent, ScanAction, UnsupportedExplanation, UnsupportedReasonSummary,
+};
 pub use verify::{verify_archive, VerifySummary};
 pub use wechat::{discover_wechat, DiscoverOptions, WechatAccount, WechatDiscovery};

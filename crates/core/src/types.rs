@@ -46,6 +46,20 @@ pub struct ExtractSummary {
     pub failed: u64,
     pub manifest_path: Option<PathBuf>,
     pub index_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsupported_explanation: Option<UnsupportedExplanation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UnsupportedExplanation {
+    pub reasons: Vec<UnsupportedReasonSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnsupportedReasonSummary {
+    pub reason: String,
+    pub count: u64,
+    pub samples: Vec<String>,
 }
 
 impl ExtractSummary {
@@ -69,7 +83,54 @@ impl ExtractSummary {
             failed: 0,
             manifest_path: None,
             index_path: None,
+            unsupported_explanation: None,
         }
+    }
+
+    pub(crate) fn enable_unsupported_explanation(&mut self) {
+        self.unsupported_explanation = Some(UnsupportedExplanation::default());
+    }
+
+    pub(crate) fn record_unsupported(&mut self, reason: String, sample: Option<String>) {
+        let Some(explanation) = self.unsupported_explanation.as_mut() else {
+            return;
+        };
+        let entry = explanation
+            .reasons
+            .iter_mut()
+            .find(|entry| entry.reason == reason);
+        let entry = match entry {
+            Some(entry) => entry,
+            None => {
+                explanation.reasons.push(UnsupportedReasonSummary {
+                    reason,
+                    count: 0,
+                    samples: Vec::new(),
+                });
+                explanation
+                    .reasons
+                    .last_mut()
+                    .expect("inserted reason must exist")
+            }
+        };
+        entry.count += 1;
+        if let Some(sample) = sample {
+            if entry.samples.len() < 3 {
+                entry.samples.push(sample);
+            }
+        }
+    }
+
+    pub(crate) fn finish_unsupported_explanation(&mut self) {
+        let Some(explanation) = self.unsupported_explanation.as_mut() else {
+            return;
+        };
+        explanation.reasons.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then(left.reason.cmp(&right.reason))
+        });
     }
 }
 

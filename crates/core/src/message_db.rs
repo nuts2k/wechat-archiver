@@ -8,7 +8,7 @@ use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions};
 use crate::error::{ArchiverError, IoContext, Result};
 use crate::index::{index_path, open_index};
 use crate::manifest::ManifestWriter;
-use crate::scanner::{apply_result, persist, process_dat_image};
+use crate::scanner::{apply_result, persist, process_dat_image, ScanOutcome};
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 
 #[derive(Debug, Clone)]
@@ -17,6 +17,7 @@ pub struct MessageDbExtractConfig {
     pub archive_dir: PathBuf,
     pub dry_run: bool,
     pub dat_options: DatDecodeOptions,
+    pub explain_unsupported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -38,6 +39,7 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
         archive_dir: config.archive_dir,
         dry_run: config.dry_run,
         dat_options: config.dat_options,
+        explain_unsupported: config.explain_unsupported,
     }
     .resolve()?;
 
@@ -77,6 +79,9 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
         resolved.dry_run,
     );
     summary.scanned_files = scanned_rows;
+    if resolved.explain_unsupported {
+        summary.enable_unsupported_explanation();
+    }
 
     let mut conn = None;
     let mut manifest = None;
@@ -126,6 +131,7 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
     if let Some(writer) = manifest.as_mut() {
         writer.flush()?;
     }
+    summary.finish_unsupported_explanation();
 
     Ok(summary)
 }
@@ -258,7 +264,7 @@ fn record_missing_dat(
     run_id: &str,
     conn: Option<&Connection>,
     manifest: Option<&mut ManifestWriter>,
-) -> Result<ScanAction> {
+) -> Result<ScanOutcome> {
     let source_relative_path = format!(
         "db_storage/message:talker={}:local_id={}:create_time={}:md5={}",
         resource.key.talker, resource.key.local_id, resource.key.create_time, resource.file_md5
@@ -285,7 +291,7 @@ fn record_missing_dat(
         error: Some("local_dat_not_found".to_string()),
     };
     persist(conn, manifest, &event)?;
-    Ok(ScanAction::Failed)
+    Ok(ScanOutcome::new(ScanAction::Failed))
 }
 
 fn message_db_paths(message_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -572,6 +578,7 @@ mod tests {
             archive_dir: archive.clone(),
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
         })
         .unwrap();
 
@@ -609,6 +616,7 @@ mod tests {
             archive_dir: archive.clone(),
             dry_run: true,
             dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
         })
         .unwrap();
 
@@ -637,6 +645,7 @@ mod tests {
             archive_dir: archive.clone(),
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
         })
         .unwrap();
 

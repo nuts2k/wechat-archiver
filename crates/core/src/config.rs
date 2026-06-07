@@ -10,6 +10,7 @@ pub struct ArchiveConfig {
     pub archive_dir: PathBuf,
     pub dry_run: bool,
     pub dat_options: DatDecodeOptions,
+    pub explain_unsupported: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +39,7 @@ pub struct ResolvedConfig {
     pub archive_dir: PathBuf,
     pub dry_run: bool,
     pub dat_options: DatDecodeOptions,
+    pub explain_unsupported: bool,
 }
 
 impl Default for DatDecodeOptions {
@@ -71,6 +73,7 @@ impl ArchiveConfig {
             archive_dir,
             dry_run: self.dry_run,
             dat_options: self.dat_options.clone(),
+            explain_unsupported: self.explain_unsupported,
         })
     }
 }
@@ -146,6 +149,7 @@ mod tests {
             archive_dir: archive,
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
         };
 
         assert!(matches!(
@@ -167,6 +171,7 @@ mod tests {
             archive_dir: archive,
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
         };
 
         assert!(matches!(

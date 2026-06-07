@@ -66,6 +66,17 @@ cargo run -p wechat-archiver -- scan \
   --archive "/path/to/wechat-archive"
 ```
 
+如果需要解释无法归档的 `.dat` 原因，可增加 `--explain-unsupported`：
+
+```bash
+cargo run -p wechat-archiver -- scan \
+  --source "/path/to/wechat/source" \
+  --archive "/path/to/wechat-archive" \
+  --explain-unsupported
+```
+
+该选项会在结果中输出 unsupported reason 的计数和最多 3 个样例相对路径，例如缺少 V2 AES key、XOR key 无法识别、解密后不是已知图片、`wxgf` 转码失败等。
+
 归档图片：
 
 ```bash
