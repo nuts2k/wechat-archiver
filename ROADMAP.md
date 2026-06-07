@@ -64,6 +64,9 @@ Rust core library
 - 支持普通图片扩展名：`jpg`、`jpeg`、`png`、`gif`、`bmp`、`webp`、`tif`、`tiff`、`heic`、`heif`。
 - 支持旧 XOR `.dat` 图片自动识别 XOR key。
 - 支持 V1 AES `.dat` 固定 key 解码。
+- 支持 `derive-image-key` 只读派生 macOS 微信 4.x 图片 `.dat` AES/XOR key。
+- `derive-image-key` 支持从 `kvcomm` 文件名提取 uin 候选，并用 V2 `.dat` 模板验证 AES key。
+- `derive-image-key` 支持在 `kvcomm` 不可用时基于账号目录 wxid 后缀搜索候选。
 - 支持 V2 AES `.dat` 在用户显式传入 `--image-aes-key` 时解码。
 - 支持 V1/V2 尾段 XOR key 参数 `--image-xor-key`。
 - 支持 `wxgf` 私有图片格式：
@@ -124,7 +127,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 - 当前主线仍是图片归档。
 - `extract-db-images` 只支持已解密/普通 SQLite 数据库，不支持直接读取 SQLCipher 加密库。
-- V2 图片 AES key 需要用户显式提供。
+- V2 图片 AES key 可通过 `derive-image-key` 只读派生，但抽取命令仍需要用户显式提供。
+- `derive-image-key` 不自动保存 key；本机 key 文档应继续保存在 `.gitignore` 覆盖的本地文件中。
 - `wxgf jpg/mp4` 依赖 `ffmpeg`，没有可用 `ffmpeg` 时应使用 `raw` 或 `off`。
 - `wxgf jpg` 当前输出首帧 JPG，不保留可能存在的动态效果。
 - 视频、文件、语音、表情、收藏、朋友圈等尚未形成统一归档命令。
@@ -139,10 +143,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 计划：
 
-- 增加 `derive-image-key` 命令，移植已验证的非侵入式图片 key 派生逻辑到 Rust。
-- 支持从 macOS `kvcomm` 文件名提取 uin 候选。
-- 支持基于账号目录 wxid 和 V2 `.dat` 模板验证 AES key。
-- 支持 fallback 的 wxid 后缀候选搜索。
 - 增加 `scan --explain-unsupported` 或类似报告，输出各类失败原因计数和样例。
 - 优化 dry-run 性能：`wxgf jpg` dry-run 可只验证分区和 ffmpeg 可用性，避免全量转码耗时过长。
 - 在 manifest/index 中记录更细的 decoder：`legacy_xor`、`v1_aes`、`v2_aes`、`wxgf_jpg`、`wxgf_raw`、`wxgf_mp4`。
@@ -151,7 +151,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 验收标准：
 
-- 不依赖 Python 参考脚本即可派生图片 key。
 - 对已有真实样本，图片 dry-run 能稳定达到 `unsupported=0` 或给出明确不可归档原因。
 - `cargo fmt --check`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings` 全部通过。
 
@@ -270,11 +269,10 @@ wechat-archiver extract --type image,video,file,voice
 
 ## 推荐下一步
 
-建议优先做 P0 中的 `derive-image-key`：
+建议优先做 P0 中的 `scan --explain-unsupported` 和 dry-run 性能优化：
 
-- 它能去掉当前手工保存 key 的步骤。
-- 它符合只读边界。
-- 它能显著降低后续 CLI 和 Tauri 的使用门槛。
-- 已有本机验证和外部参考算法，技术风险较低。
+- 它能解释剩余无法归档的图片是缺 key、缺源文件、格式未知、`ffmpeg` 不可用，还是转码失败。
+- 它能减少大目录 dry-run 时的 `wxgf jpg` 转码成本。
+- 它会直接提升后续 CLI 和 Tauri 的可诊断性。
 
-推荐随后做 `scan --explain-unsupported` 和 dry-run 性能优化，让工具在面对大目录时更可解释、更快。
+推荐随后细化 manifest/index 中的 decoder 字段，让每个归档对象都能追溯具体解码路径。

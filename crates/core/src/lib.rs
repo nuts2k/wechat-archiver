@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod hash;
 mod image;
+mod image_key;
 mod index;
 mod manifest;
 mod message_db;
@@ -14,6 +15,7 @@ mod wechat;
 
 pub use config::{ArchiveConfig, DatDecodeOptions, ResolvedConfig, WxgfMode};
 pub use error::{ArchiverError, Result};
+pub use image_key::{derive_image_key, DeriveImageKeyOptions, ImageKeyDerivation, ImageKeyMethod};
 pub use message_db::{extract_message_db_images, MessageDbExtractConfig};
 pub use scanner::extract_images;
 pub use status::{archive_status, ArchiveStatus};

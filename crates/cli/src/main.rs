@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
-    archive_status, discover_wechat, extract_images, extract_message_db_images, verify_archive,
-    ArchiveConfig, ArchiveStatus, DatDecodeOptions, DiscoverOptions, ExtractSummary,
-    MessageDbExtractConfig, VerifySummary, WechatDiscovery,
+    archive_status, derive_image_key, discover_wechat, extract_images, extract_message_db_images,
+    verify_archive, ArchiveConfig, ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions,
+    DiscoverOptions, ExtractSummary, ImageKeyDerivation, ImageKeyMethod, MessageDbExtractConfig,
+    VerifySummary, WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -24,6 +25,17 @@ enum Commands {
         /// 微信 xwechat_files 根目录或单个账号目录。默认尝试 macOS 常见路径。
         #[arg(long)]
         root: Option<PathBuf>,
+
+        /// 输出 JSON。
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// 只读派生 macOS 微信 4.x 图片 .dat AES/XOR key。
+    DeriveImageKey {
+        /// 单个微信账号目录，通常是 xwechat_files/<wxid>。
+        #[arg(long)]
+        account: PathBuf,
 
         /// 输出 JSON。
         #[arg(long)]
@@ -181,6 +193,12 @@ fn main() -> Result<()> {
             let discovery = discover_wechat(DiscoverOptions { root })?;
             print_discovery(&discovery, json)?;
         }
+        Commands::DeriveImageKey { account, json } => {
+            let derivation = derive_image_key(DeriveImageKeyOptions {
+                account_dir: account,
+            })?;
+            print_image_key_derivation(&derivation, json)?;
+        }
         Commands::Scan {
             source,
             archive,
@@ -263,6 +281,40 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_image_key_derivation(result: &ImageKeyDerivation, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(result)?);
+        return Ok(());
+    }
+
+    println!("account_id: {}", result.account_id);
+    println!("account_dir: {}", result.account_dir.display());
+    println!("attach_dir: {}", result.attach_dir.display());
+    println!("method: {}", image_key_method_name(result.method));
+    println!("uin: {}", result.uin);
+    println!("wxid: {}", result.wxid);
+    println!("image_aes_key: {}", result.image_aes_key);
+    println!("image_xor_key: {}", result.image_xor_key);
+    println!("image_xor_key_value: {}", result.image_xor_key_value);
+    println!("templates_checked: {}", result.templates_checked);
+    if let Some(path) = &result.kvcomm_dir {
+        println!("kvcomm_dir: {}", path.display());
+    }
+    println!(
+        "next_extract_args: --image-aes-key \"{}\" --image-xor-key {}",
+        result.image_aes_key, result.image_xor_key
+    );
+    println!("note: 结果只打印到终端，不会保存，也不会写入微信目录。");
+    Ok(())
+}
+
+fn image_key_method_name(method: ImageKeyMethod) -> &'static str {
+    match method {
+        ImageKeyMethod::Kvcomm => "kvcomm",
+        ImageKeyMethod::WxidSuffixSearch => "wxid_suffix_search",
+    }
 }
 
 fn parse_dat_options(
