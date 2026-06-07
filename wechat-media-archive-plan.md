@@ -79,7 +79,7 @@ wechat-archive/
 说明：
 
 - `objects` 只按内容 hash 存一份真实文件。
-- `index.sqlite` 保存消息、来源、文件、hash、归档路径等结构化信息。
+- `index.sqlite` 保存消息、来源、文件、hash、归档路径等结构化信息，并通过 `schema_migrations` 记录显式 schema 版本迁移。
 - `manifests` 保存每次扫描和归档结果，便于审计和回滚。
 - `views` 可以通过软链接或索引生成“按联系人、群、年份、类型”的视图。
 - `staging` 用于临时解密、转换和校验，成功后再移动到正式归档区。
@@ -145,7 +145,7 @@ wechat-archive/
 - 支持普通图片、旧 XOR `.dat`、V1 AES `.dat`，V2 AES `.dat` 仅在用户显式提供 key 时解码。
 - 计算 `sha256`。
 - 复制到归档目录。
-- 写入 SQLite 索引。
+- 写入 SQLite 索引，并保持 schema 迁移可追踪、可幂等复跑。
 - 消息库图片、视频、文件附件和语音归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
 - 支持校验归档文件完整性。
 - 对未知 `.dat` 记录 `unsupported`，对消息库中存在但本地 `.dat` 缺失的资源记录 `failed`。
