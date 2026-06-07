@@ -5,14 +5,14 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
-    archive_status, count_message_db_media, derive_image_key, discover_wechat, extract_files,
-    extract_images, extract_message_db_files, extract_message_db_images, extract_message_db_videos,
-    extract_message_db_voices, extract_videos, extract_voices, inspect_message_db, lookup_index,
-    verify_archive, ArchiveConfig, ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions,
-    DiscoverOptions, ExtractSummary, ImageKeyDerivation, ImageKeyMethod, IndexLookup,
-    IndexLookupQuery, MessageDbExtractConfig, MessageDbInspectConfig, MessageDbInspection,
-    MessageDbMediaCountConfig, MessageDbMediaCountSummary, MessageDbMediaTypeCount, VerifySummary,
-    WechatDiscovery,
+    archive_report, archive_status, count_message_db_media, derive_image_key, discover_wechat,
+    extract_files, extract_images, extract_message_db_files, extract_message_db_images,
+    extract_message_db_videos, extract_message_db_voices, extract_videos, extract_voices,
+    inspect_message_db, lookup_index, verify_archive, ArchiveConfig, ArchiveReport, ArchiveStatus,
+    DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions, ExtractSummary, ImageKeyDerivation,
+    ImageKeyMethod, IndexLookup, IndexLookupQuery, MessageDbExtractConfig, MessageDbInspectConfig,
+    MessageDbInspection, MessageDbMediaCountConfig, MessageDbMediaCountSummary,
+    MessageDbMediaTypeCount, VerifySummary, WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -250,6 +250,17 @@ enum Commands {
     /// 按 sha256 或源路径反查归档索引记录。
     Lookup(LookupArgs),
 
+    /// 导出归档索引报告。
+    Report {
+        /// 独立归档目录。
+        #[arg(long)]
+        archive: PathBuf,
+
+        /// 输出格式。
+        #[arg(long, value_enum, default_value = "json")]
+        format: ReportFormat,
+    },
+
     /// 校验已归档对象是否仍与索引 sha256 一致。
     Verify {
         /// 独立归档目录。
@@ -335,6 +346,12 @@ enum WxgfMode {
     Raw,
     Jpg,
     Mp4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReportFormat {
+    Json,
+    Csv,
 }
 
 impl From<WxgfMode> for CoreWxgfMode {
@@ -509,6 +526,10 @@ fn main() -> Result<()> {
             let json = args.json;
             let lookup = run_lookup(args)?;
             print_index_lookup(&lookup, json)?;
+        }
+        Commands::Report { archive, format } => {
+            let report = archive_report(&archive)?;
+            print_archive_report(&report, format)?;
         }
         Commands::Verify { archive, json } => {
             let summary = verify_archive(&archive)?;
@@ -1025,6 +1046,98 @@ fn print_index_lookup(lookup: &IndexLookup, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_archive_report(report: &ArchiveReport, format: ReportFormat) -> Result<()> {
+    match format {
+        ReportFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(report)?);
+        }
+        ReportFormat::Csv => print_archive_report_csv(report),
+    }
+    Ok(())
+}
+
+fn print_archive_report_csv(report: &ArchiveReport) {
+    print_csv_row(&[
+        "id",
+        "source_path",
+        "source_relative_path",
+        "source_kind",
+        "media_type",
+        "message_talker",
+        "message_sender",
+        "message_local_id",
+        "message_create_time",
+        "decoder",
+        "archive_path",
+        "sha256",
+        "size_bytes",
+        "extension",
+        "decrypt_status",
+        "verify_status",
+        "error",
+        "created_at_ms",
+        "updated_at_ms",
+    ]);
+    for record in &report.records {
+        let id = record.id.to_string();
+        let message_local_id = optional_i64_csv(record.message_local_id);
+        let message_create_time = optional_i64_csv(record.message_create_time);
+        let size_bytes = optional_u64_csv(record.size_bytes);
+        let created_at_ms = record.created_at_ms.to_string();
+        let updated_at_ms = record.updated_at_ms.to_string();
+        print_csv_row(&[
+            &id,
+            &record.source_path,
+            &record.source_relative_path,
+            &record.source_kind,
+            &record.media_type,
+            optional_string_csv(&record.message_talker),
+            optional_string_csv(&record.message_sender),
+            &message_local_id,
+            &message_create_time,
+            optional_string_csv(&record.decoder),
+            optional_string_csv(&record.archive_path),
+            optional_string_csv(&record.sha256),
+            &size_bytes,
+            optional_string_csv(&record.extension),
+            &record.decrypt_status,
+            &record.verify_status,
+            optional_string_csv(&record.error),
+            &created_at_ms,
+            &updated_at_ms,
+        ]);
+    }
+}
+
+fn print_csv_row(fields: &[&str]) {
+    let row = fields
+        .iter()
+        .map(|field| csv_field(field))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("{row}");
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn optional_string_csv(value: &Option<String>) -> &str {
+    value.as_deref().unwrap_or("")
+}
+
+fn optional_u64_csv(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn optional_i64_csv(value: Option<i64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
 fn optional_string(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("-")
 }
@@ -1256,6 +1369,35 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_report_csv_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "report",
+            "--archive",
+            "/tmp/wechat-archive",
+            "--format",
+            "csv",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Report { archive, format } => {
+                assert_eq!(archive, PathBuf::from("/tmp/wechat-archive"));
+                assert_eq!(format, ReportFormat::Csv);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn csv_field_escapes_commas_quotes_and_newlines() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_field("a\nb"), "\"a\nb\"");
     }
 
     #[test]

@@ -169,6 +169,7 @@ wechat-archive/
 - `index.sqlite` 和 manifest 支持可空消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；当前消息库图片、视频、文件附件和语音归档会写入 `talker/local_id/create_time`，`sender` 暂不猜测。
 - 支持 `status` 查看索引统计，并按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组。
 - 支持 `lookup` 只读按 `sha256` 反查所有来源，或按 `source_path` 查询单个源文件归档状态。
+- 支持 `report` 只读导出 JSON/CSV 索引报告。
 - 支持 `verify` 重新计算归档对象 hash，并检查索引引用完整性。
 - 支持重复对象去重：相同 `sha256` 不重复写入对象文件。
 
@@ -278,12 +279,12 @@ wechat-archiver extract --type voice
 - 支持按源路径查归档状态。
 - 增强 `status`，输出媒体类型、来源类型、解密状态和校验状态分组统计。
 - 增强 `verify`，覆盖归档对象完整性和索引引用完整性。
+- 支持 CSV/JSON 索引报告导出。
 
 计划：
 
 - 丰富 `media_items` 字段：消息时间、会话 ID、发送人、媒体类型、原始文件名、MIME、宽高、时长。
 - 生成 `views/` 视图：按年份、类型、会话、来源路径组织。
-- 支持导出 CSV/JSON 报告。
 - 支持增量扫描状态，减少重复遍历。
 
 验收标准：
@@ -364,7 +365,7 @@ wechat-archiver extract --type voice
 
 建议继续推进 P2 索引增强：
 
-- 优先补 CSV/JSON 报告导出和更可浏览的 `views/` 生成。
+- 优先补更可浏览的 `views/` 生成。
 - 然后继续丰富 `media_items` 字段，例如原始文件名、MIME、宽高、时长和发送人。
 - 语音后续增强重点是时长、发送人和可选转码/转写，而不是继续扩大直接文件扫描范围。
 - 所有路线都应继续保持 dry-run、结构化错误、manifest/index 和安全边界一致。

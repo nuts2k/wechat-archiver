@@ -118,6 +118,11 @@ fn query_records_with_two_values(
     query_records_with_params(conn, predicate, order_by, &[&first_value, &second_value])
 }
 
+pub(crate) fn query_all_records(conn: &Connection) -> Result<Vec<IndexLookupRecord>> {
+    let values: [&dyn ToSql; 0] = [];
+    query_records_with_params(conn, "1 = 1", "id", &values)
+}
+
 fn query_records_with_params(
     conn: &Connection,
     predicate: &str,

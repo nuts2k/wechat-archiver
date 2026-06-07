@@ -9,6 +9,7 @@ mod lookup;
 mod manifest;
 mod media;
 mod message_db;
+mod report;
 mod scanner;
 mod status;
 mod types;
@@ -27,6 +28,7 @@ pub use message_db::{
     MessageDbMediaCountConfig, MessageDbMediaCountSummary, MessageDbMediaTypeCount,
     MessageDbNextAction,
 };
+pub use report::{archive_report, ArchiveReport};
 pub use scanner::{extract_files, extract_images, extract_videos, extract_voices};
 pub use status::{archive_status, ArchiveStatus, StatusCount};
 pub use types::{
