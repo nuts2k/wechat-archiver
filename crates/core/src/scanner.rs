@@ -10,7 +10,7 @@ use crate::hash::{sha256_bytes, sha256_file};
 use crate::image::{decode_dat, direct_image_extension, is_dat_file, validate_dat, DatDecode};
 use crate::index::{index_path, insert_record, open_index, MediaRecord};
 use crate::manifest::ManifestWriter;
-use crate::media::direct_video_extension;
+use crate::media::{direct_file_extension, direct_video_extension};
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 
 pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
@@ -63,7 +63,7 @@ pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
 pub fn extract_videos(config: ArchiveConfig) -> Result<ExtractSummary> {
     let resolved = config.resolve()?;
     let mut run = ScanRun::new(&resolved, "extract-videos")?;
-    let video_sources = video_scan_sources(&resolved.source_dir);
+    let video_sources = account_media_scan_sources(&resolved.source_dir, "video");
 
     for source in video_sources {
         for entry in WalkDir::new(&source.scan_dir).follow_links(false) {
@@ -97,31 +97,70 @@ pub fn extract_videos(config: ArchiveConfig) -> Result<ExtractSummary> {
 }
 
 #[derive(Debug, Clone)]
-struct VideoScanSource {
+struct AccountMediaScanSource {
     scan_dir: PathBuf,
     relative_root: PathBuf,
 }
 
-fn video_scan_sources(source_dir: &Path) -> Vec<VideoScanSource> {
+pub fn extract_files(config: ArchiveConfig) -> Result<ExtractSummary> {
+    let resolved = config.resolve()?;
+    let mut run = ScanRun::new(&resolved, "extract-files")?;
+    let file_sources = account_media_scan_sources(&resolved.source_dir, "file");
+
+    for source in file_sources {
+        for entry in WalkDir::new(&source.scan_dir).follow_links(false) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            run.summary.scanned_files += 1;
+
+            let path = entry.path();
+            if let Some(extension) = direct_file_extension(path) {
+                run.summary.candidates += 1;
+                let result = process_direct_media(
+                    path,
+                    &extension,
+                    &source.relative_root,
+                    &resolved.archive_dir,
+                    &run.run_id,
+                    resolved.dry_run,
+                    run.conn.as_ref(),
+                    run.manifest.as_mut(),
+                    "direct_file",
+                    "file",
+                );
+                apply_result(&mut run.summary, result)?;
+            }
+        }
+    }
+
+    run.finish()
+}
+
+fn account_media_scan_sources(
+    source_dir: &Path,
+    media_dir_name: &str,
+) -> Vec<AccountMediaScanSource> {
     if let Some(account_dir) = account_dir_from_attach_dir(source_dir) {
-        let video_dir = account_dir.join("msg").join("video");
-        if video_dir.is_dir() {
-            return vec![VideoScanSource {
-                scan_dir: video_dir,
+        let media_dir = account_dir.join("msg").join(media_dir_name);
+        if media_dir.is_dir() {
+            return vec![AccountMediaScanSource {
+                scan_dir: media_dir,
                 relative_root: account_dir,
             }];
         }
     }
 
-    let account_video_dir = source_dir.join("msg").join("video");
-    if account_video_dir.is_dir() {
-        return vec![VideoScanSource {
-            scan_dir: account_video_dir,
+    let account_media_dir = source_dir.join("msg").join(media_dir_name);
+    if account_media_dir.is_dir() {
+        return vec![AccountMediaScanSource {
+            scan_dir: account_media_dir,
             relative_root: source_dir.to_path_buf(),
         }];
     }
 
-    vec![VideoScanSource {
+    vec![AccountMediaScanSource {
         scan_dir: source_dir.to_path_buf(),
         relative_root: source_dir.to_path_buf(),
     }]
@@ -703,6 +742,110 @@ mod tests {
         assert_eq!(summary.scanned_files, 1);
         assert_eq!(summary.candidates, 1);
         assert_eq!(summary.would_archive, 1);
+    }
+
+    #[test]
+    fn extracts_direct_files_without_touching_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let file_path = source.join("report.PDF");
+        let file_bytes = b"synthetic-file";
+        std::fs::write(&file_path, file_bytes).unwrap();
+
+        let summary = extract_files(ArchiveConfig {
+            source_dir: source.clone(),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+        assert_eq!(std::fs::read(&file_path).unwrap(), file_bytes);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_kind, media_type, extension): (String, String, String) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, media_type, extension
+                FROM media_items
+                WHERE source_relative_path = 'report.PDF'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(source_kind, "direct_file");
+        assert_eq!(media_type, "file");
+        assert_eq!(extension, "pdf");
+
+        let verify = verify_archive(&archive).unwrap();
+        assert_eq!(verify.checked, 1);
+        assert_eq!(verify.ok, 1);
+    }
+
+    #[test]
+    fn file_extract_from_attach_scans_sibling_msg_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("xwechat_files").join("wxid");
+        let attach = account.join("msg").join("attach");
+        let file_dir = account.join("msg").join("file").join("2026-02");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&attach).unwrap();
+        std::fs::create_dir_all(&file_dir).unwrap();
+        std::fs::write(attach.join("ignored.pdf"), b"attach-file-is-not-used").unwrap();
+        std::fs::write(file_dir.join("report.docx"), b"real-file").unwrap();
+
+        let summary = extract_files(ArchiveConfig {
+            source_dir: attach,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let relative_path: String = conn
+            .query_row(
+                "SELECT source_relative_path FROM media_items WHERE media_type = 'file'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relative_path, "msg/file/2026-02/report.docx");
+    }
+
+    #[test]
+    fn file_dry_run_writes_nothing_to_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("report.xlsx"), b"synthetic-file").unwrap();
+
+        let summary = extract_files(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive.clone(),
+            dry_run: true,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.archived, 0);
+        assert_eq!(summary.would_archive, 1);
+        assert!(!archive.exists());
     }
 
     #[test]

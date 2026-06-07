@@ -17,7 +17,7 @@
 - 支持 V2 AES `.dat` 在用户显式提供 `--image-aes-key` 时解码；不会自动读取微信进程内存或提取密钥。
 - 支持解密后的微信 `wxgf` 私有图片格式：默认调用 `ffmpeg` 提取 HEVC 首帧并转成 JPG；也可选择归档原始 `wxgf` 或封装为 MP4。
 - dry-run 遇到 `wxgf jpg/mp4` 时只验证 HEVC 分片和 `ffmpeg` 可用性，不执行全量转码。
-- 支持统一媒体抽取入口 `extract --type image` 和 `extract --type video`；视频当前为直接文件扫描最小版，支持 `mp4`、`mov`、`m4v`。
+- 支持统一媒体抽取入口 `extract --type image`、`extract --type video` 和 `extract --type file`；视频和文件当前为直接文件扫描最小版。
 - 对未知 `.dat`、缺少 V2 key 或无法识别文件记录为 `unsupported`，不会写出不可信的垃圾文件；对消息库中存在但本地 `.dat` 缺失的资源记录为 `failed`。
 - 归档文件写入独立 archive 目录，使用内容寻址路径 `objects/sha256/<prefix>/<sha256>.<ext>`。
 - 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind` 与独立 `decoder` 字段。
@@ -98,6 +98,16 @@ cargo run -p wechat-archiver -- extract --type video \
 ```
 
 当前视频归档会复制 `mp4`、`mov`、`m4v` 到内容寻址归档库，记录 `source_kind=direct_video`、`media_type=video`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，会自动扫描同账号的 `msg/video`；其他目录则只扫描传入目录本身。暂不解析消息库视频来源，也不提取时长和分辨率。
+
+归档直接文件附件：
+
+```bash
+cargo run -p wechat-archiver -- extract --type file \
+  --source "/path/to/wechat/source" \
+  --archive "/path/to/wechat-archive"
+```
+
+当前文件归档会复制带扩展名的普通文件到内容寻址归档库，记录 `source_kind=direct_file`、`media_type=file`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，会自动扫描同账号的 `msg/file`；其他目录则只扫描传入目录本身。暂不解析消息库文件来源，也不恢复原始文件名之外的消息上下文。
 
 按消息库枚举并归档图片：
 
