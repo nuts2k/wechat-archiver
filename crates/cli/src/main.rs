@@ -417,7 +417,7 @@ fn print_extract_summary(summary: &ExtractSummary, json: bool) -> Result<()> {
     if let Some(explanation) = &summary.unsupported_explanation {
         println!("unsupported_reasons:");
         for reason in &explanation.reasons {
-            println!("  {}: {}", reason.reason, reason.count);
+            println!("  {}: {} - {}", reason.reason, reason.count, reason.message);
             for sample in &reason.samples {
                 println!("    sample: {sample}");
             }

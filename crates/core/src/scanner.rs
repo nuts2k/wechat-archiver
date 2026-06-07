@@ -7,7 +7,7 @@ use crate::archive::{store_bytes, store_file, StoreOutcome};
 use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions};
 use crate::error::{ArchiverError, Result};
 use crate::hash::{sha256_bytes, sha256_file};
-use crate::image::{decode_dat, direct_image_extension, is_dat_file, DatDecode};
+use crate::image::{decode_dat, direct_image_extension, is_dat_file, validate_dat, DatDecode};
 use crate::index::{index_path, insert_record, open_index, MediaRecord};
 use crate::manifest::ManifestWriter;
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
@@ -65,6 +65,7 @@ pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
                 &resolved.source_dir,
                 &resolved.archive_dir,
                 &run_id,
+                "dat_image",
                 resolved.dry_run,
                 &resolved.dat_options,
                 conn.as_ref(),
@@ -161,6 +162,7 @@ fn process_direct_image(
         path,
         &rel,
         "direct_image",
+        None,
         action.clone(),
         archive_path,
         Some(sha256),
@@ -180,6 +182,7 @@ pub(crate) fn process_dat_image(
     source_root: &Path,
     archive_root: &Path,
     run_id: &str,
+    source_kind: &str,
     dry_run: bool,
     dat_options: &DatDecodeOptions,
     conn: Option<&Connection>,
@@ -187,7 +190,13 @@ pub(crate) fn process_dat_image(
 ) -> Result<ScanOutcome> {
     let rel = relative_path(path, source_root)?;
 
-    match decode_dat(path, dat_options)? {
+    let decoded = if dry_run {
+        validate_dat(path, dat_options)?
+    } else {
+        decode_dat(path, dat_options)?
+    };
+
+    match decoded {
         DatDecode::Decoded {
             bytes,
             extension,
@@ -213,7 +222,8 @@ pub(crate) fn process_dat_image(
                 run_id,
                 path,
                 &rel,
-                decoder,
+                source_kind,
+                Some(decoder),
                 action.clone(),
                 archive_path,
                 Some(sha256),
@@ -226,12 +236,32 @@ pub(crate) fn process_dat_image(
             persist(conn, manifest, &event)?;
             Ok(ScanOutcome::new(action))
         }
+        DatDecode::Validated { extension, decoder } => {
+            let event = build_event(
+                run_id,
+                path,
+                &rel,
+                source_kind,
+                Some(decoder),
+                ScanAction::WouldArchive,
+                None,
+                None,
+                None,
+                Some(extension.to_string()),
+                "validated",
+                "not_run",
+                None,
+            );
+            persist(conn, manifest, &event)?;
+            Ok(ScanOutcome::new(ScanAction::WouldArchive))
+        }
         DatDecode::Unsupported { reason } => {
             let event = build_event(
                 run_id,
                 path,
                 &rel,
-                "dat_image",
+                source_kind,
+                None,
                 ScanAction::Unsupported,
                 None,
                 None,
@@ -253,6 +283,7 @@ fn build_event(
     source_path: &Path,
     source_relative_path: &str,
     source_kind: &str,
+    decoder: Option<&str>,
     action: ScanAction,
     archive_path: Option<String>,
     sha256: Option<String>,
@@ -270,6 +301,7 @@ fn build_event(
         source_relative_path: source_relative_path.to_string(),
         source_kind: source_kind.to_string(),
         media_type: "image".to_string(),
+        decoder: decoder.map(str::to_string),
         action,
         archive_path,
         sha256,
@@ -294,6 +326,7 @@ pub(crate) fn persist(
                 source_relative_path: event.source_relative_path.clone(),
                 source_kind: event.source_kind.clone(),
                 media_type: event.media_type.clone(),
+                decoder: event.decoder.clone(),
                 archive_path: event.archive_path.clone(),
                 sha256: event.sha256.clone(),
                 size_bytes: event.size_bytes,
@@ -329,6 +362,7 @@ mod tests {
     use crate::config::ArchiveConfig;
     use crate::status::archive_status;
     use crate::verify::verify_archive;
+    use rusqlite::Connection;
 
     #[test]
     fn extracts_direct_and_xor_images_without_touching_source() {
@@ -368,6 +402,53 @@ mod tests {
         assert_eq!(verify.ok, 2);
         assert_eq!(verify.missing, 0);
         assert_eq!(verify.mismatched, 0);
+    }
+
+    #[test]
+    fn records_dat_source_kind_and_decoder_separately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(source.join("attach/hash/2026-01/Img")).unwrap();
+
+        let dat_path = source.join("attach/hash/2026-01/Img/sample.dat");
+        let decoded = b"\x89PNG\r\nsynthetic-png";
+        let encrypted: Vec<u8> = decoded.iter().map(|byte| byte ^ 0x88).collect();
+        std::fs::write(&dat_path, encrypted).unwrap();
+
+        let summary = extract_images(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_kind, decoder): (String, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, decoder
+                FROM media_items
+                WHERE source_relative_path = 'attach/hash/2026-01/Img/sample.dat'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(source_kind, "dat_image");
+        assert_eq!(decoder.as_deref(), Some("legacy_xor"));
+
+        let manifest_path = summary.manifest_path.unwrap();
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
+        let event = manifest
+            .lines()
+            .map(|line| serde_json::from_str::<ManifestEvent>(line).unwrap())
+            .find(|event| event.source_relative_path == "attach/hash/2026-01/Img/sample.dat")
+            .unwrap();
+        assert_eq!(event.source_kind, "dat_image");
+        assert_eq!(event.decoder.as_deref(), Some("legacy_xor"));
     }
 
     #[test]

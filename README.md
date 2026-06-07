@@ -16,9 +16,10 @@
 - 支持 `derive-image-key` 只读派生 macOS 微信 4.x 图片 `.dat` 的 AES/XOR key，便于后续显式传给抽取命令。
 - 支持 V2 AES `.dat` 在用户显式提供 `--image-aes-key` 时解码；不会自动读取微信进程内存或提取密钥。
 - 支持解密后的微信 `wxgf` 私有图片格式：默认调用 `ffmpeg` 提取 HEVC 首帧并转成 JPG；也可选择归档原始 `wxgf` 或封装为 MP4。
+- dry-run 遇到 `wxgf jpg/mp4` 时只验证 HEVC 分片和 `ffmpeg` 可用性，不执行全量转码。
 - 对未知 `.dat`、缺少 V2 key 或无法识别文件记录为 `unsupported`，不会写出不可信的垃圾文件；对消息库中存在但本地 `.dat` 缺失的资源记录为 `failed`。
 - 归档文件写入独立 archive 目录，使用内容寻址路径 `objects/sha256/<prefix>/<sha256>.<ext>`。
-- 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`。
+- 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind` 与独立 `decoder` 字段。
 - 支持 `status` 查看索引统计，支持 `verify` 重新计算归档对象 hash。
 
 当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`extract-db-images` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。
@@ -75,7 +76,7 @@ cargo run -p wechat-archiver -- scan \
   --explain-unsupported
 ```
 
-该选项会在结果中输出 unsupported reason 的计数和最多 3 个样例相对路径，例如缺少 V2 AES key、XOR key 无法识别、解密后不是已知图片、`wxgf` 转码失败等。
+该选项会在结果中输出 unsupported reason 的计数、中文提示和最多 3 个样例相对路径，例如缺少 V2 AES key、XOR key 无法识别、解密后不是已知图片、`ffmpeg` 缺失或 `wxgf` 转码输出异常等。
 
 归档图片：
 
@@ -118,7 +119,7 @@ cargo run -p wechat-archiver -- extract-images \
 
 `--image-aes-key` 支持普通 16+ 字节字符串，也支持 `hex:<hex-encoded-key>`。`--image-xor-key` 默认是 `0x88`，如果 `derive-image-key` 输出了不同值，应以派生结果为准。
 
-解密后如果遇到 `wxgf`，默认 `--wxgf-mode jpg` 会调用 `ffmpeg` 从内部 HEVC 分片转换首帧 JPG。若 `ffmpeg` 不在 `PATH`，可显式传入路径：
+解密后如果遇到 `wxgf`，默认 `--wxgf-mode jpg` 会调用 `ffmpeg` 从内部 HEVC 分片转换首帧 JPG。若 `ffmpeg` 不在 `PATH`，可显式传入路径。`scan` 和 `--dry-run` 只验证 HEVC 分片和 `ffmpeg -version`，不会实际转码：
 
 ```bash
 cargo run -p wechat-archiver -- extract-images \
@@ -167,7 +168,7 @@ wechat-archive/
   views/
 ```
 
-`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。
+`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。
 
 ## 外部项目参考
 

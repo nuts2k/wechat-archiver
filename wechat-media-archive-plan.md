@@ -98,6 +98,7 @@ wechat-archive/
 | `sender_id` | 发送人 ID |
 | `sender_name` | 发送人名称 |
 | `message_time` | 消息时间 |
+| `source_kind` | 来源类型，例如直接图片、目录 `.dat`、消息库图片 |
 | `media_type` | 图片、视频、语音、文件、表情等 |
 | `original_path` | 微信本地原始路径 |
 | `archive_path` | 归档后路径 |
@@ -106,6 +107,7 @@ wechat-archive/
 | `mime_type` | 文件类型 |
 | `filename` | 原始文件名 |
 | `extension` | 扩展名 |
+| `decoder` | 解码路径，例如 `legacy_xor`、`v1_aes`、`v2_aes`、`wxgf_jpg` |
 | `decrypt_status` | 解密状态 |
 | `verify_status` | 校验状态 |
 | `created_at` | 索引创建时间 |

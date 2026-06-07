@@ -10,6 +10,7 @@ pub(crate) struct MediaRecord {
     pub source_relative_path: String,
     pub source_kind: String,
     pub media_type: String,
+    pub decoder: Option<String>,
     pub archive_path: Option<String>,
     pub sha256: Option<String>,
     pub size_bytes: Option<u64>,
@@ -54,6 +55,7 @@ fn initialize(conn: &Connection) -> Result<()> {
             source_relative_path TEXT NOT NULL,
             source_kind TEXT NOT NULL,
             media_type TEXT NOT NULL,
+            decoder TEXT,
             archive_path TEXT,
             sha256 TEXT,
             size_bytes INTEGER,
@@ -80,6 +82,35 @@ fn initialize(conn: &Connection) -> Result<()> {
             ON media_items(source_path);
         "#,
     )?;
+    ensure_decoder_column(conn)?;
+    Ok(())
+}
+
+fn ensure_decoder_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(media_items)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "decoder") {
+        conn.execute("ALTER TABLE media_items ADD COLUMN decoder TEXT", [])?;
+    }
+    conn.execute(
+        r#"
+        UPDATE media_items
+        SET decoder = source_kind,
+            source_kind = 'dat_image'
+        WHERE decoder IS NULL
+          AND source_kind IN (
+            'legacy_xor',
+            'v1_aes',
+            'v2_aes',
+            'wxgf_jpg',
+            'wxgf_raw',
+            'wxgf_mp4'
+          )
+        "#,
+        [],
+    )?;
     Ok(())
 }
 
@@ -92,6 +123,7 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             source_relative_path,
             source_kind,
             media_type,
+            decoder,
             archive_path,
             sha256,
             size_bytes,
@@ -102,7 +134,7 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             created_at_ms,
             updated_at_ms
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
         ON CONFLICT(source_path)
         DO UPDATE SET
             archive_path = excluded.archive_path,
@@ -111,6 +143,7 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             source_relative_path = excluded.source_relative_path,
             source_kind = excluded.source_kind,
             media_type = excluded.media_type,
+            decoder = excluded.decoder,
             extension = excluded.extension,
             decrypt_status = excluded.decrypt_status,
             verify_status = excluded.verify_status,
@@ -122,6 +155,7 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             record.source_relative_path,
             record.source_kind,
             record.media_type,
+            record.decoder,
             record.archive_path,
             record.sha256,
             record.size_bytes,

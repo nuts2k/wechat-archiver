@@ -70,12 +70,15 @@ Rust core library
 - 支持 V2 AES `.dat` 在用户显式传入 `--image-aes-key` 时解码。
 - 支持 V1/V2 尾段 XOR key 参数 `--image-xor-key`。
 - 支持 `scan --explain-unsupported` 输出无法归档原因计数和样例路径。
+- `scan --explain-unsupported` 会输出 reason、中文提示和样例路径。
 - 支持 `wxgf` 私有图片格式：
 - `--wxgf-mode jpg`：默认模式，提取内部 HEVC 分片并调用 `ffmpeg` 转首帧 JPG。
 - `--wxgf-mode raw`：归档解密后的原始 `wxgf`。
 - `--wxgf-mode mp4`：调用 `ffmpeg` 将内部 HEVC 分片封装为 MP4。
 - `--wxgf-mode off`：关闭 `wxgf` 处理，保留旧行为。
 - 支持 `--wxgf-ffmpeg-path` 指定 ffmpeg 路径。
+- `wxgf jpg/mp4` dry-run 只验证 HEVC 分片和 `ffmpeg -version`，不执行全量转码。
+- 对 `ffmpeg` 缺失、探测失败、启动失败、写入失败、进程失败、输出为空、输出格式异常等情况输出细分 reason。
 
 ### 消息库图片枚举
 
@@ -107,13 +110,14 @@ wechat-archive/
 - `objects` 按内容 hash 存储真实文件。
 - `index.sqlite` 保存当前索引状态。
 - `manifests/*.jsonl` 保存每次运行审计记录。
+- `index.sqlite` 和 manifest 独立记录 `source_kind` 与 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。
 - 支持 `status` 查看索引统计。
 - 支持 `verify` 重新计算归档对象 hash。
 - 支持重复对象去重：相同 `sha256` 不重复写入对象文件。
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw` 和 `wxgf jpg` 转换链路。
+- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only，以及 manifest/index 的 `decoder` 记录。
 - 已通过：
 
 ```bash
@@ -142,12 +146,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 目标：让图片归档在日常使用中稳定、可解释、可复跑。
 
-计划：
+已完成：
 
-- 优化 dry-run 性能：`wxgf jpg` dry-run 可只验证分区和 ffmpeg 可用性，避免全量转码耗时过长。
-- 在 manifest/index 中记录更细的 decoder：`legacy_xor`、`v1_aes`、`v2_aes`、`wxgf_jpg`、`wxgf_raw`、`wxgf_mp4`。
-- 为 `ffmpeg` 缺失、执行失败、输出格式异常提供更清晰的用户提示。
-- 增加小型 synthetic fixture，避免测试依赖真实微信样本。
+- `wxgf jpg/mp4` dry-run 只验证分区和 `ffmpeg` 可用性，避免全量转码耗时过长。
+- manifest/index 独立记录 decoder：`legacy_xor`、`v1_aes`、`v2_aes`、`wxgf_jpg`、`wxgf_raw`、`wxgf_mp4`。
+- 为 `ffmpeg` 缺失、探测失败、执行失败、输出为空、输出格式异常提供更清晰的 reason 和用户提示。
+- 增加 synthetic 测试样本，覆盖 `wxgf` dry-run validate-only 和 manifest/index `decoder` 记录。
+
+剩余：
+
+- 继续用真实样本回归图片 dry-run 和 `extract-db-images` 的 `unsupported=0` 场景。
 
 验收标准：
 
@@ -269,10 +277,8 @@ wechat-archiver extract --type image,video,file,voice
 
 ## 推荐下一步
 
-建议优先做 P0 中的 `scan --explain-unsupported` 和 dry-run 性能优化：
+建议进入 P1，开始设计统一媒体抽取命令：
 
-- 它能解释剩余无法归档的图片是缺 key、缺源文件、格式未知、`ffmpeg` 不可用，还是转码失败。
-- 它能减少大目录 dry-run 时的 `wxgf jpg` 转码成本。
-- 它会直接提升后续 CLI 和 Tauri 的可诊断性。
-
-推荐随后细化 manifest/index 中的 decoder 字段，让每个归档对象都能追溯具体解码路径。
+- 增加 `wechat-archiver extract --type image,video,file,voice` 的薄 CLI 入口。
+- 先把现有图片抽取接入统一命令，再逐步扩展视频、文件和语音。
+- 保持 dry-run、结构化错误、manifest/index 和安全边界与现有图片流程一致。

@@ -21,6 +21,10 @@ pub(crate) enum DatDecode {
         extension: &'static str,
         decoder: &'static str,
     },
+    Validated {
+        extension: &'static str,
+        decoder: &'static str,
+    },
     Unsupported {
         reason: &'static str,
     },
@@ -49,6 +53,18 @@ pub(crate) fn is_dat_file(path: &Path) -> bool {
 }
 
 pub(crate) fn decode_dat(path: &Path, options: &DatDecodeOptions) -> Result<DatDecode> {
+    decode_dat_inner(path, options, false)
+}
+
+pub(crate) fn validate_dat(path: &Path, options: &DatDecodeOptions) -> Result<DatDecode> {
+    decode_dat_inner(path, options, true)
+}
+
+fn decode_dat_inner(
+    path: &Path,
+    options: &DatDecodeOptions,
+    validate_only: bool,
+) -> Result<DatDecode> {
     let mut file = File::open(path).with_path(path)?;
     let mut data = Vec::new();
     file.read_to_end(&mut data).with_path(path)?;
@@ -60,7 +76,7 @@ pub(crate) fn decode_dat(path: &Path, options: &DatDecodeOptions) -> Result<DatD
     }
 
     if data.starts_with(V1_MAGIC_FULL) {
-        return decode_aes_dat(&data, b"cfcd208495d565ef", options, "v1_aes");
+        return decode_aes_dat(&data, b"cfcd208495d565ef", options, "v1_aes", validate_only);
     }
 
     if data.starts_with(V2_MAGIC_FULL) {
@@ -74,7 +90,7 @@ pub(crate) fn decode_dat(path: &Path, options: &DatDecodeOptions) -> Result<DatD
                 reason: "v2_aes_key_too_short",
             });
         }
-        return decode_aes_dat(&data, &key[..16], options, "v2_aes");
+        return decode_aes_dat(&data, &key[..16], options, "v2_aes", validate_only);
     }
 
     let Some(key) = detect_xor_key(&data) else {
@@ -84,7 +100,12 @@ pub(crate) fn decode_dat(path: &Path, options: &DatDecodeOptions) -> Result<DatD
     };
 
     let decrypted: Vec<u8> = data.into_iter().map(|byte| byte ^ key).collect();
-    Ok(decoded_image(decrypted, options, "legacy_xor"))
+    Ok(decoded_image(
+        decrypted,
+        options,
+        "legacy_xor",
+        validate_only,
+    ))
 }
 
 pub(crate) fn detect_image_format(bytes: &[u8]) -> Option<&'static str> {
@@ -114,6 +135,7 @@ fn decode_aes_dat(
     aes_key: &[u8],
     options: &DatDecodeOptions,
     decoder: &'static str,
+    validate_only: bool,
 ) -> Result<DatDecode> {
     if data.len() < 15 {
         return Ok(DatDecode::Unsupported {
@@ -150,15 +172,19 @@ fn decode_aes_dat(
         );
     }
 
-    Ok(decoded_image(decrypted, options, decoder))
+    Ok(decoded_image(decrypted, options, decoder, validate_only))
 }
 
 fn decoded_image(
     decrypted: Vec<u8>,
     options: &DatDecodeOptions,
     decoder: &'static str,
+    validate_only: bool,
 ) -> DatDecode {
     if let Some(extension) = detect_image_format(&decrypted) {
+        if validate_only {
+            return DatDecode::Validated { extension, decoder };
+        }
         return DatDecode::Decoded {
             bytes: decrypted,
             extension,
@@ -167,7 +193,7 @@ fn decoded_image(
     }
 
     if decrypted.starts_with(WXGF_MAGIC) {
-        return decode_wxgf(decrypted, options);
+        return decode_wxgf(decrypted, options, validate_only);
     }
 
     DatDecode::Unsupported {
@@ -175,22 +201,40 @@ fn decoded_image(
     }
 }
 
-fn decode_wxgf(decrypted: Vec<u8>, options: &DatDecodeOptions) -> DatDecode {
+fn decode_wxgf(decrypted: Vec<u8>, options: &DatDecodeOptions, validate_only: bool) -> DatDecode {
     match options.wxgf_mode {
         WxgfMode::Off => DatDecode::Unsupported {
             reason: "wxgf_mode_off",
         },
-        WxgfMode::Raw => DatDecode::Decoded {
-            bytes: decrypted,
-            extension: "wxgf",
-            decoder: "wxgf_raw",
-        },
+        WxgfMode::Raw => {
+            if validate_only {
+                DatDecode::Validated {
+                    extension: "wxgf",
+                    decoder: "wxgf_raw",
+                }
+            } else {
+                DatDecode::Decoded {
+                    bytes: decrypted,
+                    extension: "wxgf",
+                    decoder: "wxgf_raw",
+                }
+            }
+        }
         WxgfMode::Jpg => {
             let Some(hevc) = find_wxgf_hevc_partition(&decrypted) else {
                 return DatDecode::Unsupported {
                     reason: "wxgf_hevc_partition_not_found",
                 };
             };
+            if validate_only {
+                return match probe_ffmpeg(options) {
+                    Ok(()) => DatDecode::Validated {
+                        extension: "jpg",
+                        decoder: "wxgf_jpg",
+                    },
+                    Err(reason) => DatDecode::Unsupported { reason },
+                };
+            }
             match transcode_wxgf_hevc(hevc, options, WxgfMode::Jpg) {
                 Ok(bytes) if bytes.starts_with(&[0xff, 0xd8, 0xff]) => DatDecode::Decoded {
                     bytes,
@@ -209,6 +253,15 @@ fn decode_wxgf(decrypted: Vec<u8>, options: &DatDecodeOptions) -> DatDecode {
                     reason: "wxgf_hevc_partition_not_found",
                 };
             };
+            if validate_only {
+                return match probe_ffmpeg(options) {
+                    Ok(()) => DatDecode::Validated {
+                        extension: "mp4",
+                        decoder: "wxgf_mp4",
+                    },
+                    Err(reason) => DatDecode::Unsupported { reason },
+                };
+            }
             match transcode_wxgf_hevc(hevc, options, WxgfMode::Mp4) {
                 Ok(bytes) if looks_like_mp4(&bytes) => DatDecode::Decoded {
                     bytes,
@@ -278,11 +331,7 @@ fn transcode_wxgf_hevc(
     options: &DatDecodeOptions,
     mode: WxgfMode,
 ) -> std::result::Result<Vec<u8>, &'static str> {
-    let mut command = if let Some(path) = &options.wxgf_ffmpeg_path {
-        Command::new(path)
-    } else {
-        Command::new("ffmpeg")
-    };
+    let mut command = ffmpeg_command(options);
     command
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -323,27 +372,57 @@ fn transcode_wxgf_hevc(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                "wxgf_ffmpeg_not_found"
-            } else {
-                "wxgf_ffmpeg_failed"
-            }
-        })?;
+        .map_err(map_ffmpeg_spawn_error)?;
 
-    let mut stdin = child.stdin.take().ok_or("wxgf_ffmpeg_failed")?;
+    let mut stdin = child.stdin.take().ok_or("wxgf_ffmpeg_stdin_unavailable")?;
     if stdin.write_all(hevc).is_err() {
         let _ = child.kill();
         let _ = child.wait();
-        return Err("wxgf_ffmpeg_failed");
+        return Err("wxgf_ffmpeg_write_failed");
     }
     drop(stdin);
 
-    let output = child.wait_with_output().map_err(|_| "wxgf_ffmpeg_failed")?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err("wxgf_ffmpeg_failed");
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "wxgf_ffmpeg_wait_failed")?;
+    if !output.status.success() {
+        return Err("wxgf_ffmpeg_exit_failed");
+    }
+    if output.stdout.is_empty() {
+        return Err("wxgf_ffmpeg_output_empty");
     }
     Ok(output.stdout)
+}
+
+fn probe_ffmpeg(options: &DatDecodeOptions) -> std::result::Result<(), &'static str> {
+    let status = ffmpeg_command(options)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(map_ffmpeg_spawn_error)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("wxgf_ffmpeg_probe_failed")
+    }
+}
+
+fn ffmpeg_command(options: &DatDecodeOptions) -> Command {
+    if let Some(path) = &options.wxgf_ffmpeg_path {
+        Command::new(path)
+    } else {
+        Command::new("ffmpeg")
+    }
+}
+
+fn map_ffmpeg_spawn_error(error: std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        "wxgf_ffmpeg_not_found"
+    } else {
+        "wxgf_ffmpeg_spawn_failed"
+    }
 }
 
 fn looks_like_mp4(bytes: &[u8]) -> bool {
@@ -593,6 +672,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn validates_wxgf_jpg_by_probing_ffmpeg_without_transcoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dat_path = tmp.path().join("sample.dat");
+        let ffmpeg_path = tmp.path().join("probe-only-ffmpeg");
+        let key = b"0123456789abcdef";
+        let wxgf = synthetic_wxgf(synthetic_hevc());
+        std::fs::write(&dat_path, synthetic_aes_dat(V2_MAGIC_FULL, &wxgf, key)).unwrap();
+        write_probe_only_ffmpeg(&ffmpeg_path);
+
+        let validated = validate_dat(
+            &dat_path,
+            &dat_options(key, WxgfMode::Jpg, Some(ffmpeg_path.clone())),
+        )
+        .unwrap();
+
+        assert_eq!(
+            validated,
+            DatDecode::Validated {
+                extension: "jpg",
+                decoder: "wxgf_jpg",
+            }
+        );
+
+        let decoded = decode_dat(
+            &dat_path,
+            &dat_options(key, WxgfMode::Jpg, Some(ffmpeg_path)),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            DatDecode::Unsupported {
+                reason: "wxgf_ffmpeg_exit_failed"
+            }
+        );
+    }
+
     fn synthetic_aes_dat(magic: &[u8; 6], plain: &[u8], key: &[u8]) -> Vec<u8> {
         let encrypted = encrypt_aes_128_ecb_pkcs7(plain, key);
         let mut data = Vec::new();
@@ -637,6 +753,19 @@ mod tests {
             format!("#!/bin/sh\ncat >/dev/null\nprintf '{output}'\n"),
         )
         .unwrap();
+        make_executable(path);
+    }
+
+    fn write_probe_only_ffmpeg(path: &Path) {
+        std::fs::write(
+            path,
+            "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then\n  printf 'ffmpeg fake\\n'\n  exit 0\nfi\nexit 42\n",
+        )
+        .unwrap();
+        make_executable(path);
+    }
+
+    fn make_executable(path: &Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
