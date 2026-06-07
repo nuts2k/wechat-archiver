@@ -89,7 +89,7 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
         create_archive_dirs(&resolved.archive_dir)?;
         let opened = open_index(&resolved.archive_dir)?;
         summary.index_path = Some(index_path(&resolved.archive_dir));
-        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id)?;
+        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, "extract-db-images")?;
         summary.manifest_path = Some(writer.path().to_path_buf());
         conn = Some(opened);
         manifest = Some(writer);

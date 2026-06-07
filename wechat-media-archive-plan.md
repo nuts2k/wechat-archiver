@@ -149,20 +149,21 @@ wechat-archive/
 - 不自动解密 SQLCipher 微信数据库。
 - 不提取微信进程密钥、不重签微信、不提升权限。
 - 不写入、不删除、不覆盖任何微信源目录文件。
-- 当前只覆盖图片；视频、文件、语音仍在第 2 阶段。
+- 当前覆盖图片和直接视频文件；文件、语音仍在第 2 阶段。
 
 建议命令：
 
 ```bash
 wechat-archiver scan
 wechat-archiver extract --type image
+wechat-archiver extract --type video
 wechat-archiver extract-images
 wechat-archiver extract-db-images
 wechat-archiver status
 wechat-archiver verify
 ```
 
-说明：`extract --type image` 是统一媒体抽取入口的第一步，当前复用图片归档流程；`extract-images` 保留用于兼容旧脚本。
+说明：`extract --type image` 复用图片归档流程，`extract --type video` 当前只扫描直接视频文件；`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 
@@ -177,7 +178,7 @@ wechat-archiver verify
 
 功能：
 
-- 视频归档：优先从本地路径直接复制并计算 hash。
+- 视频归档：优先从本地路径直接复制并计算 hash；后续再补消息库来源、时长和分辨率。
 - 文件归档：保留原始文件名、扩展名、大小和来源消息。
 - 语音归档：先保存原始格式，再可选转换为 `wav` 或 `mp3`。
 - 支持按时间范围、会话、类型过滤。

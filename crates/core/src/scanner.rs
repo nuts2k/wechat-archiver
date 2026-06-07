@@ -10,77 +10,136 @@ use crate::hash::{sha256_bytes, sha256_file};
 use crate::image::{decode_dat, direct_image_extension, is_dat_file, validate_dat, DatDecode};
 use crate::index::{index_path, insert_record, open_index, MediaRecord};
 use crate::manifest::ManifestWriter;
+use crate::media::direct_video_extension;
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 
 pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
     let resolved = config.resolve()?;
-    let run_id = format!("{}", now_epoch_ms());
-    let mut summary = ExtractSummary::new(
-        run_id.clone(),
-        resolved.source_dir.clone(),
-        resolved.archive_dir.clone(),
-        resolved.dry_run,
-    );
-    if resolved.explain_unsupported {
-        summary.enable_unsupported_explanation();
-    }
-
-    let mut conn = None;
-    let mut manifest = None;
-    if !resolved.dry_run {
-        create_archive_dirs(&resolved.archive_dir)?;
-        let opened = open_index(&resolved.archive_dir)?;
-        summary.index_path = Some(index_path(&resolved.archive_dir));
-        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id)?;
-        summary.manifest_path = Some(writer.path().to_path_buf());
-        conn = Some(opened);
-        manifest = Some(writer);
-    }
+    let mut run = ScanRun::new(&resolved, "extract-images")?;
 
     for entry in WalkDir::new(&resolved.source_dir).follow_links(false) {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
-        summary.scanned_files += 1;
+        run.summary.scanned_files += 1;
 
         let path = entry.path();
         if let Some(extension) = direct_image_extension(path) {
-            summary.candidates += 1;
-            let result = process_direct_image(
+            run.summary.candidates += 1;
+            let result = process_direct_media(
                 path,
                 extension,
                 &resolved.source_dir,
                 &resolved.archive_dir,
-                &run_id,
+                &run.run_id,
                 resolved.dry_run,
-                conn.as_ref(),
-                manifest.as_mut(),
+                run.conn.as_ref(),
+                run.manifest.as_mut(),
+                "direct_image",
+                "image",
             );
-            apply_result(&mut summary, result)?;
+            apply_result(&mut run.summary, result)?;
         } else if is_dat_file(path) {
-            summary.candidates += 1;
+            run.summary.candidates += 1;
             let result = process_dat_image(
                 path,
                 &resolved.source_dir,
                 &resolved.archive_dir,
-                &run_id,
+                &run.run_id,
                 "dat_image",
                 resolved.dry_run,
                 &resolved.dat_options,
-                conn.as_ref(),
-                manifest.as_mut(),
+                run.conn.as_ref(),
+                run.manifest.as_mut(),
             );
-            apply_result(&mut summary, result)?;
+            apply_result(&mut run.summary, result)?;
         }
     }
 
-    if let Some(writer) = manifest.as_mut() {
-        writer.flush()?;
-    }
-    summary.finish_unsupported_explanation();
+    run.finish()
+}
 
-    Ok(summary)
+pub fn extract_videos(config: ArchiveConfig) -> Result<ExtractSummary> {
+    let resolved = config.resolve()?;
+    let mut run = ScanRun::new(&resolved, "extract-videos")?;
+
+    for entry in WalkDir::new(&resolved.source_dir).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        run.summary.scanned_files += 1;
+
+        let path = entry.path();
+        if let Some(extension) = direct_video_extension(path) {
+            run.summary.candidates += 1;
+            let result = process_direct_media(
+                path,
+                extension,
+                &resolved.source_dir,
+                &resolved.archive_dir,
+                &run.run_id,
+                resolved.dry_run,
+                run.conn.as_ref(),
+                run.manifest.as_mut(),
+                "direct_video",
+                "video",
+            );
+            apply_result(&mut run.summary, result)?;
+        }
+    }
+
+    run.finish()
+}
+
+struct ScanRun {
+    run_id: String,
+    summary: ExtractSummary,
+    conn: Option<Connection>,
+    manifest: Option<ManifestWriter>,
+}
+
+impl ScanRun {
+    fn new(resolved: &crate::config::ResolvedConfig, manifest_label: &str) -> Result<Self> {
+        let run_id = format!("{}", now_epoch_ms());
+        let mut summary = ExtractSummary::new(
+            run_id.clone(),
+            resolved.source_dir.clone(),
+            resolved.archive_dir.clone(),
+            resolved.dry_run,
+        );
+        if resolved.explain_unsupported {
+            summary.enable_unsupported_explanation();
+        }
+
+        let mut conn = None;
+        let mut manifest = None;
+        if !resolved.dry_run {
+            create_archive_dirs(&resolved.archive_dir)?;
+            let opened = open_index(&resolved.archive_dir)?;
+            summary.index_path = Some(index_path(&resolved.archive_dir));
+            let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, manifest_label)?;
+            summary.manifest_path = Some(writer.path().to_path_buf());
+            conn = Some(opened);
+            manifest = Some(writer);
+        }
+
+        Ok(Self {
+            run_id,
+            summary,
+            conn,
+            manifest,
+        })
+    }
+
+    fn finish(mut self) -> Result<ExtractSummary> {
+        if let Some(writer) = self.manifest.as_mut() {
+            writer.flush()?;
+        }
+        self.summary.finish_unsupported_explanation();
+        Ok(self.summary)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -129,7 +188,7 @@ pub(crate) fn apply_result(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_direct_image(
+fn process_direct_media(
     path: &Path,
     extension: &str,
     source_root: &Path,
@@ -138,6 +197,8 @@ fn process_direct_image(
     dry_run: bool,
     conn: Option<&Connection>,
     manifest: Option<&mut ManifestWriter>,
+    source_kind: &str,
+    media_type: &str,
 ) -> Result<ScanOutcome> {
     let rel = relative_path(path, source_root)?;
     let (sha256, size_bytes) = sha256_file(path)?;
@@ -161,7 +222,8 @@ fn process_direct_image(
         run_id,
         path,
         &rel,
-        "direct_image",
+        source_kind,
+        media_type,
         None,
         action.clone(),
         archive_path,
@@ -223,6 +285,7 @@ pub(crate) fn process_dat_image(
                 path,
                 &rel,
                 source_kind,
+                "image",
                 Some(decoder),
                 action.clone(),
                 archive_path,
@@ -242,6 +305,7 @@ pub(crate) fn process_dat_image(
                 path,
                 &rel,
                 source_kind,
+                "image",
                 Some(decoder),
                 ScanAction::WouldArchive,
                 None,
@@ -261,6 +325,7 @@ pub(crate) fn process_dat_image(
                 path,
                 &rel,
                 source_kind,
+                "image",
                 None,
                 ScanAction::Unsupported,
                 None,
@@ -283,6 +348,7 @@ fn build_event(
     source_path: &Path,
     source_relative_path: &str,
     source_kind: &str,
+    media_type: &str,
     decoder: Option<&str>,
     action: ScanAction,
     archive_path: Option<String>,
@@ -300,7 +366,7 @@ fn build_event(
         source_path: source_path.to_string_lossy().to_string(),
         source_relative_path: source_relative_path.to_string(),
         source_kind: source_kind.to_string(),
-        media_type: "image".to_string(),
+        media_type: media_type.to_string(),
         decoder: decoder.map(str::to_string),
         action,
         archive_path,
@@ -471,6 +537,119 @@ mod tests {
         assert_eq!(summary.archived, 0);
         assert_eq!(summary.would_archive, 1);
         assert!(!archive.exists());
+    }
+
+    #[test]
+    fn extracts_direct_videos_without_touching_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let video_path = source.join("clip.MP4");
+        let video_bytes = b"synthetic-video";
+        std::fs::write(&video_path, video_bytes).unwrap();
+        std::fs::write(source.join("not-video.txt"), b"ignored").unwrap();
+
+        let summary = extract_videos(ArchiveConfig {
+            source_dir: source.clone(),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 2);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+        assert_eq!(std::fs::read(&video_path).unwrap(), video_bytes);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_kind, media_type, extension): (String, String, String) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, media_type, extension
+                FROM media_items
+                WHERE source_relative_path = 'clip.MP4'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(source_kind, "direct_video");
+        assert_eq!(media_type, "video");
+        assert_eq!(extension, "mp4");
+
+        let manifest_path = summary.manifest_path.unwrap();
+        assert!(manifest_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-extract-videos.jsonl"));
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
+        let event = manifest
+            .lines()
+            .map(|line| serde_json::from_str::<ManifestEvent>(line).unwrap())
+            .find(|event| event.source_relative_path == "clip.MP4")
+            .unwrap();
+        assert_eq!(event.source_kind, "direct_video");
+        assert_eq!(event.media_type, "video");
+        assert_eq!(event.extension.as_deref(), Some("mp4"));
+
+        let verify = verify_archive(&archive).unwrap();
+        assert_eq!(verify.checked, 1);
+        assert_eq!(verify.ok, 1);
+    }
+
+    #[test]
+    fn video_dry_run_writes_nothing_to_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("clip.mov"), b"synthetic-video").unwrap();
+
+        let summary = extract_videos(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive.clone(),
+            dry_run: true,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.archived, 0);
+        assert_eq!(summary.would_archive, 1);
+        assert!(!archive.exists());
+    }
+
+    #[test]
+    fn duplicate_videos_share_one_archive_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("one.mp4"), b"same-video").unwrap();
+        std::fs::write(source.join("two.mp4"), b"same-video").unwrap();
+
+        let summary = extract_videos(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.candidates, 2);
+        assert_eq!(summary.archived, 1);
+        assert_eq!(summary.already_archived, 1);
+
+        let status = archive_status(&archive).unwrap();
+        assert_eq!(status.total_records, 2);
+        assert_eq!(status.archived_records, 2);
+        assert_eq!(status.unique_objects, 1);
     }
 
     #[test]

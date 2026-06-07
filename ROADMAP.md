@@ -81,6 +81,13 @@ Rust core library
 - `wxgf jpg/mp4` dry-run 只验证 HEVC 分片和 `ffmpeg -version`，不执行全量转码。
 - 对 `ffmpeg` 缺失、探测失败、启动失败、写入失败、进程失败、输出为空、输出格式异常等情况输出细分 reason。
 
+### 视频扫描与归档
+
+- 支持统一媒体抽取入口 `extract --type video`。
+- 当前视频归档为直接文件扫描最小版，支持 `mp4`、`mov`、`m4v`。
+- 视频对象复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
+- 当前记录 `source_kind=direct_video`、`media_type=video`；暂不解析消息库视频来源，也不提取时长和分辨率。
+
 ### 消息库图片枚举
 
 - 支持读取 `db_storage/message/message_*.db`。
@@ -118,7 +125,7 @@ wechat-archive/
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 记录，以及统一 `extract --type` CLI 解析。
+- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 记录、直接视频归档，以及统一 `extract --type` CLI 解析。
 - 已通过：
 
 ```bash
@@ -137,7 +144,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 - `derive-image-key` 不自动保存 key；本机 key 文档应继续保存在 `.gitignore` 覆盖的本地文件中。
 - `wxgf jpg/mp4` 依赖 `ffmpeg`，没有可用 `ffmpeg` 时应使用 `raw` 或 `off`。
 - `wxgf jpg` 当前输出首帧 JPG，不保留可能存在的动态效果。
-- 统一 `extract` 入口当前只接入图片；视频、文件、语音、表情、收藏、朋友圈等尚未接入归档流程。
+- 统一 `extract` 入口当前接入图片和直接视频文件；文件、语音、表情、收藏、朋友圈等尚未接入归档流程。
+- 视频归档当前只覆盖直接文件扫描，不覆盖消息库枚举、时长、分辨率等元数据。
 - 尚未实现 Tauri 桌面客户端。
 - 尚未实现归档后的清理建议或删除操作。
 
@@ -173,15 +181,18 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ```bash
 wechat-archiver extract --type image
+wechat-archiver extract --type video
 ```
 
-- 该入口复用现有图片归档流程，保持 dry-run、结构化错误、manifest/index 和安全边界一致。
-- `video`、`file`、`voice` 等类型当前会明确返回尚未支持，不会静默跳过或生成不完整归档。
+- `image` 入口复用现有图片归档流程。
+- `video` 入口当前扫描直接视频文件，复制本地视频、计算 hash，并记录到同一套 archive/index/manifest。
+- `file`、`voice` 等类型当前会明确返回尚未支持，不会静默跳过或生成不完整归档。
+- 多类型组合当前暂未执行，避免一个 CLI 命令生成多个 run 和多份 summary；后续应先设计聚合 summary。
 
 计划：
 
 - 将 `extract --type image,video,file,voice` 扩展为多媒体归档入口。
-- 视频归档：复制本地视频、计算 hash、记录时长和分辨率。
+- 视频归档增强：解析消息库视频来源，记录时长和分辨率。
 - 文件归档：保留原始文件名、扩展名、大小、来源消息。
 - 语音归档：先保存原始格式，再支持可选转换为 `wav` 或 `mp3`。
 - 表情归档：识别静态图、动图和专有格式。
@@ -284,8 +295,8 @@ wechat-archiver extract --type image
 
 ## 推荐下一步
 
-建议进入 P1，开始设计统一媒体抽取命令：
+建议继续推进 P1 的直接媒体归档：
 
-- 增加 `wechat-archiver extract --type image,video,file,voice` 的薄 CLI 入口。
-- 先把现有图片抽取接入统一命令，再逐步扩展视频、文件和语音。
-- 保持 dry-run、结构化错误、manifest/index 和安全边界与现有图片流程一致。
+- 增加 `wechat-archiver extract --type file` 的直接文件归档最小版。
+- 复用直接媒体归档能力，记录 `source_kind=direct_file`、`media_type=file`、原始扩展名和大小。
+- 再考虑视频消息库来源、时长和分辨率等元数据增强。

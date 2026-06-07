@@ -11,10 +11,10 @@ pub(crate) struct ManifestWriter {
 }
 
 impl ManifestWriter {
-    pub(crate) fn create(archive_dir: &Path, run_id: &str) -> Result<Self> {
+    pub(crate) fn create(archive_dir: &Path, run_id: &str, label: &str) -> Result<Self> {
         let path = archive_dir
             .join("manifests")
-            .join(format!("{run_id}-extract-images.jsonl"));
+            .join(format!("{run_id}-{label}.jsonl"));
         let file = File::create(&path).with_path(&path)?;
         Ok(Self {
             path,
