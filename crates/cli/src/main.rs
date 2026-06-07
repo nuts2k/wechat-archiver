@@ -8,11 +8,12 @@ use wechat_archiver_core::{
     archive_report, archive_status, count_message_db_media, derive_image_key, discover_wechat,
     extract_files, extract_images, extract_message_db_files, extract_message_db_images,
     extract_message_db_videos, extract_message_db_voices, extract_videos, extract_voices,
-    inspect_message_db, lookup_index, verify_archive, ArchiveConfig, ArchiveReport, ArchiveStatus,
-    DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions, ExtractSummary, ImageKeyDerivation,
-    ImageKeyMethod, IndexLookup, IndexLookupQuery, MessageDbExtractConfig, MessageDbInspectConfig,
-    MessageDbInspection, MessageDbMediaCountConfig, MessageDbMediaCountSummary,
-    MessageDbMediaTypeCount, VerifySummary, WechatDiscovery,
+    generate_views, inspect_message_db, lookup_index, verify_archive, ArchiveConfig, ArchiveReport,
+    ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions, ExtractSummary,
+    ImageKeyDerivation, ImageKeyMethod, IndexLookup, IndexLookupQuery, MessageDbExtractConfig,
+    MessageDbInspectConfig, MessageDbInspection, MessageDbMediaCountConfig,
+    MessageDbMediaCountSummary, MessageDbMediaTypeCount, VerifySummary, ViewsConfig, ViewsSummary,
+    WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -261,6 +262,9 @@ enum Commands {
         format: ReportFormat,
     },
 
+    /// 生成归档目录内的可浏览 views 视图；默认 dry-run。
+    Views(ViewsArgs),
+
     /// 校验已归档对象是否仍与索引 sha256 一致。
     Verify {
         /// 独立归档目录。
@@ -291,6 +295,30 @@ struct LookupArgs {
     /// 按微信源文件完整路径查询当前索引状态。
     #[arg(long)]
     source_path: Option<PathBuf>,
+
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(group(
+    ArgGroup::new("views_mode")
+        .args(["dry_run", "write"])
+        .multiple(false)
+))]
+struct ViewsArgs {
+    /// 独立归档目录。
+    #[arg(long)]
+    archive: PathBuf,
+
+    /// 只输出将要创建的视图计划，不写入 views；默认行为。
+    #[arg(long)]
+    dry_run: bool,
+
+    /// 写入 archive/views 下的相对软链接视图。
+    #[arg(long)]
+    write: bool,
 
     /// 输出 JSON。
     #[arg(long)]
@@ -530,6 +558,17 @@ fn main() -> Result<()> {
         Commands::Report { archive, format } => {
             let report = archive_report(&archive)?;
             print_archive_report(&report, format)?;
+        }
+        Commands::Views(args) => {
+            let dry_run = args.dry_run || !args.write;
+            let summary = generate_views(ViewsConfig {
+                archive_dir: args.archive,
+                dry_run,
+            })?;
+            print_views_summary(&summary, args.json)?;
+            if summary.skipped_records > 0 || summary.failed_links > 0 {
+                std::process::exit(2);
+            }
         }
         Commands::Verify { archive, json } => {
             let summary = verify_archive(&archive)?;
@@ -1138,6 +1177,42 @@ fn optional_i64_csv(value: Option<i64>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 
+fn print_views_summary(summary: &ViewsSummary, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(summary)?);
+        return Ok(());
+    }
+
+    println!("archive: {}", summary.archive_dir.display());
+    println!("views: {}", summary.views_dir.display());
+    println!("dry_run: {}", summary.dry_run);
+    println!("scanned_records: {}", summary.scanned_records);
+    println!("planned_links: {}", summary.planned_links);
+    println!("created_links: {}", summary.created_links);
+    println!("existing_links: {}", summary.existing_links);
+    println!("skipped_records: {}", summary.skipped_records);
+    println!("failed_links: {}", summary.failed_links);
+    for link in &summary.links {
+        println!(
+            "link: {} -> {} ({})",
+            link.view_path.display(),
+            link.link_target.display(),
+            link.view_kind
+        );
+    }
+    for failure in &summary.failures {
+        println!(
+            "failure: id={:?} source_path={:?} archive_path={:?} view_path={:?} error={}",
+            failure.media_item_id,
+            failure.source_path,
+            failure.archive_path,
+            failure.view_path,
+            failure.error
+        );
+    }
+    Ok(())
+}
+
 fn optional_string(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("-")
 }
@@ -1398,6 +1473,43 @@ mod tests {
         assert_eq!(csv_field("a,b"), "\"a,b\"");
         assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
         assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+    }
+
+    #[test]
+    fn parses_views_dry_run_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "views",
+            "--archive",
+            "/tmp/wechat-archive",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Views(args) => {
+                assert_eq!(args.archive, PathBuf::from("/tmp/wechat-archive"));
+                assert!(args.dry_run);
+                assert!(!args.write);
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_views_with_dry_run_and_write() {
+        let result = Cli::try_parse_from([
+            "wechat-archiver",
+            "views",
+            "--archive",
+            "/tmp/wechat-archive",
+            "--dry-run",
+            "--write",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]

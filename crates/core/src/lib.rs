@@ -14,6 +14,7 @@ mod scanner;
 mod status;
 mod types;
 mod verify;
+mod views;
 mod wechat;
 
 pub use config::{ArchiveConfig, DatDecodeOptions, ResolvedConfig, WxgfMode};
@@ -35,4 +36,5 @@ pub use types::{
     ExtractSummary, ManifestEvent, ScanAction, UnsupportedExplanation, UnsupportedReasonSummary,
 };
 pub use verify::{verify_archive, IndexVerifyFailure, VerifyFailure, VerifySummary};
+pub use views::{generate_views, ViewFailure, ViewLink, ViewsConfig, ViewsSummary};
 pub use wechat::{discover_wechat, DiscoverOptions, WechatAccount, WechatDiscovery};
