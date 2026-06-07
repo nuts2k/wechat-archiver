@@ -43,6 +43,7 @@ Rust core library
 - 归档写入使用 staging，再移动到内容寻址对象路径。
 - 归档对象以 `sha256` 校验为准。
 - 消息数据库只按 SQLite 只读模式打开，并启用 `query_only`。
+- 语音消息库 BLOB 只从已解密/普通 SQLite `media_*.db/VoiceInfo` 只读读取，归档写入仍只发生在 archive。
 - 不读取微信进程内存。
 - 不重签微信。
 - 不提权。
@@ -104,12 +105,12 @@ Rust core library
 - 当前语音归档为直接音频文件扫描最小版，支持 `silk`、`slk`、`amr`、`mp3`、`m4a`、`aac`、`wav`、`ogg`、`opus`。
 - 当 `--source` 是微信账号目录或该账号的 `msg/attach` 时，只扫描同账号存在的 `msg/voice` 或 `msg/audio` 专用目录；其他目录只扫描传入目录本身。
 - 语音对象复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
-- 当前记录 `source_kind=direct_voice`、`media_type=voice`；暂不解析消息库语音 BLOB，不做 SILK 转码、语音转写或消息上下文补充。
+- 当前直接文件扫描记录 `source_kind=direct_voice`、`media_type=voice`；消息库语音 BLOB 归档见 `extract-db-voices`。
 
 ### 消息库图片枚举
 
 - 支持 `inspect-db` 只读诊断消息库目录，报告普通 SQLite、缺失、非 SQLite 或疑似加密库。
-- 支持 `--message-db-dir` 为 `extract-db-images`、`extract-db-videos` 和 `extract-db-files` 指定已解密/普通 SQLite 消息库目录。
+- 支持 `--message-db-dir` 为 `extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 指定已解密/普通 SQLite 消息库目录。
 - 支持读取 `db_storage/message/message_*.db`。
 - 支持读取 `message_resource.db`。
 - 支持基于 `MessageResourceInfo` 和 `Msg_<md5(talker)>` 枚举图片类消息。
@@ -134,6 +135,15 @@ Rust core library
 - 当前记录 `source_kind=message_db_file`、`media_type=file` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。
 - 对本地文件缺失的资源记录为 `failed`；当前不猜测发送人，也不解析复杂 appmsg XML。
 
+### 消息库语音枚举
+
+- 支持 `extract-db-voices` 从已解密/普通 SQLite 消息库枚举语音消息并归档 `VoiceInfo.voice_data` 原始字节。
+- 支持读取同一消息库目录下的 `media_*.db`。
+- 支持基于 `Name2Id`、`VoiceInfo` 和 `Msg_<md5(talker)>` 的 `local_type=34` 按 `talker/local_id/create_time` 匹配语音 BLOB。
+- 语音 BLOB 复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
+- 当前记录 `source_kind=message_db_voice`、`media_type=voice` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。
+- 对消息表存在但 `VoiceInfo.voice_data` 缺失的语音记录为 `failed`；当前不做 SILK 转码、语音转写、时长提取或发送人猜测。
+
 ### 归档与索引
 
 - 归档目录采用内容寻址结构：
@@ -155,14 +165,14 @@ wechat-archive/
 - `index.sqlite` 保存当前索引状态。
 - `manifests/*.jsonl` 保存每次运行审计记录。
 - `index.sqlite` 和 manifest 独立记录 `source_kind` 与 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。
-- `index.sqlite` 和 manifest 支持可空消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；当前消息库图片、视频和文件附件归档会写入 `talker/local_id/create_time`，`sender` 暂不猜测。
+- `index.sqlite` 和 manifest 支持可空消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；当前消息库图片、视频、文件附件和语音归档会写入 `talker/local_id/create_time`，`sender` 暂不猜测。
 - 支持 `status` 查看索引统计。
 - 支持 `verify` 重新计算归档对象 hash。
 - 支持重复对象去重：相同 `sha256` 不重复写入对象文件。
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 和消息来源记录、消息库诊断、消息库图片/视频/文件附件归档、外部已解密消息库目录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
+- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 和消息来源记录、消息库诊断、消息库图片/视频/文件附件/语音归档、外部已解密消息库目录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
 - 已通过：
 
 ```bash
@@ -176,10 +186,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 ## 当前边界
 
 - 当前主线仍是图片归档。
-- `extract-db-images`、`extract-db-videos` 和 `extract-db-files` 只支持已解密/普通 SQLite 数据库，不支持直接读取 SQLCipher 加密库。
+- `extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 只支持已解密/普通 SQLite 数据库，不支持直接读取 SQLCipher 加密库。
 - `inspect-db` 只能诊断当前消息库是否可读，不会自动解密；`count-db-media` 可统计已解密/普通 SQLite 消息库，但不会统计加密库里的真实媒体数量。
-- `--message-db-dir` 只改变消息库读取位置；媒体文件仍从 `--account` 下的微信目录定位。
-- 消息来源字段当前由消息库图片、视频和文件附件归档写入 `talker/local_id/create_time`；直接 file/voice 和 `message_sender` 仍待后续消息库来源增强。
+- `--message-db-dir` 只改变消息库读取位置；图片、视频和文件附件仍从 `--account` 下的微信目录定位，语音 BLOB 从该消息库目录的 `media_*.db/VoiceInfo` 只读读取。
+- 消息来源字段当前由消息库图片、视频、文件附件和语音归档写入 `talker/local_id/create_time`；直接 file/voice 和 `message_sender` 仍待后续消息库来源增强。
 - V2 图片 AES key 可通过 `derive-image-key` 只读派生，但抽取命令仍需要用户显式提供。
 - `derive-image-key` 不自动保存 key；本机 key 文档应继续保存在 `.gitignore` 覆盖的本地文件中。
 - `wxgf jpg/mp4` 依赖 `ffmpeg`，没有可用 `ffmpeg` 时应使用 `raw` 或 `off`。
@@ -187,7 +197,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 - 统一 `extract` 入口当前接入图片、直接视频文件、直接文件附件和直接语音/音频文件；表情、收藏、朋友圈等尚未接入归档流程。
 - 视频归档当前已覆盖直接文件扫描和消息库枚举，但暂不提取时长、分辨率等元数据。
 - 文件归档当前已覆盖直接文件扫描和消息库枚举，但暂不解析复杂 appmsg XML，也不补充发送人。
-- 语音归档当前只覆盖直接音频文件扫描，不覆盖消息库语音 BLOB、SILK 转码、语音转写或会话上下文。
+- 语音归档当前覆盖直接音频文件扫描和消息库 `VoiceInfo.voice_data` 原始 BLOB；暂不做 SILK 转码、语音转写、时长提取或发送人猜测。
 - 尚未实现 Tauri 桌面客户端。
 - 尚未实现归档后的清理建议或删除操作。
 
@@ -235,6 +245,7 @@ wechat-archiver extract --type voice
 - `extract-db-videos` 当前从消息库枚举视频资源，定位 `msg/video/<YYYY-MM>/<md5>.mp4`，并记录消息来源字段。
 - `file` 入口当前扫描直接文件附件；对微信账号目录或 `msg/attach` 会自动定位同账号 `msg/file`，复制本地文件、计算 hash，并记录到同一套 archive/index/manifest。
 - `extract-db-files` 当前从消息库枚举文件附件，定位 `msg/file/<YYYY-MM>/<file_name>`，并记录消息来源字段。
+- `extract-db-voices` 当前从消息库枚举 `local_type=34` 语音消息，读取 `media_*.db/VoiceInfo.voice_data` 原始 BLOB，并记录消息来源字段。
 - `voice` 入口当前扫描直接语音/音频文件；对微信账号目录或 `msg/attach` 只在存在 `msg/voice` 或 `msg/audio` 专用目录时扫描，避免把 `msg/file` 中的音乐附件误归为语音消息。
 - 多类型组合当前暂未执行，避免一个 CLI 命令生成多个 run 和多份 summary；后续应先设计聚合 summary。
 
@@ -243,7 +254,7 @@ wechat-archiver extract --type voice
 - 将 `extract --type image,video,file,voice` 扩展为可聚合的多媒体归档入口。
 - 视频归档增强：提取时长和分辨率。
 - 文件归档增强：解析更完整的 appmsg 元数据，补充大小、发送人等上下文。
-- 语音归档增强：解析消息库语音 BLOB，记录会话、时间和发送人，再支持可选转换为 `wav` 或 `mp3`。
+- 语音归档增强：在已支持原始 BLOB 归档的基础上，补充时长、发送人，再支持可选转换为 `wav` 或 `mp3`。
 - 表情归档：识别静态图、动图和专有格式。
 - 支持 `--since`、`--until`、`--chat`、`--type` 等过滤参数。
 - 支持任务级进度统计和可取消执行，为未来 Tauri 做准备。
@@ -344,9 +355,9 @@ wechat-archiver extract --type voice
 
 ## 推荐下一步
 
-建议继续推进 P1 的消息库来源增强：
+建议继续推进 P1 到 P2 的衔接：
 
-- 继续做消息库来源增强，为 voice 补充会话、时间、发送人等上下文。
-- 下一步应优先解析消息库语音 BLOB 或资源引用，并复用已落地的消息来源字段。
-- 语音下一步重点是解析消息库语音 BLOB，而不是继续扩大直接文件扫描范围。
-- 两条路线都应继续保持 dry-run、结构化错误、manifest/index 和安全边界一致。
+- 先为 `extract-db-voices` 补充真实已解密样本 dry-run 回归，确认 `VoiceInfo` 分片和 `local_id/create_time` 匹配策略。
+- 然后做多类型聚合 summary，让 `extract --type image,video,file,voice` 可以一次运行并输出统一结果。
+- 语音后续增强重点是时长、发送人和可选转码/转写，而不是继续扩大直接文件扫描范围。
+- 所有路线都应继续保持 dry-run、结构化错误、manifest/index 和安全边界一致。

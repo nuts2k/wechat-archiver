@@ -134,18 +134,19 @@ wechat-archive/
 - 将扫描、归档、索引、校验逻辑放在可被 Tauri 复用的核心库中。
 - 只读发现 macOS 微信 4.x 常见账号目录。
 - 只读递归扫描普通图片和 `.dat` 图片源目录。
-- 只读读取已解密/普通 SQLite 消息库：`message_*.db` 和 `message_resource.db`。
+- 只读读取已解密/普通 SQLite 消息库：`message_*.db`、`message_resource.db` 和语音使用的 `media_*.db/VoiceInfo`。
 - 只读诊断消息库目录是否为当前可读的普通 SQLite，并支持显式指定已解密消息库目录。
 - 只读统计已解密/普通 SQLite 消息库中的 image/video/file/voice 候选数量，不读取媒体文件，不写归档目录。
 - 基于 `ChatName2Id`、`MessageResourceInfo`、`Msg_<md5(talker)>` 枚举图片类消息。
 - 定位 `msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5>.dat`，并兼容 `_h`、`_W`、`_w`、`_t` 变体。
 - 基于消息库视频资源 md5 定位 `msg/video/<YYYY-MM>/<md5>.mp4`。
 - 基于消息库文件附件资源保守识别安全文件名，并定位 `msg/file/<YYYY-MM>/<file_name>`。
+- 基于消息库 `VoiceInfo.voice_data` 和 `Msg_<md5(talker)>` 的 `local_type=34` 归档语音原始 BLOB。
 - 支持普通图片、旧 XOR `.dat`、V1 AES `.dat`，V2 AES `.dat` 仅在用户显式提供 key 时解码。
 - 计算 `sha256`。
 - 复制到归档目录。
 - 写入 SQLite 索引。
-- 消息库图片、视频和文件附件归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
+- 消息库图片、视频、文件附件和语音归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
 - 支持校验归档文件完整性。
 - 对未知 `.dat` 记录 `unsupported`，对消息库中存在但本地 `.dat` 缺失的资源记录 `failed`。
 
@@ -154,7 +155,7 @@ wechat-archive/
 - 不自动解密 SQLCipher 微信数据库。
 - 不提取微信进程密钥、不重签微信、不提升权限。
 - 不写入、不删除、不覆盖任何微信源目录文件。
-- 当前覆盖图片、直接视频文件、直接文件附件和直接语音/音频文件；消息库语音 BLOB 仍在第 2 阶段增强。
+- 当前覆盖图片、直接视频文件、直接文件附件、直接语音/音频文件，以及消息库语音原始 BLOB；语音转码、转写和发送人补充仍在第 2 阶段增强。
 
 建议命令：
 
@@ -170,11 +171,12 @@ wechat-archiver extract-images
 wechat-archiver extract-db-images
 wechat-archiver extract-db-videos
 wechat-archiver extract-db-files
+wechat-archiver extract-db-voices
 wechat-archiver status
 wechat-archiver verify
 ```
 
-说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`count-db-media` 用于在已解密/普通 SQLite 消息库上估算 image/video/file/voice 候选量，不读取媒体文件、不写归档目录。`extract-db-images`、`extract-db-videos` 和 `extract-db-files` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定，媒体仍从 `--account/msg` 定位。`extract-images` 保留用于兼容旧脚本。
+说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`count-db-media` 用于在已解密/普通 SQLite 消息库上估算 image/video/file/voice 候选量，不读取微信媒体目录、不写归档目录。`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定。图片、视频和文件仍从 `--account/msg` 定位，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 
@@ -192,7 +194,7 @@ wechat-archiver verify
 
 - 视频归档：已支持直接文件和消息库枚举；后续再补时长和分辨率。
 - 文件归档：已支持直接文件和保守消息库枚举；后续再补更完整的 appmsg 元数据、大小和发送人。
-- 语音归档：先归档直接语音/音频文件；后续再解析消息库语音 BLOB，并支持可选转换为 `wav` 或 `mp3`。
+- 语音归档：已支持直接语音/音频文件和消息库 `VoiceInfo.voice_data` 原始 BLOB；后续再支持可选转换为 `wav` 或 `mp3`、时长提取和转写。
 - 支持按时间范围、会话、类型过滤。
 
 建议命令：

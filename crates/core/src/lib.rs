@@ -19,9 +19,9 @@ pub use error::{ArchiverError, Result};
 pub use image_key::{derive_image_key, DeriveImageKeyOptions, ImageKeyDerivation, ImageKeyMethod};
 pub use message_db::{
     count_message_db_media, extract_message_db_files, extract_message_db_images,
-    extract_message_db_videos, inspect_message_db, MessageDbDirectoryStatus,
-    MessageDbExtractConfig, MessageDbFileInspection, MessageDbFileRole, MessageDbFileStatus,
-    MessageDbInspectConfig, MessageDbInspection, MessageDbInspectionStatus,
+    extract_message_db_videos, extract_message_db_voices, inspect_message_db,
+    MessageDbDirectoryStatus, MessageDbExtractConfig, MessageDbFileInspection, MessageDbFileRole,
+    MessageDbFileStatus, MessageDbInspectConfig, MessageDbInspection, MessageDbInspectionStatus,
     MessageDbMediaCountConfig, MessageDbMediaCountSummary, MessageDbMediaTypeCount,
     MessageDbNextAction,
 };

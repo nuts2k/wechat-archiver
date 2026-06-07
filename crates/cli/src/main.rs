@@ -6,11 +6,11 @@ use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
     archive_status, count_message_db_media, derive_image_key, discover_wechat, extract_files,
     extract_images, extract_message_db_files, extract_message_db_images, extract_message_db_videos,
-    extract_videos, extract_voices, inspect_message_db, verify_archive, ArchiveConfig,
-    ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions, ExtractSummary,
-    ImageKeyDerivation, ImageKeyMethod, MessageDbExtractConfig, MessageDbInspectConfig,
-    MessageDbInspection, MessageDbMediaCountConfig, MessageDbMediaCountSummary,
-    MessageDbMediaTypeCount, VerifySummary, WechatDiscovery,
+    extract_message_db_voices, extract_videos, extract_voices, inspect_message_db, verify_archive,
+    ArchiveConfig, ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions,
+    ExtractSummary, ImageKeyDerivation, ImageKeyMethod, MessageDbExtractConfig,
+    MessageDbInspectConfig, MessageDbInspection, MessageDbMediaCountConfig,
+    MessageDbMediaCountSummary, MessageDbMediaTypeCount, VerifySummary, WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -203,6 +203,29 @@ enum Commands {
         archive: PathBuf,
 
         /// 只读枚举和定位，不写入 archive。
+        #[arg(long)]
+        dry_run: bool,
+
+        /// 输出 JSON。
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// 从已解密/普通 SQLite 微信消息库枚举语音 BLOB 并归档。
+    ExtractDbVoices {
+        /// 单个微信账号目录，通常是 xwechat_files/<wxid>。
+        #[arg(long)]
+        account: PathBuf,
+
+        /// 已解密/普通 SQLite 消息库目录；语音 BLOB 仍从该目录下 media_*.db 只读读取。
+        #[arg(long)]
+        message_db_dir: Option<PathBuf>,
+
+        /// 独立归档目录，不能位于 account 内部，也不能包含 account。
+        #[arg(long)]
+        archive: PathBuf,
+
+        /// 只读枚举和 hash，不写入 archive。
         #[arg(long)]
         dry_run: bool,
 
@@ -418,6 +441,23 @@ fn main() -> Result<()> {
             json,
         } => {
             let summary = extract_message_db_files(MessageDbExtractConfig {
+                account_dir: account,
+                message_db_dir,
+                archive_dir: archive,
+                dry_run,
+                dat_options: DatDecodeOptions::default(),
+                explain_unsupported: false,
+            })?;
+            print_extract_summary(&summary, json)?;
+        }
+        Commands::ExtractDbVoices {
+            account,
+            message_db_dir,
+            archive,
+            dry_run,
+            json,
+        } => {
+            let summary = extract_message_db_voices(MessageDbExtractConfig {
                 account_dir: account,
                 message_db_dir,
                 archive_dir: archive,
@@ -706,7 +746,7 @@ fn print_message_db_media_count(summary: &MessageDbMediaCountSummary, json: bool
     print_media_type_count("file", summary.file);
     print_media_type_count("voice", summary.voice);
     println!("note: 该命令只读消息库，不读取、复制或 hash account/msg 下的媒体文件。");
-    println!("note: voice 当前只统计消息表 local_type=34 行数，暂不解析语音资源 BLOB。");
+    println!("note: voice 会只读统计 media_*.db/VoiceInfo 候选，但不会读取或复制微信媒体目录。");
     Ok(())
 }
 
@@ -945,6 +985,43 @@ mod tests {
             } => {
                 assert_eq!(account, PathBuf::from("/tmp/xwechat_files/wxid"));
                 assert_eq!(message_db_dir, None);
+                assert_eq!(archive, PathBuf::from("/tmp/wechat-archive"));
+                assert!(dry_run);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_extract_db_voices_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "extract-db-voices",
+            "--account",
+            "/tmp/xwechat_files/wxid",
+            "--message-db-dir",
+            "/tmp/decrypted-message",
+            "--archive",
+            "/tmp/wechat-archive",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ExtractDbVoices {
+                account,
+                message_db_dir,
+                archive,
+                dry_run,
+                json,
+            } => {
+                assert_eq!(account, PathBuf::from("/tmp/xwechat_files/wxid"));
+                assert_eq!(
+                    message_db_dir,
+                    Some(PathBuf::from("/tmp/decrypted-message"))
+                );
                 assert_eq!(archive, PathBuf::from("/tmp/wechat-archive"));
                 assert!(dry_run);
                 assert!(json);

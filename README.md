@@ -8,11 +8,12 @@
 
 - 只读发现 macOS 微信 4.x 常见账号目录：`xwechat_files/<wxid>/db_storage` 和 `msg/attach`。
 - 只读递归扫描用户指定的源目录。
-- 只读读取已解密/普通 SQLite 消息库：`db_storage/message/message_*.db` 和 `message_resource.db`。
+- 只读读取已解密/普通 SQLite 消息库：`db_storage/message/message_*.db`、`message_resource.db`，以及语音使用的 `media_*.db/VoiceInfo`。
 - 支持 `inspect-db` 只读诊断消息库目录，区分普通 SQLite、缺失、非 SQLite 或疑似加密库。
 - 支持 `count-db-media` 只读统计已解密/普通 SQLite 消息库中的 image/video/file/voice 候选数量，不读取、复制或 hash 媒体文件。
 - 基于 `MessageResourceInfo` 和 `Msg_<md5(talker)>` 枚举图片消息，定位 `msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5>.dat`。
 - 基于消息库资源信息枚举视频和文件附件，分别定位 `msg/video/<YYYY-MM>/<md5>.mp4` 和 `msg/file/<YYYY-MM>/<file_name>`。
+- 基于 `media_*.db/VoiceInfo` 和 `Msg_<md5(talker)>` 枚举语音消息，归档 `voice_data` 原始字节。
 - 归档普通图片：`jpg`、`jpeg`、`png`、`gif`、`bmp`、`webp`、`tif`、`tiff`、`heic`、`heif`。
 - 参考 `jackwener/wx-cli` 和 `ylytdeng/wechat-decrypt` 的旧格式图片 `.dat` 思路，支持自动识别 XOR key 并解码旧 XOR `.dat` 图片。
 - 支持 V1 AES `.dat` 的固定 key 解码。
@@ -20,13 +21,13 @@
 - 支持 V2 AES `.dat` 在用户显式提供 `--image-aes-key` 时解码；不会自动读取微信进程内存或提取密钥。
 - 支持解密后的微信 `wxgf` 私有图片格式：默认调用 `ffmpeg` 提取 HEVC 首帧并转成 JPG；也可选择归档原始 `wxgf` 或封装为 MP4。
 - dry-run 遇到 `wxgf jpg/mp4` 时只验证 HEVC 分片和 `ffmpeg` 可用性，不执行全量转码。
-- 支持统一媒体抽取入口 `extract --type image`、`extract --type video`、`extract --type file` 和 `extract --type voice`；视频、文件和语音当前为直接文件扫描最小版。
+- 支持统一媒体抽取入口 `extract --type image`、`extract --type video`、`extract --type file` 和 `extract --type voice`；视频、文件和语音支持直接文件扫描，视频、文件和语音也已有消息库枚举入口。
 - 对未知 `.dat`、缺少 V2 key 或无法识别文件记录为 `unsupported`，不会写出不可信的垃圾文件；对消息库中存在但本地 `.dat` 缺失的资源记录为 `failed`。
 - 归档文件写入独立 archive 目录，使用内容寻址路径 `objects/sha256/<prefix>/<sha256>.<ext>`。
 - 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind`、独立 `decoder` 和可用的消息来源字段。
 - 支持 `status` 查看索引统计，支持 `verify` 重新计算归档对象 hash。
 
-当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`count-db-media`、`extract-db-images`、`extract-db-videos` 和 `extract-db-files` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；媒体文件仍只从 `--account` 下的 `msg/*` 读取。
+当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`count-db-media`、`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；图片、视频和文件附件仍只从 `--account` 下的 `msg/*` 读取，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。
 
 ## 安全边界
 
@@ -95,7 +96,7 @@ cargo run -p wechat-archiver -- count-db-media \
   --json
 ```
 
-`count-db-media` 不需要 `--archive`，不会创建归档目录、索引或 manifest，也不会读取、复制或 hash `--account/msg` 下的媒体文件。输出中的 `resource_candidates` 表示资源库可解析候选数，`message_rows` 表示消息表对应 `local_type` 行数，`matched_messages` 表示两边能按 `talker/local_id/create_time` 匹配的消息数。语音当前只统计消息表 `local_type=34` 行数，暂不解析语音资源 BLOB，因此 `voice.resource_candidates=0`、`voice.matched_messages=0`。
+`count-db-media` 不需要 `--archive`，不会创建归档目录、索引或 manifest，也不会读取、复制或 hash `--account/msg` 下的媒体文件。输出中的 `resource_candidates` 表示可解析资源候选数，`message_rows` 表示消息表对应 `local_type` 行数，`matched_messages` 表示两边能按 `talker/local_id/create_time` 匹配的消息数。语音候选来自 `media_*.db/VoiceInfo` 中非空的 `voice_data`，该统计命令只读计数，不复制或归档 BLOB。
 
 只读扫描，不写入归档目录：
 
@@ -154,7 +155,7 @@ cargo run -p wechat-archiver -- extract --type voice \
   --archive "/path/to/wechat-archive"
 ```
 
-当前语音归档会复制 `silk`、`slk`、`amr`、`mp3`、`m4a`、`aac`、`wav`、`ogg`、`opus` 到内容寻址归档库，记录 `source_kind=direct_voice`、`media_type=voice`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，只会在同账号存在 `msg/voice` 或 `msg/audio` 专用目录时扫描这些目录；其他目录则只扫描传入目录本身。暂不解析消息库中的语音 BLOB，不做 SILK 转码或语音转写。
+当前直接语音归档会复制 `silk`、`slk`、`amr`、`mp3`、`m4a`、`aac`、`wav`、`ogg`、`opus` 到内容寻址归档库，记录 `source_kind=direct_voice`、`media_type=voice`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，只会在同账号存在 `msg/voice` 或 `msg/audio` 专用目录时扫描这些目录；其他目录则只扫描传入目录本身。消息库语音请使用 `extract-db-voices`；当前不做 SILK 转码或语音转写。
 
 按消息库枚举并归档图片：
 
@@ -196,6 +197,25 @@ cargo run -p wechat-archiver -- extract-db-files \
 ```
 
 该命令会读取 `<account>/db_storage/message/message_*.db` 和 `message_resource.db`，从资源 `packed_info` 中保守识别带扩展名的安全文件名，并定位 `<account>/msg/file/<YYYY-MM>/<file_name>`。归档成功后记录 `source_kind=message_db_file`、`media_type=file` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。它不会解密 SQLCipher 数据库，不会写入微信源目录；当前不猜测发送人，也不解析复杂 appmsg XML。
+
+按消息库枚举并归档语音：
+
+```bash
+cargo run -p wechat-archiver -- extract-db-voices \
+  --account "/path/to/xwechat_files/<wxid>" \
+  --archive "/path/to/wechat-archive"
+```
+
+该命令会读取 `<account>/db_storage/message/message_*.db`、`message_resource.db` 和 `media_*.db`，基于 `Msg_<md5(talker)>` 的 `local_type=34` 与 `VoiceInfo` 的 `talker/local_id/create_time` 匹配语音 BLOB，并将 `voice_data` 原始字节归档到内容寻址库。归档成功后记录 `source_kind=message_db_voice`、`media_type=voice` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。它不会解密 SQLCipher 数据库，不会写入微信源目录；当前不做 SILK 转码、语音转写或发送人猜测。
+
+如果使用已解密消息库副本，`extract-db-voices` 也支持 `--message-db-dir`。语音 BLOB 会从该目录下的 `media_*.db/VoiceInfo` 只读读取：
+
+```bash
+cargo run -p wechat-archiver -- extract-db-voices \
+  --account "/path/to/xwechat_files/<wxid>" \
+  --message-db-dir "/path/to/decrypted/message" \
+  --archive "/path/to/wechat-archive"
+```
 
 如果需要解码 V2 AES `.dat`，可以先只读派生图片 key：
 

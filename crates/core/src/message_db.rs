@@ -3,11 +3,13 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
+use crate::archive::{store_bytes, StoreOutcome};
 use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions};
 use crate::error::{ArchiverError, IoContext, Result};
+use crate::hash::sha256_bytes;
 use crate::index::{index_path, open_index};
 use crate::manifest::ManifestWriter;
 use crate::media::{direct_file_extension, direct_video_extension};
@@ -149,6 +151,12 @@ struct VideoResource {
 struct FileResource {
     key: MessageKey,
     file_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct VoiceResource {
+    key: MessageKey,
+    data: Vec<u8>,
 }
 
 pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
@@ -428,6 +436,82 @@ pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<Extrac
     Ok(summary)
 }
 
+pub fn extract_message_db_voices(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
+    let resolved = ArchiveConfig {
+        source_dir: config.account_dir.clone(),
+        archive_dir: config.archive_dir,
+        dry_run: config.dry_run,
+        dat_options: config.dat_options,
+        explain_unsupported: config.explain_unsupported,
+    }
+    .resolve()?;
+
+    let db_source = resolve_message_db_source(&resolved.source_dir, config.message_db_dir)?;
+
+    let message_dbs = message_db_paths(&db_source.message_dir)?;
+    let mut talkers = query_resource_talkers(&db_source.resource_db)?;
+    talkers.extend(query_voice_talkers(&db_source.message_dir)?);
+    let (voice_messages, scanned_rows) =
+        query_message_keys_for_talkers(&message_dbs, &talkers, 34)?;
+
+    let run_id = format!("{}", now_epoch_ms());
+    let mut summary = ExtractSummary::new(
+        run_id.clone(),
+        resolved.source_dir.clone(),
+        resolved.archive_dir.clone(),
+        resolved.dry_run,
+    );
+    summary.scanned_files = scanned_rows;
+    if resolved.explain_unsupported {
+        summary.enable_unsupported_explanation();
+    }
+
+    let mut conn = None;
+    let mut manifest = None;
+    if !resolved.dry_run {
+        create_archive_dirs(&resolved.archive_dir)?;
+        let opened = open_index(&resolved.archive_dir)?;
+        summary.index_path = Some(index_path(&resolved.archive_dir));
+        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, "extract-db-voices")?;
+        summary.manifest_path = Some(writer.path().to_path_buf());
+        conn = Some(opened);
+        manifest = Some(writer);
+    }
+
+    for key in voice_messages {
+        summary.candidates += 1;
+        let message_source = message_source_from_key(&key);
+        let result = match find_voice_resource(&db_source.message_dir, &key)? {
+            Some(resource) => process_voice_resource(
+                &resource,
+                &resolved.source_dir,
+                &resolved.archive_dir,
+                &run_id,
+                resolved.dry_run,
+                conn.as_ref(),
+                manifest.as_mut(),
+                &message_source,
+            ),
+            None => record_missing_voice(
+                &key,
+                &resolved.source_dir,
+                &run_id,
+                conn.as_ref(),
+                manifest.as_mut(),
+                &message_source,
+            ),
+        };
+        apply_result(&mut summary, result)?;
+    }
+
+    if let Some(writer) = manifest.as_mut() {
+        writer.flush()?;
+    }
+    summary.finish_unsupported_explanation();
+
+    Ok(summary)
+}
+
 pub fn inspect_message_db(config: MessageDbInspectConfig) -> Result<MessageDbInspection> {
     let account_dir = normalize_existing_dir_for_message_db(&config.account_dir)?;
     let message_db_dir_overridden = config.message_db_dir.is_some();
@@ -498,10 +582,19 @@ pub fn count_message_db_media(
         ),
     };
 
+    let voice_resource_keys = query_voice_resource_keys(&inspection.message_db_dir)?;
+    let mut voice_talkers = query_resource_talkers(&inspection.resource_db.path)?;
+    voice_talkers.extend(query_voice_talkers(&inspection.message_db_dir)?);
+    voice_talkers.extend(
+        voice_resource_keys
+            .iter()
+            .map(|resource_key| resource_key.talker.clone()),
+    );
+    let (voice_messages, _) = query_message_keys_for_talkers(&message_dbs, &voice_talkers, 34)?;
     let voice = MessageDbMediaTypeCount {
-        resource_candidates: 0,
+        resource_candidates: voice_resource_keys.len() as u64,
         message_rows: count_message_rows_for_type(&message_dbs, 34)?,
-        matched_messages: 0,
+        matched_messages: matched_voice_message_count(&voice_resource_keys, &voice_messages),
     };
 
     Ok(MessageDbMediaCountSummary {
@@ -973,14 +1066,22 @@ fn query_message_keys_for_type(
 ) -> Result<(BTreeSet<MessageKey>, u64)> {
     let talkers = resource_keys
         .iter()
-        .map(|key| key.talker.as_str())
+        .map(|key| key.talker.clone())
         .collect::<BTreeSet<_>>();
+    query_message_keys_for_talkers(message_dbs, &talkers, local_type)
+}
+
+fn query_message_keys_for_talkers(
+    message_dbs: &[PathBuf],
+    talkers: &BTreeSet<String>,
+    local_type: i64,
+) -> Result<(BTreeSet<MessageKey>, u64)> {
     let mut keys = BTreeSet::new();
     let mut scanned_rows = 0u64;
 
     for db_path in message_dbs {
         let conn = open_readonly_db(db_path)?;
-        for talker in &talkers {
+        for talker in talkers {
             let table_name = message_table_name(talker);
             if !table_exists(&conn, &table_name)? {
                 continue;
@@ -997,7 +1098,7 @@ fn query_message_keys_for_type(
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map([local_type], |row| {
                 Ok(MessageKey {
-                    talker: (*talker).to_string(),
+                    talker: talker.clone(),
                     local_id: row.get(0)?,
                     create_time: row.get(1)?,
                 })
@@ -1044,6 +1145,22 @@ fn matched_message_count<'a>(
     message_keys
         .iter()
         .filter(|key| resource_keys.contains(*key))
+        .count() as u64
+}
+
+fn matched_voice_message_count(
+    resource_keys: &[MessageKey],
+    message_keys: &BTreeSet<MessageKey>,
+) -> u64 {
+    message_keys
+        .iter()
+        .filter(|message_key| {
+            resource_keys.iter().any(|resource_key| {
+                resource_key.talker == message_key.talker
+                    && resource_key.local_id == message_key.local_id
+                    && voice_time_matches(resource_key.create_time, message_key.create_time)
+            })
+        })
         .count() as u64
 }
 
@@ -1239,6 +1356,146 @@ fn query_file_resources(resource_db: &Path) -> Result<Vec<FileResource>> {
     Ok(resources)
 }
 
+fn query_voice_resource_keys(message_dir: &Path) -> Result<Vec<MessageKey>> {
+    let mut seen = HashSet::<MessageKey>::new();
+    let mut keys = Vec::new();
+    for db_path in media_db_paths(message_dir)? {
+        let conn = open_readonly_db(&db_path)?;
+        if !table_exists(&conn, "Name2Id")? || !table_exists(&conn, "VoiceInfo")? {
+            continue;
+        }
+        let has_required_columns = ["chat_name_id", "local_id", "create_time", "voice_data"]
+            .into_iter()
+            .map(|column| table_has_column(&conn, "VoiceInfo", column))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .all(|exists| exists);
+        if !has_required_columns {
+            continue;
+        }
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT n.user_name, v.local_id, v.create_time
+            FROM VoiceInfo v
+            JOIN Name2Id n ON n.rowid = v.chat_name_id
+            WHERE n.user_name IS NOT NULL
+              AND v.voice_data IS NOT NULL
+              AND length(v.voice_data) > 0
+            ORDER BY n.user_name, v.create_time, v.local_id, v.rowid
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(MessageKey {
+                talker: row.get(0)?,
+                local_id: row.get(1)?,
+                create_time: row.get(2)?,
+            })
+        })?;
+
+        for row in rows {
+            let key = row?;
+            if seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+fn find_voice_resource(message_dir: &Path, key: &MessageKey) -> Result<Option<VoiceResource>> {
+    for db_path in media_db_paths(message_dir)? {
+        let conn = open_readonly_db(&db_path)?;
+        if !table_exists(&conn, "Name2Id")? || !table_exists(&conn, "VoiceInfo")? {
+            continue;
+        }
+        let has_required_columns = ["chat_name_id", "local_id", "create_time", "voice_data"]
+            .into_iter()
+            .map(|column| table_has_column(&conn, "VoiceInfo", column))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .all(|exists| exists);
+        if !has_required_columns {
+            continue;
+        }
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT v.voice_data
+            FROM VoiceInfo v
+            JOIN Name2Id n ON n.rowid = v.chat_name_id
+            WHERE n.user_name = ?1
+              AND v.local_id = ?2
+              AND ABS(v.create_time - ?3) <= 5
+              AND v.voice_data IS NOT NULL
+              AND length(v.voice_data) > 0
+            ORDER BY ABS(v.create_time - ?3), v.rowid
+            LIMIT 1
+            "#,
+        )?;
+        let data = stmt
+            .query_row(params![key.talker, key.local_id, key.create_time], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .optional()?;
+        if let Some(data) = data {
+            return Ok(Some(VoiceResource {
+                key: key.clone(),
+                data,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn voice_time_matches(left: i64, right: i64) -> bool {
+    left.abs_diff(right) <= 5
+}
+
+fn query_resource_talkers(resource_db: &Path) -> Result<BTreeSet<String>> {
+    let conn = open_readonly_db(resource_db)?;
+    if !table_exists(&conn, "ChatName2Id")? {
+        return Ok(BTreeSet::new());
+    }
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT DISTINCT user_name
+        FROM ChatName2Id
+        WHERE user_name IS NOT NULL AND user_name != ''
+        ORDER BY user_name
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut talkers = BTreeSet::new();
+    for row in rows {
+        talkers.insert(row?);
+    }
+    Ok(talkers)
+}
+
+fn query_voice_talkers(message_dir: &Path) -> Result<BTreeSet<String>> {
+    let mut talkers = BTreeSet::new();
+    for db_path in media_db_paths(message_dir)? {
+        let conn = open_readonly_db(&db_path)?;
+        if !table_exists(&conn, "Name2Id")? {
+            continue;
+        }
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT DISTINCT user_name
+            FROM Name2Id
+            WHERE user_name IS NOT NULL AND user_name != ''
+            ORDER BY user_name
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            talkers.insert(row?);
+        }
+    }
+    Ok(talkers)
+}
+
 fn record_missing_dat(
     resource: &ImageResource,
     account_dir: &Path,
@@ -1365,6 +1622,110 @@ fn record_missing_file(
     Ok(ScanOutcome::new(ScanAction::Failed))
 }
 
+fn record_missing_voice(
+    key: &MessageKey,
+    account_dir: &Path,
+    run_id: &str,
+    conn: Option<&Connection>,
+    manifest: Option<&mut ManifestWriter>,
+    message_source: &MessageSource,
+) -> Result<ScanOutcome> {
+    let source_relative_path = format!(
+        "db_storage/message:talker={}:local_id={}:create_time={}:voice_blob",
+        key.talker, key.local_id, key.create_time
+    );
+    let source_path = account_dir
+        .join(&source_relative_path)
+        .to_string_lossy()
+        .to_string();
+    let event = ManifestEvent {
+        event: "media_item".to_string(),
+        run_id: run_id.to_string(),
+        timestamp_epoch_ms: now_epoch_ms(),
+        source_path,
+        source_relative_path,
+        source_kind: "message_db_voice".to_string(),
+        media_type: "voice".to_string(),
+        message_talker: message_source.talker.clone(),
+        message_sender: message_source.sender.clone(),
+        message_local_id: message_source.local_id,
+        message_create_time: message_source.create_time,
+        decoder: None,
+        action: ScanAction::Failed,
+        archive_path: None,
+        sha256: None,
+        size_bytes: None,
+        extension: Some("silk".to_string()),
+        decrypt_status: "source_missing".to_string(),
+        verify_status: "failed".to_string(),
+        error: Some("voice_blob_not_found".to_string()),
+    };
+    persist(conn, manifest, &event)?;
+    Ok(ScanOutcome::new(ScanAction::Failed))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_voice_resource(
+    resource: &VoiceResource,
+    account_dir: &Path,
+    archive_root: &Path,
+    run_id: &str,
+    dry_run: bool,
+    conn: Option<&Connection>,
+    manifest: Option<&mut ManifestWriter>,
+    message_source: &MessageSource,
+) -> Result<ScanOutcome> {
+    let extension = voice_extension_for_data(&resource.data).to_string();
+    let (sha256, size_bytes) = sha256_bytes(&resource.data);
+    let (action, archive_path, verify_status) = if dry_run {
+        (ScanAction::WouldArchive, None, "not_run".to_string())
+    } else {
+        match store_bytes(archive_root, run_id, &resource.data, &sha256, &extension)? {
+            StoreOutcome::Stored { archive_path } => {
+                (ScanAction::Archived, Some(archive_path), "ok".to_string())
+            }
+            StoreOutcome::AlreadyExists { archive_path } => (
+                ScanAction::AlreadyArchived,
+                Some(archive_path),
+                "ok".to_string(),
+            ),
+        }
+    };
+
+    let source_relative_path = format!(
+        "db_storage/message:talker={}:local_id={}:create_time={}:voice_blob",
+        resource.key.talker, resource.key.local_id, resource.key.create_time
+    );
+    let source_path = account_dir
+        .join(&source_relative_path)
+        .to_string_lossy()
+        .to_string();
+    let event = ManifestEvent {
+        event: "media_item".to_string(),
+        run_id: run_id.to_string(),
+        timestamp_epoch_ms: now_epoch_ms(),
+        source_path,
+        source_relative_path,
+        source_kind: "message_db_voice".to_string(),
+        media_type: "voice".to_string(),
+        message_talker: message_source.talker.clone(),
+        message_sender: message_source.sender.clone(),
+        message_local_id: message_source.local_id,
+        message_create_time: message_source.create_time,
+        decoder: None,
+        action: action.clone(),
+        archive_path,
+        sha256: Some(sha256),
+        size_bytes: Some(size_bytes),
+        extension: Some(extension),
+        decrypt_status: "not_needed".to_string(),
+        verify_status,
+        error: None,
+    };
+    persist(conn, manifest, &event)?;
+    Ok(ScanOutcome::new(action))
+}
+
 fn find_video_file(video_root: &Path, file_md5: &str, create_time: i64) -> Option<PathBuf> {
     for month in month_candidates(create_time) {
         let video_dir = video_root.join(month);
@@ -1464,11 +1825,40 @@ fn message_db_paths(message_dir: &Path) -> Result<Vec<PathBuf>> {
         if file_name == "message_resource.db" {
             continue;
         }
+        if file_name.starts_with("media_") {
+            continue;
+        }
         if path
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.eq_ignore_ascii_case("db"))
             .unwrap_or(false)
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn media_db_paths(message_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(message_dir).with_path(message_dir)? {
+        let entry = entry.with_path(message_dir)?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with("media_")
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("db"))
+                .unwrap_or(false)
         {
             paths.push(path);
         }
@@ -1762,6 +2152,25 @@ fn plausible_file_attachment_name(name: &str) -> bool {
         return false;
     }
     direct_file_extension(Path::new(name)).is_some()
+}
+
+fn voice_extension_for_data(data: &[u8]) -> &'static str {
+    if data.starts_with(b"#!SILK") || data.first() == Some(&0x02) {
+        return "silk";
+    }
+    if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WAVE") {
+        return "wav";
+    }
+    if data.starts_with(b"ID3") || data.starts_with(&[0xff, 0xfb]) {
+        return "mp3";
+    }
+    if data.starts_with(b"OggS") {
+        return "ogg";
+    }
+    if data.starts_with(b"#!AMR") {
+        return "amr";
+    }
+    "silk"
 }
 
 fn is_md5_hex(value: &str) -> bool {
@@ -2186,6 +2595,212 @@ mod tests {
     }
 
     #[test]
+    fn extracts_message_db_voices_from_media_db_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let archive = tmp.path().join("archive");
+        let talker = "room@example";
+        let local_id = 35;
+        let create_time = 1_779_472_800;
+        let voice_data = b"\x02synthetic-silk-voice";
+        create_voice_fixture_account(&account, talker, local_id, create_time, Some(voice_data));
+
+        let media_db_path = account
+            .join("db_storage")
+            .join("message")
+            .join("media_0.db");
+        let message_db_path = account
+            .join("db_storage")
+            .join("message")
+            .join("message_0.db");
+        let media_hash_before = sha256_file(&media_db_path).unwrap();
+        let message_hash_before = sha256_file(&message_db_path).unwrap();
+
+        let summary = extract_message_db_voices(MessageDbExtractConfig {
+            account_dir: account.clone(),
+            message_db_dir: None,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+        assert_eq!(sha256_file(&media_db_path).unwrap(), media_hash_before);
+        assert_eq!(sha256_file(&message_db_path).unwrap(), message_hash_before);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (
+            source_kind,
+            media_type,
+            extension,
+            size_bytes,
+            message_talker,
+            message_local_id,
+            message_create_time,
+        ): (String, String, String, u64, String, i64, i64) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, media_type, extension, size_bytes, message_talker, message_local_id, message_create_time
+                FROM media_items
+                WHERE source_kind = 'message_db_voice'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(source_kind, "message_db_voice");
+        assert_eq!(media_type, "voice");
+        assert_eq!(extension, "silk");
+        assert_eq!(size_bytes, voice_data.len() as u64);
+        assert_eq!(message_talker, talker);
+        assert_eq!(message_local_id, local_id);
+        assert_eq!(message_create_time, create_time);
+
+        let manifest_path = summary.manifest_path.clone().unwrap();
+        let manifest = fs::read_to_string(manifest_path).unwrap();
+        let event = manifest
+            .lines()
+            .map(|line| serde_json::from_str::<ManifestEvent>(line).unwrap())
+            .find(|event| event.source_kind == "message_db_voice")
+            .unwrap();
+        assert_eq!(event.message_talker.as_deref(), Some(talker));
+        assert_eq!(event.message_local_id, Some(local_id));
+        assert_eq!(event.message_create_time, Some(create_time));
+        assert_eq!(event.size_bytes, Some(voice_data.len() as u64));
+
+        let verify = verify_archive(&archive).unwrap();
+        assert_eq!(verify.checked, 1);
+        assert_eq!(verify.ok, 1);
+    }
+
+    #[test]
+    fn extract_message_db_voices_dry_run_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let archive = tmp.path().join("archive");
+        create_voice_fixture_account(
+            &account,
+            "wxid_friend",
+            36,
+            1_779_472_800,
+            Some(b"#!SILK_V3synthetic-voice"),
+        );
+
+        let summary = extract_message_db_voices(MessageDbExtractConfig {
+            account_dir: account,
+            message_db_dir: None,
+            archive_dir: archive.clone(),
+            dry_run: true,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.would_archive, 1);
+        assert!(!archive.exists());
+    }
+
+    #[test]
+    fn extract_message_db_voices_allows_small_create_time_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let archive = tmp.path().join("archive");
+        let talker = "room@example";
+        let message_create_time = 1_779_472_800;
+        create_voice_fixture_account_with_voice_time(
+            &account,
+            talker,
+            38,
+            message_create_time,
+            message_create_time + 3,
+            Some(b"\x02synthetic-drifted-voice"),
+        );
+
+        let summary = extract_message_db_voices(MessageDbExtractConfig {
+            account_dir: account,
+            message_db_dir: None,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let stored_create_time: i64 = conn
+            .query_row(
+                r#"
+                SELECT message_create_time
+                FROM media_items
+                WHERE source_kind = 'message_db_voice'
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_create_time, message_create_time);
+    }
+
+    #[test]
+    fn missing_voice_blob_is_recorded_as_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let archive = tmp.path().join("archive");
+        create_voice_fixture_account(&account, "wxid_friend", 37, 1_779_472_800, None);
+
+        let summary = extract_message_db_voices(MessageDbExtractConfig {
+            account_dir: account,
+            message_db_dir: None,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.failed, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_kind, error, extension, message_local_id): (String, String, String, i64) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, error, extension, message_local_id
+                FROM media_items
+                WHERE verify_status = 'failed'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(source_kind, "message_db_voice");
+        assert_eq!(error, "voice_blob_not_found");
+        assert_eq!(extension, "silk");
+        assert_eq!(message_local_id, 37);
+    }
+
+    #[test]
     fn inspect_message_db_reports_ready_for_plain_sqlite_fixture() {
         let tmp = tempfile::tempdir().unwrap();
         let account = tmp.path().join("wxid_example");
@@ -2362,9 +2977,9 @@ mod tests {
         assert_eq!(
             summary.voice,
             MessageDbMediaTypeCount {
-                resource_candidates: 0,
+                resource_candidates: 1,
                 message_rows: 1,
-                matched_messages: 0,
+                matched_messages: 1,
             }
         );
         assert!(!account.join("msg").exists());
@@ -2396,7 +3011,9 @@ mod tests {
         assert_eq!(summary.image.resource_candidates, 1);
         assert_eq!(summary.video.message_rows, 2);
         assert_eq!(summary.file.matched_messages, 1);
+        assert_eq!(summary.voice.resource_candidates, 1);
         assert_eq!(summary.voice.message_rows, 1);
+        assert_eq!(summary.voice.matched_messages, 1);
     }
 
     #[test]
@@ -2807,11 +3424,119 @@ mod tests {
         blob
     }
 
+    fn create_voice_fixture_account(
+        account: &Path,
+        talker: &str,
+        local_id: i64,
+        create_time: i64,
+        voice_data: Option<&[u8]>,
+    ) {
+        create_voice_fixture_account_with_voice_time(
+            account,
+            talker,
+            local_id,
+            create_time,
+            create_time,
+            voice_data,
+        );
+    }
+
+    fn create_voice_fixture_account_with_voice_time(
+        account: &Path,
+        talker: &str,
+        local_id: i64,
+        message_create_time: i64,
+        voice_create_time: i64,
+        voice_data: Option<&[u8]>,
+    ) {
+        let message_dir = account.join("db_storage").join("message");
+        fs::create_dir_all(&message_dir).unwrap();
+        create_message_db_with_type(
+            &message_dir.join("message_0.db"),
+            talker,
+            local_id,
+            message_create_time,
+            34,
+        );
+        create_minimal_resource_db(&message_dir.join("message_resource.db"), talker);
+        create_voice_media_db(
+            &message_dir.join("media_0.db"),
+            talker,
+            local_id,
+            voice_create_time,
+            voice_data,
+        );
+    }
+
+    fn create_minimal_resource_db(path: &Path, talker: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE ChatName2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE MessageResourceInfo (
+                message_id INTEGER,
+                chat_id INTEGER,
+                message_local_id INTEGER,
+                message_create_time INTEGER,
+                message_local_type INTEGER,
+                packed_info BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ChatName2Id(rowid, user_name) VALUES (?1, ?2)",
+            params![1, talker],
+        )
+        .unwrap();
+    }
+
+    fn create_voice_media_db(
+        path: &Path,
+        talker: &str,
+        local_id: i64,
+        create_time: i64,
+        voice_data: Option<&[u8]>,
+    ) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE VoiceInfo (
+                chat_name_id INTEGER,
+                local_id INTEGER,
+                create_time INTEGER,
+                voice_data BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Name2Id(rowid, user_name) VALUES (?1, ?2)",
+            params![1, talker],
+        )
+        .unwrap();
+        if let Some(voice_data) = voice_data {
+            conn.execute(
+                "INSERT INTO VoiceInfo(chat_name_id, local_id, create_time, voice_data) VALUES (?1, ?2, ?3, ?4)",
+                params![1, local_id, create_time, voice_data],
+            )
+            .unwrap();
+        }
+    }
+
     fn create_media_count_fixture_account(account: &Path, talker: &str) {
         let message_dir = account.join("db_storage").join("message");
         fs::create_dir_all(&message_dir).unwrap();
         create_media_count_message_db(&message_dir.join("message_0.db"), talker);
         create_media_count_resource_db(&message_dir.join("message_resource.db"), talker);
+        create_voice_media_db(
+            &message_dir.join("media_0.db"),
+            talker,
+            104,
+            1_779_472_803,
+            Some(b"\x02synthetic-count-voice"),
+        );
     }
 
     fn create_media_count_message_db(path: &Path, talker: &str) {
