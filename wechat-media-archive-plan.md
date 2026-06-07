@@ -135,6 +135,7 @@ wechat-archive/
 - 只读发现 macOS 微信 4.x 常见账号目录。
 - 只读递归扫描普通图片和 `.dat` 图片源目录。
 - 只读读取已解密/普通 SQLite 消息库：`message_*.db` 和 `message_resource.db`。
+- 只读诊断消息库目录是否为当前可读的普通 SQLite，并支持显式指定已解密消息库目录。
 - 基于 `ChatName2Id`、`MessageResourceInfo`、`Msg_<md5(talker)>` 枚举图片类消息。
 - 定位 `msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5>.dat`，并兼容 `_h`、`_W`、`_w`、`_t` 变体。
 - 基于消息库视频资源 md5 定位 `msg/video/<YYYY-MM>/<md5>.mp4`。
@@ -162,6 +163,7 @@ wechat-archiver extract --type image
 wechat-archiver extract --type video
 wechat-archiver extract --type file
 wechat-archiver extract --type voice
+wechat-archiver inspect-db
 wechat-archiver extract-images
 wechat-archiver extract-db-images
 wechat-archiver extract-db-videos
@@ -170,11 +172,12 @@ wechat-archiver status
 wechat-archiver verify
 ```
 
-说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`extract-db-images`、`extract-db-videos` 和 `extract-db-files` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段。`extract-images` 保留用于兼容旧脚本。
+说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`extract-db-images`、`extract-db-videos` 和 `extract-db-files` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定，媒体仍从 `--account/msg` 定位。`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 
 - 只复制，不删除微信原文件。
+- 不自动解密 SQLCipher 数据库；加密库需要先通过独立流程得到用户明确提供的已解密副本。
 - 对无法解析的消息保留错误记录。
 - 每次运行生成 manifest。
 - 归档成功必须以 hash 校验为准。

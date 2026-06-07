@@ -19,7 +19,9 @@ pub use error::{ArchiverError, Result};
 pub use image_key::{derive_image_key, DeriveImageKeyOptions, ImageKeyDerivation, ImageKeyMethod};
 pub use message_db::{
     extract_message_db_files, extract_message_db_images, extract_message_db_videos,
-    MessageDbExtractConfig,
+    inspect_message_db, MessageDbDirectoryStatus, MessageDbExtractConfig, MessageDbFileInspection,
+    MessageDbFileRole, MessageDbFileStatus, MessageDbInspectConfig, MessageDbInspection,
+    MessageDbInspectionStatus,
 };
 pub use scanner::{extract_files, extract_images, extract_videos, extract_voices};
 pub use status::{archive_status, ArchiveStatus};

@@ -9,6 +9,7 @@
 - 只读发现 macOS 微信 4.x 常见账号目录：`xwechat_files/<wxid>/db_storage` 和 `msg/attach`。
 - 只读递归扫描用户指定的源目录。
 - 只读读取已解密/普通 SQLite 消息库：`db_storage/message/message_*.db` 和 `message_resource.db`。
+- 支持 `inspect-db` 只读诊断消息库目录，区分普通 SQLite、缺失、非 SQLite 或疑似加密库。
 - 基于 `MessageResourceInfo` 和 `Msg_<md5(talker)>` 枚举图片消息，定位 `msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5>.dat`。
 - 基于消息库资源信息枚举视频和文件附件，分别定位 `msg/video/<YYYY-MM>/<md5>.mp4` 和 `msg/file/<YYYY-MM>/<file_name>`。
 - 归档普通图片：`jpg`、`jpeg`、`png`、`gif`、`bmp`、`webp`、`tif`、`tiff`、`heic`、`heif`。
@@ -24,7 +25,7 @@
 - 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind`、独立 `decoder` 和可用的消息来源字段。
 - 支持 `status` 查看索引统计，支持 `verify` 重新计算归档对象 hash。
 
-当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`extract-db-images`、`extract-db-videos` 和 `extract-db-files` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。
+当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`extract-db-images`、`extract-db-videos` 和 `extract-db-files` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；媒体文件仍只从 `--account` 下的 `msg/*` 读取。
 
 ## 安全边界
 
@@ -60,6 +61,25 @@ cargo run -p wechat-archiver -- discover --json
 cargo run -p wechat-archiver -- discover \
   --root "$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
 ```
+
+只读诊断消息库是否可被当前 SQLite 路径读取：
+
+```bash
+cargo run -p wechat-archiver -- inspect-db \
+  --account "/path/to/xwechat_files/<wxid>" \
+  --json
+```
+
+如果已经有用户自行准备的已解密消息库副本，可显式指定目录：
+
+```bash
+cargo run -p wechat-archiver -- inspect-db \
+  --account "/path/to/xwechat_files/<wxid>" \
+  --message-db-dir "/path/to/decrypted/message" \
+  --json
+```
+
+`inspect-db` 不写归档目录，也不写微信源目录。它只检查 `message_resource.db` 和 `message_*.db` 是否存在、是否有 SQLite header、是否能以只读 SQLite 打开，以及是否包含当前抽取命令需要的基础表结构。
 
 只读扫描，不写入归档目录：
 
@@ -129,6 +149,17 @@ cargo run -p wechat-archiver -- extract-db-images \
 ```
 
 该命令会读取 `<account>/db_storage/message/message_*.db` 和 `message_resource.db`，并只从 `<account>/msg/attach` 复制或解码图片资源。它不会解密 SQLCipher 数据库，也不会读取微信进程内存；如果数据库不是普通 SQLite，会返回错误。
+
+如果使用已解密消息库副本：
+
+```bash
+cargo run -p wechat-archiver -- extract-db-images \
+  --account "/path/to/xwechat_files/<wxid>" \
+  --message-db-dir "/path/to/decrypted/message" \
+  --archive "/path/to/wechat-archive"
+```
+
+`--message-db-dir` 只改变消息数据库读取位置，不改变媒体文件来源；图片、视频和文件附件仍从 `--account` 下的 `msg/attach`、`msg/video`、`msg/file` 定位。
 
 按消息库枚举并归档视频：
 

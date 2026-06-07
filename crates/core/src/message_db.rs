@@ -1,8 +1,10 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
+use serde::Serialize;
 
 use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions};
 use crate::error::{ArchiverError, IoContext, Result};
@@ -18,10 +20,76 @@ use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 #[derive(Debug, Clone)]
 pub struct MessageDbExtractConfig {
     pub account_dir: PathBuf,
+    pub message_db_dir: Option<PathBuf>,
     pub archive_dir: PathBuf,
     pub dry_run: bool,
     pub dat_options: DatDecodeOptions,
     pub explain_unsupported: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageDbInspectConfig {
+    pub account_dir: PathBuf,
+    pub message_db_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MessageDbInspection {
+    pub account_dir: PathBuf,
+    pub message_db_dir: PathBuf,
+    pub message_db_dir_overridden: bool,
+    pub status: MessageDbInspectionStatus,
+    pub directory_status: MessageDbDirectoryStatus,
+    pub resource_db: MessageDbFileInspection,
+    pub message_dbs: Vec<MessageDbFileInspection>,
+    pub total_message_dbs: usize,
+    pub readable_message_dbs: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDbInspectionStatus {
+    Ready,
+    Missing,
+    EncryptedOrNotSqlite,
+    Unsupported,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDbDirectoryStatus {
+    Ready,
+    Missing,
+    NotDirectory,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MessageDbFileInspection {
+    pub path: PathBuf,
+    pub role: MessageDbFileRole,
+    pub status: MessageDbFileStatus,
+    pub sqlite_header: bool,
+    pub table_count: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDbFileRole {
+    MessageResource,
+    Message,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDbFileStatus {
+    ReadableSqlite,
+    Missing,
+    NotFile,
+    EncryptedOrNotSqlite,
+    UnsupportedSqlite,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -51,7 +119,7 @@ struct FileResource {
 
 pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
     let resolved = ArchiveConfig {
-        source_dir: config.account_dir,
+        source_dir: config.account_dir.clone(),
         archive_dir: config.archive_dir,
         dry_run: config.dry_run,
         dat_options: config.dat_options,
@@ -59,21 +127,7 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
     }
     .resolve()?;
 
-    let message_dir = resolved.source_dir.join("db_storage").join("message");
-    if !message_dir.is_dir() {
-        return Err(ArchiverError::Other(format!(
-            "message directory does not exist: {}",
-            message_dir.display()
-        )));
-    }
-
-    let resource_db = message_dir.join("message_resource.db");
-    if !resource_db.is_file() {
-        return Err(ArchiverError::Other(format!(
-            "message_resource.db does not exist: {}",
-            resource_db.display()
-        )));
-    }
+    let db_source = resolve_message_db_source(&resolved.source_dir, config.message_db_dir)?;
 
     let attach_root = resolved.source_dir.join("msg").join("attach");
     if !attach_root.is_dir() {
@@ -83,8 +137,8 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
         )));
     }
 
-    let resources = query_image_resources(&resource_db)?;
-    let message_dbs = message_db_paths(&message_dir)?;
+    let resources = query_image_resources(&db_source.resource_db)?;
+    let message_dbs = message_db_paths(&db_source.message_dir)?;
     let (image_messages, scanned_rows) = query_image_message_keys(&message_dbs, &resources)?;
 
     let run_id = format!("{}", now_epoch_ms());
@@ -158,7 +212,7 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
 
 pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
     let resolved = ArchiveConfig {
-        source_dir: config.account_dir,
+        source_dir: config.account_dir.clone(),
         archive_dir: config.archive_dir,
         dry_run: config.dry_run,
         dat_options: config.dat_options,
@@ -166,25 +220,11 @@ pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<Extra
     }
     .resolve()?;
 
-    let message_dir = resolved.source_dir.join("db_storage").join("message");
-    if !message_dir.is_dir() {
-        return Err(ArchiverError::Other(format!(
-            "message directory does not exist: {}",
-            message_dir.display()
-        )));
-    }
-
-    let resource_db = message_dir.join("message_resource.db");
-    if !resource_db.is_file() {
-        return Err(ArchiverError::Other(format!(
-            "message_resource.db does not exist: {}",
-            resource_db.display()
-        )));
-    }
+    let db_source = resolve_message_db_source(&resolved.source_dir, config.message_db_dir)?;
 
     let video_root = resolved.source_dir.join("msg").join("video");
-    let resources = query_video_resources(&resource_db)?;
-    let message_dbs = message_db_paths(&message_dir)?;
+    let resources = query_video_resources(&db_source.resource_db)?;
+    let message_dbs = message_db_paths(&db_source.message_dir)?;
     let resource_keys = resources
         .iter()
         .map(|resource| resource.key.clone())
@@ -263,7 +303,7 @@ pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<Extra
 
 pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
     let resolved = ArchiveConfig {
-        source_dir: config.account_dir,
+        source_dir: config.account_dir.clone(),
         archive_dir: config.archive_dir,
         dry_run: config.dry_run,
         dat_options: config.dat_options,
@@ -271,25 +311,11 @@ pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<Extrac
     }
     .resolve()?;
 
-    let message_dir = resolved.source_dir.join("db_storage").join("message");
-    if !message_dir.is_dir() {
-        return Err(ArchiverError::Other(format!(
-            "message directory does not exist: {}",
-            message_dir.display()
-        )));
-    }
-
-    let resource_db = message_dir.join("message_resource.db");
-    if !resource_db.is_file() {
-        return Err(ArchiverError::Other(format!(
-            "message_resource.db does not exist: {}",
-            resource_db.display()
-        )));
-    }
+    let db_source = resolve_message_db_source(&resolved.source_dir, config.message_db_dir)?;
 
     let file_root = resolved.source_dir.join("msg").join("file");
-    let resources = query_file_resources(&resource_db)?;
-    let message_dbs = message_db_paths(&message_dir)?;
+    let resources = query_file_resources(&db_source.resource_db)?;
+    let message_dbs = message_db_paths(&db_source.message_dir)?;
     let resource_keys = resources
         .iter()
         .map(|resource| resource.key.clone())
@@ -366,6 +392,279 @@ pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<Extrac
     summary.finish_unsupported_explanation();
 
     Ok(summary)
+}
+
+pub fn inspect_message_db(config: MessageDbInspectConfig) -> Result<MessageDbInspection> {
+    let account_dir = normalize_existing_dir_for_message_db(&config.account_dir)?;
+    let message_db_dir_overridden = config.message_db_dir.is_some();
+    let message_db_dir = resolve_message_db_dir_for_inspect(&account_dir, config.message_db_dir)?;
+    Ok(inspect_message_db_dir(
+        account_dir,
+        message_db_dir,
+        message_db_dir_overridden,
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct MessageDbSource {
+    message_dir: PathBuf,
+    resource_db: PathBuf,
+}
+
+fn resolve_message_db_source(
+    account_dir: &Path,
+    message_db_dir: Option<PathBuf>,
+) -> Result<MessageDbSource> {
+    let message_dir = resolve_message_db_dir_for_extract(account_dir, message_db_dir)?;
+    if !message_dir.is_dir() {
+        return Err(ArchiverError::Other(format!(
+            "message directory does not exist: {}",
+            message_dir.display()
+        )));
+    }
+
+    let resource_db = message_dir.join("message_resource.db");
+    if !resource_db.is_file() {
+        return Err(ArchiverError::Other(format!(
+            "message_resource.db does not exist: {}",
+            resource_db.display()
+        )));
+    }
+
+    Ok(MessageDbSource {
+        message_dir,
+        resource_db,
+    })
+}
+
+fn resolve_message_db_dir_for_extract(
+    account_dir: &Path,
+    message_db_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    match message_db_dir {
+        Some(path) => normalize_existing_dir_for_message_db(&path),
+        None => Ok(account_dir.join("db_storage").join("message")),
+    }
+}
+
+fn resolve_message_db_dir_for_inspect(
+    account_dir: &Path,
+    message_db_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    match message_db_dir {
+        Some(path) => {
+            let abs = absolutize_message_db_path(&path)?;
+            if abs.exists() {
+                abs.canonicalize().with_path(&abs)
+            } else {
+                Ok(abs)
+            }
+        }
+        None => Ok(account_dir.join("db_storage").join("message")),
+    }
+}
+
+fn normalize_existing_dir_for_message_db(path: &Path) -> Result<PathBuf> {
+    let abs = absolutize_message_db_path(path)?;
+    let normalized = abs.canonicalize().with_path(&abs)?;
+    if !normalized.is_dir() {
+        return Err(ArchiverError::InvalidSource(normalized));
+    }
+    Ok(normalized)
+}
+
+fn absolutize_message_db_path(path: &Path) -> Result<PathBuf> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| ArchiverError::Io {
+                path: PathBuf::from("."),
+                source,
+            })?
+            .join(path)
+    };
+    Ok(abs)
+}
+
+fn inspect_message_db_dir(
+    account_dir: PathBuf,
+    message_db_dir: PathBuf,
+    message_db_dir_overridden: bool,
+) -> MessageDbInspection {
+    let directory_status = if message_db_dir.is_dir() {
+        MessageDbDirectoryStatus::Ready
+    } else if message_db_dir.exists() {
+        MessageDbDirectoryStatus::NotDirectory
+    } else {
+        MessageDbDirectoryStatus::Missing
+    };
+
+    let resource_db = inspect_db_file(
+        message_db_dir.join("message_resource.db"),
+        MessageDbFileRole::MessageResource,
+    );
+    let message_dbs = if directory_status == MessageDbDirectoryStatus::Ready {
+        message_db_paths(&message_db_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|path| inspect_db_file(path, MessageDbFileRole::Message))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let total_message_dbs = message_dbs.len();
+    let readable_message_dbs = message_dbs
+        .iter()
+        .filter(|db| db.status == MessageDbFileStatus::ReadableSqlite)
+        .count();
+    let status = summarize_inspection_status(directory_status, &resource_db, &message_dbs);
+
+    MessageDbInspection {
+        account_dir,
+        message_db_dir,
+        message_db_dir_overridden,
+        status,
+        directory_status,
+        resource_db,
+        message_dbs,
+        total_message_dbs,
+        readable_message_dbs,
+    }
+}
+
+fn summarize_inspection_status(
+    directory_status: MessageDbDirectoryStatus,
+    resource_db: &MessageDbFileInspection,
+    message_dbs: &[MessageDbFileInspection],
+) -> MessageDbInspectionStatus {
+    if directory_status != MessageDbDirectoryStatus::Ready {
+        return MessageDbInspectionStatus::Missing;
+    }
+    if resource_db.status == MessageDbFileStatus::Missing || message_dbs.is_empty() {
+        return MessageDbInspectionStatus::Missing;
+    }
+    if resource_db.status == MessageDbFileStatus::ReadableSqlite
+        && message_dbs
+            .iter()
+            .any(|db| db.status == MessageDbFileStatus::ReadableSqlite)
+    {
+        return MessageDbInspectionStatus::Ready;
+    }
+    if resource_db.status == MessageDbFileStatus::EncryptedOrNotSqlite
+        || message_dbs
+            .iter()
+            .any(|db| db.status == MessageDbFileStatus::EncryptedOrNotSqlite)
+    {
+        return MessageDbInspectionStatus::EncryptedOrNotSqlite;
+    }
+    if resource_db.status == MessageDbFileStatus::UnsupportedSqlite
+        || message_dbs
+            .iter()
+            .any(|db| db.status == MessageDbFileStatus::UnsupportedSqlite)
+    {
+        return MessageDbInspectionStatus::Unsupported;
+    }
+    MessageDbInspectionStatus::Error
+}
+
+fn inspect_db_file(path: PathBuf, role: MessageDbFileRole) -> MessageDbFileInspection {
+    if !path.exists() {
+        return MessageDbFileInspection {
+            path,
+            role,
+            status: MessageDbFileStatus::Missing,
+            sqlite_header: false,
+            table_count: None,
+            error: None,
+        };
+    }
+    if !path.is_file() {
+        return MessageDbFileInspection {
+            path,
+            role,
+            status: MessageDbFileStatus::NotFile,
+            sqlite_header: false,
+            table_count: None,
+            error: Some("path is not a file".to_string()),
+        };
+    }
+
+    let sqlite_header = has_sqlite_header(&path).unwrap_or(false);
+    match inspect_sqlite_file(&path, role) {
+        Ok((table_count, has_expected_schema)) => {
+            let status = if has_expected_schema {
+                MessageDbFileStatus::ReadableSqlite
+            } else {
+                MessageDbFileStatus::UnsupportedSqlite
+            };
+            MessageDbFileInspection {
+                path,
+                role,
+                status,
+                sqlite_header,
+                table_count: Some(table_count),
+                error: None,
+            }
+        }
+        Err(error) => {
+            let status = classify_db_error(&error, sqlite_header);
+            MessageDbFileInspection {
+                path,
+                role,
+                status,
+                sqlite_header,
+                table_count: None,
+                error: Some(error.to_string()),
+            }
+        }
+    }
+}
+
+fn has_sqlite_header(path: &Path) -> std::io::Result<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0_u8; 16];
+    let read = file.read(&mut header)?;
+    Ok(read == header.len() && &header == b"SQLite format 3\0")
+}
+
+fn inspect_sqlite_file(path: &Path, role: MessageDbFileRole) -> Result<(u64, bool)> {
+    let conn = open_readonly_db(path)?;
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let has_expected_schema = match role {
+        MessageDbFileRole::MessageResource => {
+            table_exists(&conn, "ChatName2Id")? && table_exists(&conn, "MessageResourceInfo")?
+        }
+        MessageDbFileRole::Message => has_message_table(&conn)?,
+    };
+    Ok((count, has_expected_schema))
+}
+
+fn has_message_table(conn: &Connection) -> Result<bool> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name LIKE 'Msg_%')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    Ok(exists)
+}
+
+fn classify_db_error(error: &ArchiverError, sqlite_header: bool) -> MessageDbFileStatus {
+    match error {
+        ArchiverError::Sqlite(sqlite_error) => match sqlite_error.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::NotADatabase) => MessageDbFileStatus::EncryptedOrNotSqlite,
+            Some(rusqlite::ErrorCode::DatabaseCorrupt) => MessageDbFileStatus::EncryptedOrNotSqlite,
+            Some(_) if sqlite_header => MessageDbFileStatus::UnsupportedSqlite,
+            Some(_) => MessageDbFileStatus::Error,
+            None => MessageDbFileStatus::Error,
+        },
+        _ => MessageDbFileStatus::Error,
+    }
 }
 
 fn message_source_from_key(key: &MessageKey) -> MessageSource {
@@ -1288,6 +1587,7 @@ mod tests {
 
         let summary = extract_message_db_images(MessageDbExtractConfig {
             account_dir: account.clone(),
+            message_db_dir: None,
             archive_dir: archive.clone(),
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
@@ -1360,6 +1660,7 @@ mod tests {
 
         let summary = extract_message_db_images(MessageDbExtractConfig {
             account_dir: account,
+            message_db_dir: None,
             archive_dir: archive.clone(),
             dry_run: true,
             dat_options: DatDecodeOptions::default(),
@@ -1389,6 +1690,7 @@ mod tests {
 
         let summary = extract_message_db_images(MessageDbExtractConfig {
             account_dir: account,
+            message_db_dir: None,
             archive_dir: archive.clone(),
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
@@ -1446,6 +1748,7 @@ mod tests {
 
         let summary = extract_message_db_videos(MessageDbExtractConfig {
             account_dir: account.clone(),
+            message_db_dir: None,
             archive_dir: archive.clone(),
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
@@ -1512,6 +1815,7 @@ mod tests {
 
         let summary = extract_message_db_videos(MessageDbExtractConfig {
             account_dir: account,
+            message_db_dir: None,
             archive_dir: archive.clone(),
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
@@ -1565,6 +1869,7 @@ mod tests {
 
         let summary = extract_message_db_files(MessageDbExtractConfig {
             account_dir: account.clone(),
+            message_db_dir: None,
             archive_dir: archive.clone(),
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
@@ -1634,6 +1939,7 @@ mod tests {
 
         let summary = extract_message_db_files(MessageDbExtractConfig {
             account_dir: account,
+            message_db_dir: None,
             archive_dir: archive.clone(),
             dry_run: false,
             dat_options: DatDecodeOptions::default(),
@@ -1661,6 +1967,126 @@ mod tests {
         assert_eq!(error, "local_file_not_found");
         assert_eq!(extension, "docx");
         assert_eq!(message_local_id, 32);
+    }
+
+    #[test]
+    fn inspect_message_db_reports_ready_for_plain_sqlite_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        create_video_fixture_account(
+            &account,
+            "room@example",
+            41,
+            1_779_472_800,
+            "cccccccccccccccccccccccccccccccc",
+            true,
+        );
+
+        let inspection = inspect_message_db(MessageDbInspectConfig {
+            account_dir: account.clone(),
+            message_db_dir: None,
+        })
+        .unwrap();
+
+        assert_eq!(inspection.account_dir, account.canonicalize().unwrap());
+        assert_eq!(inspection.status, MessageDbInspectionStatus::Ready);
+        assert_eq!(inspection.directory_status, MessageDbDirectoryStatus::Ready);
+        assert!(!inspection.message_db_dir_overridden);
+        assert_eq!(
+            inspection.resource_db.status,
+            MessageDbFileStatus::ReadableSqlite
+        );
+        assert!(inspection.resource_db.sqlite_header);
+        assert_eq!(inspection.total_message_dbs, 1);
+        assert_eq!(inspection.readable_message_dbs, 1);
+        assert_eq!(
+            inspection.message_dbs[0].status,
+            MessageDbFileStatus::ReadableSqlite
+        );
+    }
+
+    #[test]
+    fn inspect_message_db_reports_encrypted_or_not_sqlite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let message_dir = account.join("db_storage").join("message");
+        fs::create_dir_all(&message_dir).unwrap();
+        fs::write(message_dir.join("message_resource.db"), b"not sqlite").unwrap();
+        fs::write(message_dir.join("message_0.db"), b"not sqlite").unwrap();
+
+        let inspection = inspect_message_db(MessageDbInspectConfig {
+            account_dir: account,
+            message_db_dir: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            inspection.status,
+            MessageDbInspectionStatus::EncryptedOrNotSqlite
+        );
+        assert_eq!(
+            inspection.resource_db.status,
+            MessageDbFileStatus::EncryptedOrNotSqlite
+        );
+        assert!(!inspection.resource_db.sqlite_header);
+        assert_eq!(inspection.total_message_dbs, 1);
+        assert_eq!(inspection.readable_message_dbs, 0);
+        assert_eq!(
+            inspection.message_dbs[0].status,
+            MessageDbFileStatus::EncryptedOrNotSqlite
+        );
+    }
+
+    #[test]
+    fn extract_message_db_videos_can_use_external_message_db_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let archive = tmp.path().join("archive");
+        let decrypted_message_dir = tmp.path().join("decrypted-message");
+        let talker = "room@example";
+        let local_id = 42;
+        let create_time = 1_779_472_800;
+        let file_md5 = "dddddddddddddddddddddddddddddddd";
+        create_video_fixture_account(&account, talker, local_id, create_time, file_md5, true);
+        copy_dir(
+            &account.join("db_storage").join("message"),
+            &decrypted_message_dir,
+        );
+        fs::remove_dir_all(account.join("db_storage")).unwrap();
+
+        let video_path = account
+            .join("msg")
+            .join("video")
+            .join("2026-05")
+            .join(format!("{file_md5}.mp4"));
+        let video_hash_before = sha256_file(&video_path).unwrap();
+
+        let summary = extract_message_db_videos(MessageDbExtractConfig {
+            account_dir: account.clone(),
+            message_db_dir: Some(decrypted_message_dir.clone()),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+        assert_eq!(sha256_file(&video_path).unwrap(), video_hash_before);
+
+        let inspection = inspect_message_db(MessageDbInspectConfig {
+            account_dir: account,
+            message_db_dir: Some(decrypted_message_dir),
+        })
+        .unwrap();
+        assert!(inspection.message_db_dir_overridden);
+        assert_eq!(inspection.status, MessageDbInspectionStatus::Ready);
+
+        let verify = verify_archive(&archive).unwrap();
+        assert_eq!(verify.checked, 1);
+        assert_eq!(verify.ok, 1);
     }
 
     #[test]
@@ -2049,5 +2475,19 @@ mod tests {
         blob.push(0);
         blob.extend_from_slice(b"suffix");
         blob
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let target = to.join(entry.file_name());
+            if path.is_dir() {
+                copy_dir(&path, &target);
+            } else {
+                fs::copy(&path, &target).unwrap();
+            }
+        }
     }
 }

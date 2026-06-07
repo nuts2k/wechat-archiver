@@ -47,6 +47,7 @@ Rust core library
 - 不重签微信。
 - 不提权。
 - 不自动解密 SQLCipher 微信数据库。
+- 支持用户显式指定已解密消息库目录，但媒体文件仍从微信账号目录读取。
 
 ### 账号发现
 
@@ -107,6 +108,8 @@ Rust core library
 
 ### 消息库图片枚举
 
+- 支持 `inspect-db` 只读诊断消息库目录，报告普通 SQLite、缺失、非 SQLite 或疑似加密库。
+- 支持 `--message-db-dir` 为 `extract-db-images`、`extract-db-videos` 和 `extract-db-files` 指定已解密/普通 SQLite 消息库目录。
 - 支持读取 `db_storage/message/message_*.db`。
 - 支持读取 `message_resource.db`。
 - 支持基于 `MessageResourceInfo` 和 `Msg_<md5(talker)>` 枚举图片类消息。
@@ -159,7 +162,7 @@ wechat-archive/
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 和消息来源记录、消息库图片/视频/文件附件归档、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
+- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 和消息来源记录、消息库诊断、消息库图片/视频/文件附件归档、外部已解密消息库目录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
 - 已通过：
 
 ```bash
@@ -174,6 +177,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 - 当前主线仍是图片归档。
 - `extract-db-images`、`extract-db-videos` 和 `extract-db-files` 只支持已解密/普通 SQLite 数据库，不支持直接读取 SQLCipher 加密库。
+- `inspect-db` 只能诊断当前消息库是否可读，不会自动解密，也不会统计加密库里的真实媒体数量。
+- `--message-db-dir` 只改变消息库读取位置；媒体文件仍从 `--account` 下的微信目录定位。
 - 消息来源字段当前由消息库图片、视频和文件附件归档写入 `talker/local_id/create_time`；直接 file/voice 和 `message_sender` 仍待后续消息库来源增强。
 - V2 图片 AES key 可通过 `derive-image-key` 只读派生，但抽取命令仍需要用户显式提供。
 - `derive-image-key` 不自动保存 key；本机 key 文档应继续保存在 `.gitignore` 覆盖的本地文件中。
@@ -224,6 +229,7 @@ wechat-archiver extract --type voice
 ```
 
 - `image` 入口复用现有图片归档流程。
+- `inspect-db` 能在抽取前诊断消息库路径是否可读，避免只看到 `file is not a database`。
 - `video` 入口当前扫描直接视频文件；对微信账号目录或 `msg/attach` 会自动定位同账号 `msg/video`，复制本地视频、计算 hash，并记录到同一套 archive/index/manifest。
 - `extract-db-videos` 当前从消息库枚举视频资源，定位 `msg/video/<YYYY-MM>/<md5>.mp4`，并记录消息来源字段。
 - `file` 入口当前扫描直接文件附件；对微信账号目录或 `msg/attach` 会自动定位同账号 `msg/file`，复制本地文件、计算 hash，并记录到同一套 archive/index/manifest。
