@@ -97,6 +97,14 @@ Rust core library
 - 文件对象复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
 - 当前记录 `source_kind=direct_file`、`media_type=file`；暂不解析消息库文件来源，也不补充会话、发送人等上下文。
 
+### 语音扫描与归档
+
+- 支持统一媒体抽取入口 `extract --type voice`。
+- 当前语音归档为直接音频文件扫描最小版，支持 `silk`、`slk`、`amr`、`mp3`、`m4a`、`aac`、`wav`、`ogg`、`opus`。
+- 当 `--source` 是微信账号目录或该账号的 `msg/attach` 时，只扫描同账号存在的 `msg/voice` 或 `msg/audio` 专用目录；其他目录只扫描传入目录本身。
+- 语音对象复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
+- 当前记录 `source_kind=direct_voice`、`media_type=voice`；暂不解析消息库语音 BLOB，不做 SILK 转码、语音转写或消息上下文补充。
+
 ### 消息库图片枚举
 
 - 支持读取 `db_storage/message/message_*.db`。
@@ -134,7 +142,7 @@ wechat-archive/
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 记录、直接视频和文件归档，以及统一 `extract --type` CLI 解析。
+- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 记录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
 - 已通过：
 
 ```bash
@@ -153,9 +161,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 - `derive-image-key` 不自动保存 key；本机 key 文档应继续保存在 `.gitignore` 覆盖的本地文件中。
 - `wxgf jpg/mp4` 依赖 `ffmpeg`，没有可用 `ffmpeg` 时应使用 `raw` 或 `off`。
 - `wxgf jpg` 当前输出首帧 JPG，不保留可能存在的动态效果。
-- 统一 `extract` 入口当前接入图片、直接视频文件和直接文件附件；语音、表情、收藏、朋友圈等尚未接入归档流程。
+- 统一 `extract` 入口当前接入图片、直接视频文件、直接文件附件和直接语音/音频文件；表情、收藏、朋友圈等尚未接入归档流程。
 - 视频归档当前只覆盖直接文件扫描，不覆盖消息库枚举、时长、分辨率等元数据。
 - 文件归档当前只覆盖直接文件扫描，不覆盖消息库枚举、会话、发送人等元数据。
+- 语音归档当前只覆盖直接音频文件扫描，不覆盖消息库语音 BLOB、SILK 转码、语音转写或会话上下文。
 - 尚未实现 Tauri 桌面客户端。
 - 尚未实现归档后的清理建议或删除操作。
 
@@ -193,20 +202,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 wechat-archiver extract --type image
 wechat-archiver extract --type video
 wechat-archiver extract --type file
+wechat-archiver extract --type voice
 ```
 
 - `image` 入口复用现有图片归档流程。
 - `video` 入口当前扫描直接视频文件；对微信账号目录或 `msg/attach` 会自动定位同账号 `msg/video`，复制本地视频、计算 hash，并记录到同一套 archive/index/manifest。
 - `file` 入口当前扫描直接文件附件；对微信账号目录或 `msg/attach` 会自动定位同账号 `msg/file`，复制本地文件、计算 hash，并记录到同一套 archive/index/manifest。
-- `voice` 等类型当前会明确返回尚未支持，不会静默跳过或生成不完整归档。
+- `voice` 入口当前扫描直接语音/音频文件；对微信账号目录或 `msg/attach` 只在存在 `msg/voice` 或 `msg/audio` 专用目录时扫描，避免把 `msg/file` 中的音乐附件误归为语音消息。
 - 多类型组合当前暂未执行，避免一个 CLI 命令生成多个 run 和多份 summary；后续应先设计聚合 summary。
 
 计划：
 
-- 将 `extract --type image,video,file,voice` 扩展为多媒体归档入口。
+- 将 `extract --type image,video,file,voice` 扩展为可聚合的多媒体归档入口。
 - 视频归档增强：解析消息库视频来源，记录时长和分辨率。
 - 文件归档增强：解析消息库文件来源，记录原始文件名、会话、发送人等上下文。
-- 语音归档：先保存原始格式，再支持可选转换为 `wav` 或 `mp3`。
+- 语音归档增强：解析消息库语音 BLOB，记录会话、时间和发送人，再支持可选转换为 `wav` 或 `mp3`。
 - 表情归档：识别静态图、动图和专有格式。
 - 支持 `--since`、`--until`、`--chat`、`--type` 等过滤参数。
 - 支持任务级进度统计和可取消执行，为未来 Tauri 做准备。
@@ -307,8 +317,8 @@ wechat-archiver extract --type file
 
 ## 推荐下一步
 
-建议继续推进 P1 的语音或元数据增强：
+建议继续推进 P1 的消息库来源增强：
 
-- 增加 `wechat-archiver extract --type voice` 的原始语音文件归档最小版。
-- 或者开始做消息库来源增强，为 video/file 补充会话、时间、发送人等上下文。
+- 开始做消息库来源增强，为 video/file/voice 补充会话、时间、发送人等上下文。
+- 语音下一步重点是解析消息库语音 BLOB，而不是继续扩大直接文件扫描范围。
 - 两条路线都应继续保持 dry-run、结构化错误、manifest/index 和安全边界一致。

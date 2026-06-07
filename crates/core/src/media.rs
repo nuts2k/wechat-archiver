@@ -18,3 +18,19 @@ pub(crate) fn direct_file_extension(path: &Path) -> Option<String> {
         Some(extension)
     }
 }
+
+pub(crate) fn direct_voice_extension(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "silk" => Some("silk"),
+        "slk" => Some("slk"),
+        "amr" => Some("amr"),
+        "mp3" => Some("mp3"),
+        "m4a" => Some("m4a"),
+        "aac" => Some("aac"),
+        "wav" => Some("wav"),
+        "ogg" => Some("ogg"),
+        "opus" => Some("opus"),
+        _ => None,
+    }
+}

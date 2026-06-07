@@ -10,7 +10,7 @@ use crate::hash::{sha256_bytes, sha256_file};
 use crate::image::{decode_dat, direct_image_extension, is_dat_file, validate_dat, DatDecode};
 use crate::index::{index_path, insert_record, open_index, MediaRecord};
 use crate::manifest::ManifestWriter;
-use crate::media::{direct_file_extension, direct_video_extension};
+use crate::media::{direct_file_extension, direct_video_extension, direct_voice_extension};
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 
 pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
@@ -102,6 +102,42 @@ struct AccountMediaScanSource {
     relative_root: PathBuf,
 }
 
+pub fn extract_voices(config: ArchiveConfig) -> Result<ExtractSummary> {
+    let resolved = config.resolve()?;
+    let mut run = ScanRun::new(&resolved, "extract-voices")?;
+    let voice_sources = voice_scan_sources(&resolved.source_dir);
+
+    for source in voice_sources {
+        for entry in WalkDir::new(&source.scan_dir).follow_links(false) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            run.summary.scanned_files += 1;
+
+            let path = entry.path();
+            if let Some(extension) = direct_voice_extension(path) {
+                run.summary.candidates += 1;
+                let result = process_direct_media(
+                    path,
+                    extension,
+                    &source.relative_root,
+                    &resolved.archive_dir,
+                    &run.run_id,
+                    resolved.dry_run,
+                    run.conn.as_ref(),
+                    run.manifest.as_mut(),
+                    "direct_voice",
+                    "voice",
+                );
+                apply_result(&mut run.summary, result)?;
+            }
+        }
+    }
+
+    run.finish()
+}
+
 pub fn extract_files(config: ArchiveConfig) -> Result<ExtractSummary> {
     let resolved = config.resolve()?;
     let mut run = ScanRun::new(&resolved, "extract-files")?;
@@ -142,28 +178,70 @@ fn account_media_scan_sources(
     source_dir: &Path,
     media_dir_name: &str,
 ) -> Vec<AccountMediaScanSource> {
-    if let Some(account_dir) = account_dir_from_attach_dir(source_dir) {
-        let media_dir = account_dir.join("msg").join(media_dir_name);
-        if media_dir.is_dir() {
-            return vec![AccountMediaScanSource {
-                scan_dir: media_dir,
-                relative_root: account_dir,
-            }];
+    if let Some(sources) = account_media_scan_sources_for_names(source_dir, &[media_dir_name]) {
+        if !sources.is_empty() {
+            return sources;
         }
-    }
-
-    let account_media_dir = source_dir.join("msg").join(media_dir_name);
-    if account_media_dir.is_dir() {
-        return vec![AccountMediaScanSource {
-            scan_dir: account_media_dir,
-            relative_root: source_dir.to_path_buf(),
-        }];
     }
 
     vec![AccountMediaScanSource {
         scan_dir: source_dir.to_path_buf(),
         relative_root: source_dir.to_path_buf(),
     }]
+}
+
+fn voice_scan_sources(source_dir: &Path) -> Vec<AccountMediaScanSource> {
+    if let Some(sources) = account_media_scan_sources_for_names(source_dir, &["voice", "audio"]) {
+        return sources;
+    }
+
+    vec![AccountMediaScanSource {
+        scan_dir: source_dir.to_path_buf(),
+        relative_root: source_dir.to_path_buf(),
+    }]
+}
+
+fn account_media_scan_sources_for_names(
+    source_dir: &Path,
+    media_dir_names: &[&str],
+) -> Option<Vec<AccountMediaScanSource>> {
+    if let Some(account_dir) = account_dir_from_attach_dir(source_dir) {
+        return Some(existing_account_media_sources(
+            &account_dir,
+            media_dir_names,
+            &account_dir,
+        ));
+    }
+
+    let msg_dir = source_dir.join("msg");
+    if msg_dir.is_dir() {
+        return Some(existing_account_media_sources(
+            source_dir,
+            media_dir_names,
+            source_dir,
+        ));
+    }
+
+    None
+}
+
+fn existing_account_media_sources(
+    account_dir: &Path,
+    media_dir_names: &[&str],
+    relative_root: &Path,
+) -> Vec<AccountMediaScanSource> {
+    let mut sources = Vec::new();
+    for media_dir_name in media_dir_names {
+        let media_dir = account_dir.join("msg").join(media_dir_name);
+        if media_dir.is_dir() {
+            sources.push(AccountMediaScanSource {
+                scan_dir: media_dir,
+                relative_root: relative_root.to_path_buf(),
+            });
+        }
+    }
+
+    sources
 }
 
 fn account_dir_from_attach_dir(source_dir: &Path) -> Option<PathBuf> {
@@ -835,6 +913,141 @@ mod tests {
         std::fs::write(source.join("report.xlsx"), b"synthetic-file").unwrap();
 
         let summary = extract_files(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive.clone(),
+            dry_run: true,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.archived, 0);
+        assert_eq!(summary.would_archive, 1);
+        assert!(!archive.exists());
+    }
+
+    #[test]
+    fn extracts_direct_voices_without_touching_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("voice-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let voice_path = source.join("sample.SILK");
+        let voice_bytes = b"synthetic-voice";
+        std::fs::write(&voice_path, voice_bytes).unwrap();
+        std::fs::write(source.join("notes.txt"), b"ignored").unwrap();
+
+        let summary = extract_voices(ArchiveConfig {
+            source_dir: source.clone(),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 2);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+        assert_eq!(std::fs::read(&voice_path).unwrap(), voice_bytes);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_kind, media_type, extension): (String, String, String) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, media_type, extension
+                FROM media_items
+                WHERE source_relative_path = 'sample.SILK'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(source_kind, "direct_voice");
+        assert_eq!(media_type, "voice");
+        assert_eq!(extension, "silk");
+
+        let manifest_path = summary.manifest_path.unwrap();
+        assert!(manifest_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-extract-voices.jsonl"));
+
+        let verify = verify_archive(&archive).unwrap();
+        assert_eq!(verify.checked, 1);
+        assert_eq!(verify.ok, 1);
+    }
+
+    #[test]
+    fn voice_extract_from_attach_scans_sibling_msg_voice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("xwechat_files").join("wxid");
+        let attach = account.join("msg").join("attach");
+        let voice_dir = account.join("msg").join("voice").join("2026-02");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&attach).unwrap();
+        std::fs::create_dir_all(&voice_dir).unwrap();
+        std::fs::write(attach.join("ignored.silk"), b"attach-voice-is-not-used").unwrap();
+        std::fs::write(voice_dir.join("sample.amr"), b"real-voice").unwrap();
+
+        let summary = extract_voices(ArchiveConfig {
+            source_dir: attach,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let relative_path: String = conn
+            .query_row(
+                "SELECT source_relative_path FROM media_items WHERE media_type = 'voice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relative_path, "msg/voice/2026-02/sample.amr");
+    }
+
+    #[test]
+    fn voice_extract_from_account_does_not_scan_msg_file_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("xwechat_files").join("wxid");
+        let file_dir = account.join("msg").join("file").join("2026-02");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        std::fs::write(file_dir.join("music.mp3"), b"audio-attachment").unwrap();
+
+        let summary = extract_voices(ArchiveConfig {
+            source_dir: account,
+            archive_dir: archive,
+            dry_run: true,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 0);
+        assert_eq!(summary.candidates, 0);
+        assert_eq!(summary.would_archive, 0);
+    }
+
+    #[test]
+    fn voice_dry_run_writes_nothing_to_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("voice-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("sample.opus"), b"synthetic-voice").unwrap();
+
+        let summary = extract_voices(ArchiveConfig {
             source_dir: source,
             archive_dir: archive.clone(),
             dry_run: true,

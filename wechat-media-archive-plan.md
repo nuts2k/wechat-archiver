@@ -149,7 +149,7 @@ wechat-archive/
 - 不自动解密 SQLCipher 微信数据库。
 - 不提取微信进程密钥、不重签微信、不提升权限。
 - 不写入、不删除、不覆盖任何微信源目录文件。
-- 当前覆盖图片、直接视频文件和直接文件附件；语音仍在第 2 阶段。
+- 当前覆盖图片、直接视频文件、直接文件附件和直接语音/音频文件；消息库语音 BLOB 仍在第 2 阶段增强。
 
 建议命令：
 
@@ -158,13 +158,14 @@ wechat-archiver scan
 wechat-archiver extract --type image
 wechat-archiver extract --type video
 wechat-archiver extract --type file
+wechat-archiver extract --type voice
 wechat-archiver extract-images
 wechat-archiver extract-db-images
 wechat-archiver status
 wechat-archiver verify
 ```
 
-说明：`extract --type image` 复用图片归档流程。`extract --type video` 和 `extract --type file` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video` 和 `msg/file`。`extract-images` 保留用于兼容旧脚本。
+说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 
@@ -181,7 +182,7 @@ wechat-archiver verify
 
 - 视频归档：优先从本地路径直接复制并计算 hash；后续再补消息库来源、时长和分辨率。
 - 文件归档：先归档 `msg/file` 中的直接文件；后续再补原始文件名、扩展名、大小和来源消息。
-- 语音归档：先保存原始格式，再可选转换为 `wav` 或 `mp3`。
+- 语音归档：先归档直接语音/音频文件；后续再解析消息库语音 BLOB，并支持可选转换为 `wav` 或 `mp3`。
 - 支持按时间范围、会话、类型过滤。
 
 建议命令：

@@ -5,9 +5,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
     archive_status, derive_image_key, discover_wechat, extract_files, extract_images,
-    extract_message_db_images, extract_videos, verify_archive, ArchiveConfig, ArchiveStatus,
-    DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions, ExtractSummary, ImageKeyDerivation,
-    ImageKeyMethod, MessageDbExtractConfig, VerifySummary, WechatDiscovery,
+    extract_message_db_images, extract_videos, extract_voices, verify_archive, ArchiveConfig,
+    ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions, ExtractSummary,
+    ImageKeyDerivation, ImageKeyMethod, MessageDbExtractConfig, VerifySummary, WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -77,9 +77,9 @@ enum Commands {
         json: bool,
     },
 
-    /// 统一媒体抽取入口；当前已接入 image，其他类型后续扩展。
+    /// 统一媒体抽取入口；当前已接入 image、video、file、voice。
     Extract {
-        /// 媒体类型，支持逗号分隔；当前仅 image 已实现。
+        /// 媒体类型，支持逗号分隔；当前每次只执行一种类型。
         #[arg(long = "type", value_enum, value_delimiter = ',', required = true)]
         media_types: Vec<MediaType>,
 
@@ -319,14 +319,14 @@ fn ensure_supported_extract_types(media_types: &[MediaType]) -> Result<()> {
         .filter(|media_type| {
             !matches!(
                 media_type,
-                MediaType::Image | MediaType::Video | MediaType::File
+                MediaType::Image | MediaType::Video | MediaType::File | MediaType::Voice
             )
         })
         .map(media_type_name)
         .collect::<Vec<_>>();
     anyhow::ensure!(
         unsupported.is_empty(),
-        "extract --type currently supports image, video and file; unsupported types: {}",
+        "extract --type currently supports image, video, file and voice; unsupported types: {}",
         unsupported.join(",")
     );
     Ok(())
@@ -350,7 +350,7 @@ fn run_extract(media_type: MediaType, args: ImageExtractArgs) -> Result<ExtractS
         MediaType::Image => run_image_extract(args),
         MediaType::Video => Ok(extract_videos(direct_media_archive_config_from_args(args))?),
         MediaType::File => Ok(extract_files(direct_media_archive_config_from_args(args))?),
-        MediaType::Voice => unreachable!("unsupported media types are rejected"),
+        MediaType::Voice => Ok(extract_voices(direct_media_archive_config_from_args(args))?),
     }
 }
 
@@ -615,16 +615,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unimplemented_extract_types_before_running() {
-        let error = ensure_supported_extract_types(&[MediaType::Voice])
-            .expect_err("voice is not implemented yet");
-
-        assert!(error
-            .to_string()
-            .contains("currently supports image, video and file; unsupported types: voice"));
-    }
-
-    #[test]
     fn accepts_video_extract_type() {
         ensure_supported_extract_types(&[MediaType::Video]).unwrap();
     }
@@ -632,6 +622,11 @@ mod tests {
     #[test]
     fn accepts_file_extract_type() {
         ensure_supported_extract_types(&[MediaType::File]).unwrap();
+    }
+
+    #[test]
+    fn accepts_voice_extract_type() {
+        ensure_supported_extract_types(&[MediaType::Voice]).unwrap();
     }
 
     #[test]
