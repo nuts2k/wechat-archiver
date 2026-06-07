@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
     archive_status, discover_wechat, extract_images, extract_message_db_images, verify_archive,
     ArchiveConfig, ArchiveStatus, DatDecodeOptions, DiscoverOptions, ExtractSummary,
@@ -47,6 +48,14 @@ enum Commands {
         #[arg(long, default_value = "0x88")]
         image_xor_key: String,
 
+        /// wxgf 私有图片处理模式：jpg 调用 ffmpeg 输出首帧 JPG，raw 归档原始 wxgf，off 关闭。
+        #[arg(long, value_enum, default_value = "jpg")]
+        wxgf_mode: WxgfMode,
+
+        /// ffmpeg 可执行文件路径；不传时使用 PATH 中的 ffmpeg。
+        #[arg(long)]
+        wxgf_ffmpeg_path: Option<PathBuf>,
+
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
@@ -74,6 +83,14 @@ enum Commands {
         #[arg(long, default_value = "0x88")]
         image_xor_key: String,
 
+        /// wxgf 私有图片处理模式：jpg 调用 ffmpeg 输出首帧 JPG，raw 归档原始 wxgf，off 关闭。
+        #[arg(long, value_enum, default_value = "jpg")]
+        wxgf_mode: WxgfMode,
+
+        /// ffmpeg 可执行文件路径；不传时使用 PATH 中的 ffmpeg。
+        #[arg(long)]
+        wxgf_ffmpeg_path: Option<PathBuf>,
+
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
@@ -100,6 +117,14 @@ enum Commands {
         /// V1/V2 图片 .dat 尾段 XOR key，默认 0x88。
         #[arg(long, default_value = "0x88")]
         image_xor_key: String,
+
+        /// wxgf 私有图片处理模式：jpg 调用 ffmpeg 输出首帧 JPG，raw 归档原始 wxgf，off 关闭。
+        #[arg(long, value_enum, default_value = "jpg")]
+        wxgf_mode: WxgfMode,
+
+        /// ffmpeg 可执行文件路径；不传时使用 PATH 中的 ffmpeg。
+        #[arg(long)]
+        wxgf_ffmpeg_path: Option<PathBuf>,
 
         /// 输出 JSON。
         #[arg(long)]
@@ -129,6 +154,25 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WxgfMode {
+    Off,
+    Raw,
+    Jpg,
+    Mp4,
+}
+
+impl From<WxgfMode> for CoreWxgfMode {
+    fn from(value: WxgfMode) -> Self {
+        match value {
+            WxgfMode::Off => CoreWxgfMode::Off,
+            WxgfMode::Raw => CoreWxgfMode::Raw,
+            WxgfMode::Jpg => CoreWxgfMode::Jpg,
+            WxgfMode::Mp4 => CoreWxgfMode::Mp4,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -142,13 +186,20 @@ fn main() -> Result<()> {
             archive,
             image_aes_key,
             image_xor_key,
+            wxgf_mode,
+            wxgf_ffmpeg_path,
             json,
         } => {
             let summary = extract_images(ArchiveConfig {
                 source_dir: source,
                 archive_dir: archive,
                 dry_run: true,
-                dat_options: parse_dat_options(image_aes_key, &image_xor_key)?,
+                dat_options: parse_dat_options(
+                    image_aes_key,
+                    &image_xor_key,
+                    wxgf_mode,
+                    wxgf_ffmpeg_path,
+                )?,
             })?;
             print_extract_summary(&summary, json)?;
         }
@@ -158,13 +209,20 @@ fn main() -> Result<()> {
             dry_run,
             image_aes_key,
             image_xor_key,
+            wxgf_mode,
+            wxgf_ffmpeg_path,
             json,
         } => {
             let summary = extract_images(ArchiveConfig {
                 source_dir: source,
                 archive_dir: archive,
                 dry_run,
-                dat_options: parse_dat_options(image_aes_key, &image_xor_key)?,
+                dat_options: parse_dat_options(
+                    image_aes_key,
+                    &image_xor_key,
+                    wxgf_mode,
+                    wxgf_ffmpeg_path,
+                )?,
             })?;
             print_extract_summary(&summary, json)?;
         }
@@ -174,13 +232,20 @@ fn main() -> Result<()> {
             dry_run,
             image_aes_key,
             image_xor_key,
+            wxgf_mode,
+            wxgf_ffmpeg_path,
             json,
         } => {
             let summary = extract_message_db_images(MessageDbExtractConfig {
                 account_dir: account,
                 archive_dir: archive,
                 dry_run,
-                dat_options: parse_dat_options(image_aes_key, &image_xor_key)?,
+                dat_options: parse_dat_options(
+                    image_aes_key,
+                    &image_xor_key,
+                    wxgf_mode,
+                    wxgf_ffmpeg_path,
+                )?,
             })?;
             print_extract_summary(&summary, json)?;
         }
@@ -203,11 +268,15 @@ fn main() -> Result<()> {
 fn parse_dat_options(
     image_aes_key: Option<String>,
     image_xor_key: &str,
+    wxgf_mode: WxgfMode,
+    wxgf_ffmpeg_path: Option<PathBuf>,
 ) -> Result<DatDecodeOptions> {
     Ok(DatDecodeOptions {
         image_aes_key: image_aes_key.as_deref().map(parse_aes_key).transpose()?,
         image_xor_key: parse_u8_key(image_xor_key)
             .with_context(|| format!("invalid --image-xor-key: {image_xor_key}"))?,
+        wxgf_mode: wxgf_mode.into(),
+        wxgf_ffmpeg_path,
     })
 }
 

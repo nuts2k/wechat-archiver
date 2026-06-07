@@ -14,6 +14,7 @@
 - 参考 `jackwener/wx-cli` 和 `ylytdeng/wechat-decrypt` 的旧格式图片 `.dat` 思路，支持自动识别 XOR key 并解码旧 XOR `.dat` 图片。
 - 支持 V1 AES `.dat` 的固定 key 解码。
 - 支持 V2 AES `.dat` 在用户显式提供 `--image-aes-key` 时解码；不会自动读取微信进程内存或提取密钥。
+- 支持解密后的微信 `wxgf` 私有图片格式：默认调用 `ffmpeg` 提取 HEVC 首帧并转成 JPG；也可选择归档原始 `wxgf` 或封装为 MP4。
 - 对未知 `.dat`、缺少 V2 key 或无法识别文件记录为 `unsupported`，不会写出不可信的垃圾文件；对消息库中存在但本地 `.dat` 缺失的资源记录为 `failed`。
 - 归档文件写入独立 archive 目录，使用内容寻址路径 `objects/sha256/<prefix>/<sha256>.<ext>`。
 - 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`。
@@ -93,6 +94,24 @@ cargo run -p wechat-archiver -- extract-images \
 `extract-db-images` 同样支持 `--image-aes-key` 和 `--image-xor-key`。
 
 `--image-aes-key` 支持普通 16+ 字节字符串，也支持 `hex:<hex-encoded-key>`。`--image-xor-key` 默认是 `0x88`，通常不需要修改。
+
+解密后如果遇到 `wxgf`，默认 `--wxgf-mode jpg` 会调用 `ffmpeg` 从内部 HEVC 分片转换首帧 JPG。若 `ffmpeg` 不在 `PATH`，可显式传入路径：
+
+```bash
+cargo run -p wechat-archiver -- extract-images \
+  --source "/path/to/wechat/source" \
+  --archive "/path/to/wechat-archive" \
+  --image-aes-key "0123456789abcdef" \
+  --wxgf-mode jpg \
+  --wxgf-ffmpeg-path "/opt/homebrew/bin/ffmpeg"
+```
+
+`--wxgf-mode` 支持：
+
+- `jpg`：默认值，转出首帧 JPG，适合图片归档和预览。
+- `raw`：不转码，归档解密后的原始 `wxgf`。
+- `mp4`：调用 `ffmpeg` 将内部 HEVC 分片封装为 MP4。
+- `off`：关闭 `wxgf` 处理，保留旧行为并记录为 `unsupported`。
 
 查看统计：
 

@@ -12,7 +12,7 @@ mod types;
 mod verify;
 mod wechat;
 
-pub use config::{ArchiveConfig, DatDecodeOptions, ResolvedConfig};
+pub use config::{ArchiveConfig, DatDecodeOptions, ResolvedConfig, WxgfMode};
 pub use error::{ArchiverError, Result};
 pub use message_db::{extract_message_db_images, MessageDbExtractConfig};
 pub use scanner::extract_images;
