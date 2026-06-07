@@ -369,6 +369,35 @@ fn process_direct_media(
     source_kind: &str,
     media_type: &str,
 ) -> Result<ScanOutcome> {
+    process_direct_media_with_message_source(
+        path,
+        extension,
+        source_root,
+        archive_root,
+        run_id,
+        dry_run,
+        conn,
+        manifest,
+        source_kind,
+        media_type,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_direct_media_with_message_source(
+    path: &Path,
+    extension: &str,
+    source_root: &Path,
+    archive_root: &Path,
+    run_id: &str,
+    dry_run: bool,
+    conn: Option<&Connection>,
+    manifest: Option<&mut ManifestWriter>,
+    source_kind: &str,
+    media_type: &str,
+    message_source: Option<&MessageSource>,
+) -> Result<ScanOutcome> {
     let rel = relative_path(path, source_root)?;
     let (sha256, size_bytes) = sha256_file(path)?;
 
@@ -393,7 +422,7 @@ fn process_direct_media(
         &rel,
         source_kind,
         media_type,
-        None,
+        message_source,
         None,
         action.clone(),
         archive_path,

@@ -97,7 +97,7 @@ cargo run -p wechat-archiver -- extract --type video \
   --archive "/path/to/wechat-archive"
 ```
 
-当前视频归档会复制 `mp4`、`mov`、`m4v` 到内容寻址归档库，记录 `source_kind=direct_video`、`media_type=video`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，会自动扫描同账号的 `msg/video`；其他目录则只扫描传入目录本身。暂不解析消息库视频来源，也不提取时长和分辨率。
+当前视频归档会复制 `mp4`、`mov`、`m4v` 到内容寻址归档库，记录 `source_kind=direct_video`、`media_type=video`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，会自动扫描同账号的 `msg/video`；其他目录则只扫描传入目录本身。暂不提取时长和分辨率。
 
 归档直接文件附件：
 
@@ -128,6 +128,16 @@ cargo run -p wechat-archiver -- extract-db-images \
 ```
 
 该命令会读取 `<account>/db_storage/message/message_*.db` 和 `message_resource.db`，并只从 `<account>/msg/attach` 复制或解码图片资源。它不会解密 SQLCipher 数据库，也不会读取微信进程内存；如果数据库不是普通 SQLite，会返回错误。
+
+按消息库枚举并归档视频：
+
+```bash
+cargo run -p wechat-archiver -- extract-db-videos \
+  --account "/path/to/xwechat_files/<wxid>" \
+  --archive "/path/to/wechat-archive"
+```
+
+该命令会读取 `<account>/db_storage/message/message_*.db` 和 `message_resource.db`，基于 `MessageResourceInfo` / `MessageResourceDetail` 的资源 md5 定位 `<account>/msg/video/<YYYY-MM>/<md5>.mp4`，并复制可读视频到归档库，记录 `source_kind=message_db_video`、`media_type=video` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。它不会解密 SQLCipher 数据库，不会写入微信源目录；暂不提取时长和分辨率。
 
 如果需要解码 V2 AES `.dat`，可以先只读派生图片 key：
 
@@ -201,7 +211,7 @@ wechat-archive/
   views/
 ```
 
-`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。通过消息库归档的图片还会记录可用的消息来源字段：`message_talker`、`message_local_id`、`message_create_time`；`message_sender` 已预留但当前不猜测不同微信版本的发送人列。
+`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。通过消息库归档的图片和视频还会记录可用的消息来源字段：`message_talker`、`message_local_id`、`message_create_time`；`message_sender` 已预留但当前不猜测不同微信版本的发送人列。
 
 ## 外部项目参考
 

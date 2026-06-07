@@ -137,11 +137,12 @@ wechat-archive/
 - 只读读取已解密/普通 SQLite 消息库：`message_*.db` 和 `message_resource.db`。
 - 基于 `ChatName2Id`、`MessageResourceInfo`、`Msg_<md5(talker)>` 枚举图片类消息。
 - 定位 `msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5>.dat`，并兼容 `_h`、`_W`、`_w`、`_t` 变体。
+- 基于消息库视频资源 md5 定位 `msg/video/<YYYY-MM>/<md5>.mp4`。
 - 支持普通图片、旧 XOR `.dat`、V1 AES `.dat`，V2 AES `.dat` 仅在用户显式提供 key 时解码。
 - 计算 `sha256`。
 - 复制到归档目录。
 - 写入 SQLite 索引。
-- 消息库图片归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
+- 消息库图片和视频归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
 - 支持校验归档文件完整性。
 - 对未知 `.dat` 记录 `unsupported`，对消息库中存在但本地 `.dat` 缺失的资源记录 `failed`。
 
@@ -162,6 +163,7 @@ wechat-archiver extract --type file
 wechat-archiver extract --type voice
 wechat-archiver extract-images
 wechat-archiver extract-db-images
+wechat-archiver extract-db-videos
 wechat-archiver status
 wechat-archiver verify
 ```

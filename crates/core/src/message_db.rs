@@ -8,8 +8,10 @@ use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions};
 use crate::error::{ArchiverError, IoContext, Result};
 use crate::index::{index_path, open_index};
 use crate::manifest::ManifestWriter;
+use crate::media::direct_video_extension;
 use crate::scanner::{
-    apply_result, persist, process_dat_image_with_message_source, MessageSource, ScanOutcome,
+    apply_result, persist, process_dat_image_with_message_source,
+    process_direct_media_with_message_source, MessageSource, ScanOutcome,
 };
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 
@@ -31,6 +33,12 @@ struct MessageKey {
 
 #[derive(Debug, Clone)]
 struct ImageResource {
+    key: MessageKey,
+    file_md5: String,
+}
+
+#[derive(Debug, Clone)]
+struct VideoResource {
     key: MessageKey,
     file_md5: String,
 }
@@ -131,6 +139,106 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
                 &message_source,
             ),
         };
+        apply_result(&mut summary, result)?;
+    }
+
+    if let Some(writer) = manifest.as_mut() {
+        writer.flush()?;
+    }
+    summary.finish_unsupported_explanation();
+
+    Ok(summary)
+}
+
+pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
+    let resolved = ArchiveConfig {
+        source_dir: config.account_dir,
+        archive_dir: config.archive_dir,
+        dry_run: config.dry_run,
+        dat_options: config.dat_options,
+        explain_unsupported: config.explain_unsupported,
+    }
+    .resolve()?;
+
+    let message_dir = resolved.source_dir.join("db_storage").join("message");
+    if !message_dir.is_dir() {
+        return Err(ArchiverError::Other(format!(
+            "message directory does not exist: {}",
+            message_dir.display()
+        )));
+    }
+
+    let resource_db = message_dir.join("message_resource.db");
+    if !resource_db.is_file() {
+        return Err(ArchiverError::Other(format!(
+            "message_resource.db does not exist: {}",
+            resource_db.display()
+        )));
+    }
+
+    let video_root = resolved.source_dir.join("msg").join("video");
+    let resources = query_video_resources(&resource_db)?;
+    let message_dbs = message_db_paths(&message_dir)?;
+    let (video_messages, scanned_rows) = query_message_keys_for_type(&message_dbs, &resources, 43)?;
+
+    let run_id = format!("{}", now_epoch_ms());
+    let mut summary = ExtractSummary::new(
+        run_id.clone(),
+        resolved.source_dir.clone(),
+        resolved.archive_dir.clone(),
+        resolved.dry_run,
+    );
+    summary.scanned_files = scanned_rows;
+    if resolved.explain_unsupported {
+        summary.enable_unsupported_explanation();
+    }
+
+    let mut conn = None;
+    let mut manifest = None;
+    if !resolved.dry_run {
+        create_archive_dirs(&resolved.archive_dir)?;
+        let opened = open_index(&resolved.archive_dir)?;
+        summary.index_path = Some(index_path(&resolved.archive_dir));
+        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, "extract-db-videos")?;
+        summary.manifest_path = Some(writer.path().to_path_buf());
+        conn = Some(opened);
+        manifest = Some(writer);
+    }
+
+    for resource in resources {
+        if !video_messages.contains(&resource.key) {
+            continue;
+        }
+
+        summary.candidates += 1;
+        let message_source = message_source_from_key(&resource.key);
+        let result =
+            match find_video_file(&video_root, &resource.file_md5, resource.key.create_time) {
+                Some(video_path) => {
+                    let extension = direct_video_extension(&video_path).unwrap_or("mp4");
+                    process_direct_media_with_message_source(
+                        &video_path,
+                        extension,
+                        &resolved.source_dir,
+                        &resolved.archive_dir,
+                        &run_id,
+                        resolved.dry_run,
+                        conn.as_ref(),
+                        manifest.as_mut(),
+                        "message_db_video",
+                        "video",
+                        Some(&message_source),
+                    )
+                }
+                None => record_missing_video(
+                    &resource,
+                    &resolved.source_dir,
+                    &run_id,
+                    conn.as_ref(),
+                    manifest.as_mut(),
+                    &message_source,
+                ),
+            };
         apply_result(&mut summary, result)?;
     }
 
@@ -273,6 +381,171 @@ fn query_image_message_keys(
     Ok((keys, scanned_rows))
 }
 
+fn query_message_keys_for_type(
+    message_dbs: &[PathBuf],
+    resources: &[VideoResource],
+    local_type: i64,
+) -> Result<(BTreeSet<MessageKey>, u64)> {
+    let talkers = resources
+        .iter()
+        .map(|resource| resource.key.talker.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut keys = BTreeSet::new();
+    let mut scanned_rows = 0u64;
+
+    for db_path in message_dbs {
+        let conn = open_readonly_db(db_path)?;
+        for talker in &talkers {
+            let table_name = message_table_name(talker);
+            if !table_exists(&conn, &table_name)? {
+                continue;
+            }
+
+            let sql = format!(
+                r#"
+                SELECT local_id, create_time
+                FROM {}
+                WHERE local_type = ?1 OR local_type % 4294967296 = ?1
+                "#,
+                quote_identifier(&table_name)
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([local_type], |row| {
+                Ok(MessageKey {
+                    talker: (*talker).to_string(),
+                    local_id: row.get(0)?,
+                    create_time: row.get(1)?,
+                })
+            })?;
+
+            for row in rows {
+                keys.insert(row?);
+                scanned_rows += 1;
+            }
+        }
+    }
+
+    Ok((keys, scanned_rows))
+}
+
+fn query_video_resources(resource_db: &Path) -> Result<Vec<VideoResource>> {
+    let conn = open_readonly_db(resource_db)?;
+    let has_detail_type = table_has_column(&conn, "MessageResourceDetail", "type")?;
+    let has_detail_packed_info = table_has_column(&conn, "MessageResourceDetail", "packed_info")?;
+    let sql = match (has_detail_type, has_detail_packed_info) {
+        (true, true) => {
+            r#"
+            SELECT c.user_name,
+                   i.message_local_id,
+                   i.message_create_time,
+                   i.message_local_type,
+                   i.packed_info,
+                   d.type,
+                   d.packed_info
+            FROM MessageResourceInfo i
+            JOIN ChatName2Id c ON c.rowid = i.chat_id
+            LEFT JOIN MessageResourceDetail d ON d.message_id = i.message_id
+            WHERE c.user_name IS NOT NULL
+              AND (i.message_local_type = 43 OR i.message_local_type % 4294967296 = 43)
+              AND (d.type IS NULL OR d.type % 65536 = 2)
+            ORDER BY c.user_name, i.message_create_time, i.message_local_id, i.rowid
+            "#
+        }
+        (true, false) => {
+            r#"
+            SELECT c.user_name,
+                   i.message_local_id,
+                   i.message_create_time,
+                   i.message_local_type,
+                   i.packed_info,
+                   d.type,
+                   NULL
+            FROM MessageResourceInfo i
+            JOIN ChatName2Id c ON c.rowid = i.chat_id
+            LEFT JOIN MessageResourceDetail d ON d.message_id = i.message_id
+            WHERE c.user_name IS NOT NULL
+              AND (i.message_local_type = 43 OR i.message_local_type % 4294967296 = 43)
+              AND (d.type IS NULL OR d.type % 65536 = 2)
+            ORDER BY c.user_name, i.message_create_time, i.message_local_id, i.rowid
+            "#
+        }
+        (false, true) => {
+            r#"
+            SELECT c.user_name,
+                   i.message_local_id,
+                   i.message_create_time,
+                   i.message_local_type,
+                   i.packed_info,
+                   NULL,
+                   d.packed_info
+            FROM MessageResourceInfo i
+            JOIN ChatName2Id c ON c.rowid = i.chat_id
+            LEFT JOIN MessageResourceDetail d ON d.message_id = i.message_id
+            WHERE c.user_name IS NOT NULL
+              AND (i.message_local_type = 43 OR i.message_local_type % 4294967296 = 43)
+            ORDER BY c.user_name, i.message_create_time, i.message_local_id, i.rowid
+            "#
+        }
+        (false, false) => {
+            r#"
+            SELECT c.user_name,
+                   i.message_local_id,
+                   i.message_create_time,
+                   i.message_local_type,
+                   i.packed_info,
+                   NULL,
+                   NULL
+            FROM MessageResourceInfo i
+            JOIN ChatName2Id c ON c.rowid = i.chat_id
+            WHERE c.user_name IS NOT NULL
+              AND (i.message_local_type = 43 OR i.message_local_type % 4294967296 = 43)
+            ORDER BY c.user_name, i.message_create_time, i.message_local_id, i.rowid
+            "#
+        }
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| {
+        let talker: String = row.get(0)?;
+        let local_id: i64 = row.get(1)?;
+        let create_time: i64 = row.get(2)?;
+        let message_blob: Option<Vec<u8>> = row.get(4)?;
+        let detail_blob: Option<Vec<u8>> = row.get(6)?;
+        let file_md5 = message_blob
+            .as_deref()
+            .and_then(extract_md5_from_packed_info)
+            .or_else(|| {
+                detail_blob
+                    .as_deref()
+                    .and_then(extract_md5_from_packed_info)
+            });
+
+        Ok(file_md5.map(|file_md5| VideoResource {
+            key: MessageKey {
+                talker,
+                local_id,
+                create_time,
+            },
+            file_md5,
+        }))
+    })?;
+
+    let mut seen = HashSet::<(MessageKey, String)>::new();
+    let mut resources = Vec::new();
+    for row in rows {
+        let Some(resource) = row? else {
+            continue;
+        };
+        if !is_md5_hex(&resource.file_md5) {
+            continue;
+        }
+        if seen.insert((resource.key.clone(), resource.file_md5.clone())) {
+            resources.push(resource);
+        }
+    }
+    Ok(resources)
+}
+
 fn record_missing_dat(
     resource: &ImageResource,
     account_dir: &Path,
@@ -313,6 +586,103 @@ fn record_missing_dat(
     };
     persist(conn, manifest, &event)?;
     Ok(ScanOutcome::new(ScanAction::Failed))
+}
+
+fn record_missing_video(
+    resource: &VideoResource,
+    account_dir: &Path,
+    run_id: &str,
+    conn: Option<&Connection>,
+    manifest: Option<&mut ManifestWriter>,
+    message_source: &MessageSource,
+) -> Result<ScanOutcome> {
+    let source_relative_path = format!(
+        "db_storage/message:talker={}:local_id={}:create_time={}:video_md5={}",
+        resource.key.talker, resource.key.local_id, resource.key.create_time, resource.file_md5
+    );
+    let source_path = account_dir
+        .join(&source_relative_path)
+        .to_string_lossy()
+        .to_string();
+    let event = ManifestEvent {
+        event: "media_item".to_string(),
+        run_id: run_id.to_string(),
+        timestamp_epoch_ms: now_epoch_ms(),
+        source_path,
+        source_relative_path,
+        source_kind: "message_db_video".to_string(),
+        media_type: "video".to_string(),
+        message_talker: message_source.talker.clone(),
+        message_sender: message_source.sender.clone(),
+        message_local_id: message_source.local_id,
+        message_create_time: message_source.create_time,
+        decoder: None,
+        action: ScanAction::Failed,
+        archive_path: None,
+        sha256: None,
+        size_bytes: None,
+        extension: Some("mp4".to_string()),
+        decrypt_status: "source_missing".to_string(),
+        verify_status: "failed".to_string(),
+        error: Some("local_video_not_found".to_string()),
+    };
+    persist(conn, manifest, &event)?;
+    Ok(ScanOutcome::new(ScanAction::Failed))
+}
+
+fn find_video_file(video_root: &Path, file_md5: &str, create_time: i64) -> Option<PathBuf> {
+    for month in month_candidates(create_time) {
+        let video_dir = video_root.join(month);
+        if let Some(path) = pick_video_file(&video_dir, file_md5) {
+            return Some(path);
+        }
+    }
+
+    let mut month_dirs = fs::read_dir(video_root)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    month_dirs.sort();
+
+    for month_dir in month_dirs {
+        if let Some(path) = pick_video_file(&month_dir, file_md5) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn pick_video_file(video_dir: &Path, file_md5: &str) -> Option<PathBuf> {
+    if !video_dir.is_dir() {
+        return None;
+    }
+
+    for suffix in [".mp4", ".mov", ".m4v"] {
+        let path = video_dir.join(format!("{file_md5}{suffix}"));
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let mut candidates = fs::read_dir(video_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            let Some(extension) = direct_video_extension(path) else {
+                return false;
+            };
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| stem.eq_ignore_ascii_case(file_md5) && !extension.is_empty())
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
 }
 
 fn message_db_paths(message_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -730,6 +1100,125 @@ mod tests {
     }
 
     #[test]
+    fn extracts_message_db_videos_with_message_source_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let archive = tmp.path().join("archive");
+        let talker = "room@example";
+        let local_id = 21;
+        let create_time = 1_779_472_800;
+        let file_md5 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        create_video_fixture_account(&account, talker, local_id, create_time, file_md5, true);
+
+        let video_path = account
+            .join("msg")
+            .join("video")
+            .join("2026-05")
+            .join(format!("{file_md5}.mp4"));
+        let db_path = account
+            .join("db_storage")
+            .join("message")
+            .join("message_0.db");
+        let video_hash_before = sha256_file(&video_path).unwrap();
+        let db_hash_before = sha256_file(&db_path).unwrap();
+
+        let summary = extract_message_db_videos(MessageDbExtractConfig {
+            account_dir: account.clone(),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+        assert_eq!(sha256_file(&video_path).unwrap(), video_hash_before);
+        assert_eq!(sha256_file(&db_path).unwrap(), db_hash_before);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_kind, media_type, message_talker, message_local_id, message_create_time): (
+            String,
+            String,
+            String,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, media_type, message_talker, message_local_id, message_create_time
+                FROM media_items
+                WHERE source_kind = 'message_db_video'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(source_kind, "message_db_video");
+        assert_eq!(media_type, "video");
+        assert_eq!(message_talker, talker);
+        assert_eq!(message_local_id, local_id);
+        assert_eq!(message_create_time, create_time);
+
+        let verify = verify_archive(&archive).unwrap();
+        assert_eq!(verify.checked, 1);
+        assert_eq!(verify.ok, 1);
+    }
+
+    #[test]
+    fn missing_local_video_is_recorded_as_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let archive = tmp.path().join("archive");
+        create_video_fixture_account(
+            &account,
+            "wxid_friend",
+            22,
+            1_779_472_800,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            false,
+        );
+
+        let summary = extract_message_db_videos(MessageDbExtractConfig {
+            account_dir: account,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.failed, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_kind, error, message_local_id): (String, String, i64) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, error, message_local_id
+                FROM media_items
+                WHERE verify_status = 'failed'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(source_kind, "message_db_video");
+        assert_eq!(error, "local_video_not_found");
+        assert_eq!(message_local_id, 22);
+    }
+
+    #[test]
     fn extracts_md5_from_marker_and_fallback() {
         let mut marker_blob = vec![0x12, 0x22, 0x0a, 0x20];
         marker_blob.extend_from_slice(b"DEADBEEFCAFEBABE1234567890ABCDEF");
@@ -785,6 +1274,16 @@ mod tests {
     }
 
     fn create_message_db(path: &Path, talker: &str, local_id: i64, create_time: i64) {
+        create_message_db_with_type(path, talker, local_id, create_time, 3);
+    }
+
+    fn create_message_db_with_type(
+        path: &Path,
+        talker: &str,
+        local_id: i64,
+        create_time: i64,
+        local_type: i64,
+    ) {
         let conn = Connection::open(path).unwrap();
         let table_name = message_table_name(talker);
         conn.execute(
@@ -800,7 +1299,7 @@ mod tests {
                 "INSERT INTO {} (local_id, create_time, local_type) VALUES (?1, ?2, ?3)",
                 quote_identifier(&table_name)
             ),
-            params![local_id, create_time, (1_i64 << 32) + 3],
+            params![local_id, create_time, (1_i64 << 32) + local_type],
         )
         .unwrap();
     }
@@ -889,5 +1388,103 @@ mod tests {
         let mut blob = vec![0x12, 0x22, 0x0a, 0x20];
         blob.extend_from_slice(file_md5.as_bytes());
         blob
+    }
+
+    fn create_video_fixture_account(
+        account: &Path,
+        talker: &str,
+        local_id: i64,
+        create_time: i64,
+        file_md5: &str,
+        create_video: bool,
+    ) {
+        let message_dir = account.join("db_storage").join("message");
+        fs::create_dir_all(&message_dir).unwrap();
+        create_message_db_with_type(
+            &message_dir.join("message_0.db"),
+            talker,
+            local_id,
+            create_time,
+            43,
+        );
+        create_video_resource_db(
+            &message_dir.join("message_resource.db"),
+            talker,
+            local_id,
+            create_time,
+            file_md5,
+        );
+
+        let video_dir = account.join("msg").join("video").join("2026-05");
+        fs::create_dir_all(&video_dir).unwrap();
+        if create_video {
+            fs::write(
+                video_dir.join(format!("{file_md5}.mp4")),
+                b"synthetic-video",
+            )
+            .unwrap();
+        }
+    }
+
+    fn create_video_resource_db(
+        path: &Path,
+        talker: &str,
+        local_id: i64,
+        create_time: i64,
+        file_md5: &str,
+    ) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE ChatName2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE MessageResourceInfo (
+                message_id INTEGER,
+                chat_id INTEGER,
+                message_local_id INTEGER,
+                message_create_time INTEGER,
+                message_local_type INTEGER,
+                packed_info BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE MessageResourceDetail (
+                message_id INTEGER,
+                type INTEGER,
+                packed_info BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ChatName2Id(rowid, user_name) VALUES (?1, ?2)",
+            params![1, talker],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO MessageResourceInfo (
+                message_id,
+                chat_id,
+                message_local_id,
+                message_create_time,
+                message_local_type,
+                packed_info
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                20,
+                1,
+                local_id,
+                create_time,
+                (1_i64 << 32) + 43,
+                Vec::<u8>::new()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO MessageResourceDetail(message_id, type, packed_info) VALUES (?1, ?2, ?3)",
+            params![20, 2, packed_md5(file_md5)],
+        )
+        .unwrap();
     }
 }

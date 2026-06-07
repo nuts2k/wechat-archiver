@@ -17,7 +17,9 @@ mod wechat;
 pub use config::{ArchiveConfig, DatDecodeOptions, ResolvedConfig, WxgfMode};
 pub use error::{ArchiverError, Result};
 pub use image_key::{derive_image_key, DeriveImageKeyOptions, ImageKeyDerivation, ImageKeyMethod};
-pub use message_db::{extract_message_db_images, MessageDbExtractConfig};
+pub use message_db::{
+    extract_message_db_images, extract_message_db_videos, MessageDbExtractConfig,
+};
 pub use scanner::{extract_files, extract_images, extract_videos, extract_voices};
 pub use status::{archive_status, ArchiveStatus};
 pub use types::{
