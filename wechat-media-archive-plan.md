@@ -138,11 +138,12 @@ wechat-archive/
 - 基于 `ChatName2Id`、`MessageResourceInfo`、`Msg_<md5(talker)>` 枚举图片类消息。
 - 定位 `msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5>.dat`，并兼容 `_h`、`_W`、`_w`、`_t` 变体。
 - 基于消息库视频资源 md5 定位 `msg/video/<YYYY-MM>/<md5>.mp4`。
+- 基于消息库文件附件资源保守识别安全文件名，并定位 `msg/file/<YYYY-MM>/<file_name>`。
 - 支持普通图片、旧 XOR `.dat`、V1 AES `.dat`，V2 AES `.dat` 仅在用户显式提供 key 时解码。
 - 计算 `sha256`。
 - 复制到归档目录。
 - 写入 SQLite 索引。
-- 消息库图片和视频归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
+- 消息库图片、视频和文件附件归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
 - 支持校验归档文件完整性。
 - 对未知 `.dat` 记录 `unsupported`，对消息库中存在但本地 `.dat` 缺失的资源记录 `failed`。
 
@@ -164,11 +165,12 @@ wechat-archiver extract --type voice
 wechat-archiver extract-images
 wechat-archiver extract-db-images
 wechat-archiver extract-db-videos
+wechat-archiver extract-db-files
 wechat-archiver status
 wechat-archiver verify
 ```
 
-说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`extract-images` 保留用于兼容旧脚本。
+说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`extract-db-images`、`extract-db-videos` 和 `extract-db-files` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段。`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 
@@ -183,8 +185,8 @@ wechat-archiver verify
 
 功能：
 
-- 视频归档：优先从本地路径直接复制并计算 hash；后续再补消息库来源、时长和分辨率。
-- 文件归档：先归档 `msg/file` 中的直接文件；后续再补原始文件名、扩展名、大小和来源消息。
+- 视频归档：已支持直接文件和消息库枚举；后续再补时长和分辨率。
+- 文件归档：已支持直接文件和保守消息库枚举；后续再补更完整的 appmsg 元数据、大小和发送人。
 - 语音归档：先归档直接语音/音频文件；后续再解析消息库语音 BLOB，并支持可选转换为 `wav` 或 `mp3`。
 - 支持按时间范围、会话、类型过滤。
 

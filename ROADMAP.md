@@ -95,7 +95,7 @@ Rust core library
 - 当前文件归档为直接文件扫描最小版，归档带扩展名的普通文件。
 - 当 `--source` 是微信账号目录或该账号的 `msg/attach` 时，自动扫描同账号 `msg/file`；其他目录只扫描传入目录本身。
 - 文件对象复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
-- 当前记录 `source_kind=direct_file`、`media_type=file`；暂不解析消息库文件来源，也不补充会话、发送人等上下文。
+- 当前记录 `source_kind=direct_file`、`media_type=file`；需要消息库来源上下文时使用 `extract-db-files`。
 
 ### 语音扫描与归档
 
@@ -123,6 +123,14 @@ Rust core library
 - 当前记录 `source_kind=message_db_video`、`media_type=video` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。
 - 对本地视频缺失的资源记录为 `failed`；暂不提取时长和分辨率。
 
+### 消息库文件附件枚举
+
+- 支持 `extract-db-files` 从已解密/普通 SQLite 消息库枚举文件附件并定位本地文件。
+- 支持从 `MessageResourceInfo` / `MessageResourceDetail` 的 `packed_info` 中保守识别带扩展名的安全文件名。
+- 支持定位 `msg/file/<YYYY-MM>/<file_name>`，并复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
+- 当前记录 `source_kind=message_db_file`、`media_type=file` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。
+- 对本地文件缺失的资源记录为 `failed`；当前不猜测发送人，也不解析复杂 appmsg XML。
+
 ### 归档与索引
 
 - 归档目录采用内容寻址结构：
@@ -144,14 +152,14 @@ wechat-archive/
 - `index.sqlite` 保存当前索引状态。
 - `manifests/*.jsonl` 保存每次运行审计记录。
 - `index.sqlite` 和 manifest 独立记录 `source_kind` 与 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。
-- `index.sqlite` 和 manifest 支持可空消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；当前消息库图片和视频归档会写入 `talker/local_id/create_time`，`sender` 暂不猜测。
+- `index.sqlite` 和 manifest 支持可空消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；当前消息库图片、视频和文件附件归档会写入 `talker/local_id/create_time`，`sender` 暂不猜测。
 - 支持 `status` 查看索引统计。
 - 支持 `verify` 重新计算归档对象 hash。
 - 支持重复对象去重：相同 `sha256` 不重复写入对象文件。
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 和消息来源记录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
+- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 和消息来源记录、消息库图片/视频/文件附件归档、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
 - 已通过：
 
 ```bash
@@ -165,15 +173,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 ## 当前边界
 
 - 当前主线仍是图片归档。
-- `extract-db-images` 只支持已解密/普通 SQLite 数据库，不支持直接读取 SQLCipher 加密库。
-- 消息来源字段当前由消息库图片和视频归档写入 `talker/local_id/create_time`；直接 file/voice 和 `message_sender` 仍待后续消息库来源增强。
+- `extract-db-images`、`extract-db-videos` 和 `extract-db-files` 只支持已解密/普通 SQLite 数据库，不支持直接读取 SQLCipher 加密库。
+- 消息来源字段当前由消息库图片、视频和文件附件归档写入 `talker/local_id/create_time`；直接 file/voice 和 `message_sender` 仍待后续消息库来源增强。
 - V2 图片 AES key 可通过 `derive-image-key` 只读派生，但抽取命令仍需要用户显式提供。
 - `derive-image-key` 不自动保存 key；本机 key 文档应继续保存在 `.gitignore` 覆盖的本地文件中。
 - `wxgf jpg/mp4` 依赖 `ffmpeg`，没有可用 `ffmpeg` 时应使用 `raw` 或 `off`。
 - `wxgf jpg` 当前输出首帧 JPG，不保留可能存在的动态效果。
 - 统一 `extract` 入口当前接入图片、直接视频文件、直接文件附件和直接语音/音频文件；表情、收藏、朋友圈等尚未接入归档流程。
-- 视频归档当前只覆盖直接文件扫描，不覆盖消息库枚举、时长、分辨率等元数据。
-- 文件归档当前只覆盖直接文件扫描，不覆盖消息库枚举、会话、发送人等元数据。
+- 视频归档当前已覆盖直接文件扫描和消息库枚举，但暂不提取时长、分辨率等元数据。
+- 文件归档当前已覆盖直接文件扫描和消息库枚举，但暂不解析复杂 appmsg XML，也不补充发送人。
 - 语音归档当前只覆盖直接音频文件扫描，不覆盖消息库语音 BLOB、SILK 转码、语音转写或会话上下文。
 - 尚未实现 Tauri 桌面客户端。
 - 尚未实现归档后的清理建议或删除操作。
@@ -219,6 +227,7 @@ wechat-archiver extract --type voice
 - `video` 入口当前扫描直接视频文件；对微信账号目录或 `msg/attach` 会自动定位同账号 `msg/video`，复制本地视频、计算 hash，并记录到同一套 archive/index/manifest。
 - `extract-db-videos` 当前从消息库枚举视频资源，定位 `msg/video/<YYYY-MM>/<md5>.mp4`，并记录消息来源字段。
 - `file` 入口当前扫描直接文件附件；对微信账号目录或 `msg/attach` 会自动定位同账号 `msg/file`，复制本地文件、计算 hash，并记录到同一套 archive/index/manifest。
+- `extract-db-files` 当前从消息库枚举文件附件，定位 `msg/file/<YYYY-MM>/<file_name>`，并记录消息来源字段。
 - `voice` 入口当前扫描直接语音/音频文件；对微信账号目录或 `msg/attach` 只在存在 `msg/voice` 或 `msg/audio` 专用目录时扫描，避免把 `msg/file` 中的音乐附件误归为语音消息。
 - 多类型组合当前暂未执行，避免一个 CLI 命令生成多个 run 和多份 summary；后续应先设计聚合 summary。
 
@@ -226,7 +235,7 @@ wechat-archiver extract --type voice
 
 - 将 `extract --type image,video,file,voice` 扩展为可聚合的多媒体归档入口。
 - 视频归档增强：提取时长和分辨率。
-- 文件归档增强：解析消息库文件来源，记录原始文件名、会话、发送人等上下文。
+- 文件归档增强：解析更完整的 appmsg 元数据，补充大小、发送人等上下文。
 - 语音归档增强：解析消息库语音 BLOB，记录会话、时间和发送人，再支持可选转换为 `wav` 或 `mp3`。
 - 表情归档：识别静态图、动图和专有格式。
 - 支持 `--since`、`--until`、`--chat`、`--type` 等过滤参数。

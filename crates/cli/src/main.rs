@@ -5,10 +5,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
     archive_status, derive_image_key, discover_wechat, extract_files, extract_images,
-    extract_message_db_images, extract_message_db_videos, extract_videos, extract_voices,
-    verify_archive, ArchiveConfig, ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions,
-    DiscoverOptions, ExtractSummary, ImageKeyDerivation, ImageKeyMethod, MessageDbExtractConfig,
-    VerifySummary, WechatDiscovery,
+    extract_message_db_files, extract_message_db_images, extract_message_db_videos, extract_videos,
+    extract_voices, verify_archive, ArchiveConfig, ArchiveStatus, DatDecodeOptions,
+    DeriveImageKeyOptions, DiscoverOptions, ExtractSummary, ImageKeyDerivation, ImageKeyMethod,
+    MessageDbExtractConfig, VerifySummary, WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -131,6 +131,25 @@ enum Commands {
 
     /// 从已解密/普通 SQLite 微信消息库枚举视频消息并归档。
     ExtractDbVideos {
+        /// 单个微信账号目录，通常是 xwechat_files/<wxid>。
+        #[arg(long)]
+        account: PathBuf,
+
+        /// 独立归档目录，不能位于 account 内部，也不能包含 account。
+        #[arg(long)]
+        archive: PathBuf,
+
+        /// 只读枚举和定位，不写入 archive。
+        #[arg(long)]
+        dry_run: bool,
+
+        /// 输出 JSON。
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// 从已解密/普通 SQLite 微信消息库枚举文件附件并归档。
+    ExtractDbFiles {
         /// 单个微信账号目录，通常是 xwechat_files/<wxid>。
         #[arg(long)]
         account: PathBuf,
@@ -313,6 +332,21 @@ fn main() -> Result<()> {
             json,
         } => {
             let summary = extract_message_db_videos(MessageDbExtractConfig {
+                account_dir: account,
+                archive_dir: archive,
+                dry_run,
+                dat_options: DatDecodeOptions::default(),
+                explain_unsupported: false,
+            })?;
+            print_extract_summary(&summary, json)?;
+        }
+        Commands::ExtractDbFiles {
+            account,
+            archive,
+            dry_run,
+            json,
+        } => {
+            let summary = extract_message_db_files(MessageDbExtractConfig {
                 account_dir: account,
                 archive_dir: archive,
                 dry_run,
@@ -665,6 +699,36 @@ mod tests {
 
         match cli.command {
             Commands::ExtractDbVideos {
+                account,
+                archive,
+                dry_run,
+                json,
+            } => {
+                assert_eq!(account, PathBuf::from("/tmp/xwechat_files/wxid"));
+                assert_eq!(archive, PathBuf::from("/tmp/wechat-archive"));
+                assert!(dry_run);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_extract_db_files_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "extract-db-files",
+            "--account",
+            "/tmp/xwechat_files/wxid",
+            "--archive",
+            "/tmp/wechat-archive",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ExtractDbFiles {
                 account,
                 archive,
                 dry_run,

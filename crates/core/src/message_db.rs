@@ -8,7 +8,7 @@ use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions};
 use crate::error::{ArchiverError, IoContext, Result};
 use crate::index::{index_path, open_index};
 use crate::manifest::ManifestWriter;
-use crate::media::direct_video_extension;
+use crate::media::{direct_file_extension, direct_video_extension};
 use crate::scanner::{
     apply_result, persist, process_dat_image_with_message_source,
     process_direct_media_with_message_source, MessageSource, ScanOutcome,
@@ -41,6 +41,12 @@ struct ImageResource {
 struct VideoResource {
     key: MessageKey,
     file_md5: String,
+}
+
+#[derive(Debug, Clone)]
+struct FileResource {
+    key: MessageKey,
+    file_name: String,
 }
 
 pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
@@ -179,7 +185,12 @@ pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<Extra
     let video_root = resolved.source_dir.join("msg").join("video");
     let resources = query_video_resources(&resource_db)?;
     let message_dbs = message_db_paths(&message_dir)?;
-    let (video_messages, scanned_rows) = query_message_keys_for_type(&message_dbs, &resources, 43)?;
+    let resource_keys = resources
+        .iter()
+        .map(|resource| resource.key.clone())
+        .collect::<Vec<_>>();
+    let (video_messages, scanned_rows) =
+        query_message_keys_for_type(&message_dbs, &resource_keys, 43)?;
 
     let run_id = format!("{}", now_epoch_ms());
     let mut summary = ExtractSummary::new(
@@ -231,6 +242,113 @@ pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<Extra
                     )
                 }
                 None => record_missing_video(
+                    &resource,
+                    &resolved.source_dir,
+                    &run_id,
+                    conn.as_ref(),
+                    manifest.as_mut(),
+                    &message_source,
+                ),
+            };
+        apply_result(&mut summary, result)?;
+    }
+
+    if let Some(writer) = manifest.as_mut() {
+        writer.flush()?;
+    }
+    summary.finish_unsupported_explanation();
+
+    Ok(summary)
+}
+
+pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
+    let resolved = ArchiveConfig {
+        source_dir: config.account_dir,
+        archive_dir: config.archive_dir,
+        dry_run: config.dry_run,
+        dat_options: config.dat_options,
+        explain_unsupported: config.explain_unsupported,
+    }
+    .resolve()?;
+
+    let message_dir = resolved.source_dir.join("db_storage").join("message");
+    if !message_dir.is_dir() {
+        return Err(ArchiverError::Other(format!(
+            "message directory does not exist: {}",
+            message_dir.display()
+        )));
+    }
+
+    let resource_db = message_dir.join("message_resource.db");
+    if !resource_db.is_file() {
+        return Err(ArchiverError::Other(format!(
+            "message_resource.db does not exist: {}",
+            resource_db.display()
+        )));
+    }
+
+    let file_root = resolved.source_dir.join("msg").join("file");
+    let resources = query_file_resources(&resource_db)?;
+    let message_dbs = message_db_paths(&message_dir)?;
+    let resource_keys = resources
+        .iter()
+        .map(|resource| resource.key.clone())
+        .collect::<Vec<_>>();
+    let (file_messages, scanned_rows) =
+        query_message_keys_for_type(&message_dbs, &resource_keys, 49)?;
+
+    let run_id = format!("{}", now_epoch_ms());
+    let mut summary = ExtractSummary::new(
+        run_id.clone(),
+        resolved.source_dir.clone(),
+        resolved.archive_dir.clone(),
+        resolved.dry_run,
+    );
+    summary.scanned_files = scanned_rows;
+    if resolved.explain_unsupported {
+        summary.enable_unsupported_explanation();
+    }
+
+    let mut conn = None;
+    let mut manifest = None;
+    if !resolved.dry_run {
+        create_archive_dirs(&resolved.archive_dir)?;
+        let opened = open_index(&resolved.archive_dir)?;
+        summary.index_path = Some(index_path(&resolved.archive_dir));
+        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, "extract-db-files")?;
+        summary.manifest_path = Some(writer.path().to_path_buf());
+        conn = Some(opened);
+        manifest = Some(writer);
+    }
+
+    for resource in resources {
+        if !file_messages.contains(&resource.key) {
+            continue;
+        }
+
+        summary.candidates += 1;
+        let message_source = message_source_from_key(&resource.key);
+        let result =
+            match find_file_attachment(&file_root, &resource.file_name, resource.key.create_time) {
+                Some(file_path) => {
+                    let Some(extension) = direct_file_extension(&file_path) else {
+                        continue;
+                    };
+                    process_direct_media_with_message_source(
+                        &file_path,
+                        &extension,
+                        &resolved.source_dir,
+                        &resolved.archive_dir,
+                        &run_id,
+                        resolved.dry_run,
+                        conn.as_ref(),
+                        manifest.as_mut(),
+                        "message_db_file",
+                        "file",
+                        Some(&message_source),
+                    )
+                }
+                None => record_missing_file(
                     &resource,
                     &resolved.source_dir,
                     &run_id,
@@ -383,12 +501,12 @@ fn query_image_message_keys(
 
 fn query_message_keys_for_type(
     message_dbs: &[PathBuf],
-    resources: &[VideoResource],
+    resource_keys: &[MessageKey],
     local_type: i64,
 ) -> Result<(BTreeSet<MessageKey>, u64)> {
-    let talkers = resources
+    let talkers = resource_keys
         .iter()
-        .map(|resource| resource.key.talker.as_str())
+        .map(|key| key.talker.as_str())
         .collect::<BTreeSet<_>>();
     let mut keys = BTreeSet::new();
     let mut scanned_rows = 0u64;
@@ -546,6 +664,80 @@ fn query_video_resources(resource_db: &Path) -> Result<Vec<VideoResource>> {
     Ok(resources)
 }
 
+fn query_file_resources(resource_db: &Path) -> Result<Vec<FileResource>> {
+    let conn = open_readonly_db(resource_db)?;
+    let has_detail_packed_info = table_has_column(&conn, "MessageResourceDetail", "packed_info")?;
+    let sql = if has_detail_packed_info {
+        r#"
+        SELECT c.user_name,
+               i.message_local_id,
+               i.message_create_time,
+               i.message_local_type,
+               i.packed_info,
+               d.packed_info
+        FROM MessageResourceInfo i
+        JOIN ChatName2Id c ON c.rowid = i.chat_id
+        LEFT JOIN MessageResourceDetail d ON d.message_id = i.message_id
+        WHERE c.user_name IS NOT NULL
+          AND (i.message_local_type = 49 OR i.message_local_type % 4294967296 = 49)
+        ORDER BY c.user_name, i.message_create_time, i.message_local_id, i.rowid
+        "#
+    } else {
+        r#"
+        SELECT c.user_name,
+               i.message_local_id,
+               i.message_create_time,
+               i.message_local_type,
+               i.packed_info,
+               NULL
+        FROM MessageResourceInfo i
+        JOIN ChatName2Id c ON c.rowid = i.chat_id
+        WHERE c.user_name IS NOT NULL
+          AND (i.message_local_type = 49 OR i.message_local_type % 4294967296 = 49)
+        ORDER BY c.user_name, i.message_create_time, i.message_local_id, i.rowid
+        "#
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| {
+        let talker: String = row.get(0)?;
+        let local_id: i64 = row.get(1)?;
+        let create_time: i64 = row.get(2)?;
+        let message_blob: Option<Vec<u8>> = row.get(4)?;
+        let detail_blob: Option<Vec<u8>> = row.get(5)?;
+        let strings = message_blob
+            .as_deref()
+            .into_iter()
+            .chain(detail_blob.as_deref())
+            .flat_map(extract_printable_strings)
+            .collect::<Vec<_>>();
+        let file_name = strings
+            .into_iter()
+            .find(|value| plausible_file_attachment_name(value));
+
+        Ok(file_name.map(|file_name| FileResource {
+            key: MessageKey {
+                talker,
+                local_id,
+                create_time,
+            },
+            file_name,
+        }))
+    })?;
+
+    let mut seen = HashSet::<(MessageKey, String)>::new();
+    let mut resources = Vec::new();
+    for row in rows {
+        let Some(resource) = row? else {
+            continue;
+        };
+        if seen.insert((resource.key.clone(), resource.file_name.clone())) {
+            resources.push(resource);
+        }
+    }
+    Ok(resources)
+}
+
 fn record_missing_dat(
     resource: &ImageResource,
     account_dir: &Path,
@@ -630,6 +822,48 @@ fn record_missing_video(
     Ok(ScanOutcome::new(ScanAction::Failed))
 }
 
+fn record_missing_file(
+    resource: &FileResource,
+    account_dir: &Path,
+    run_id: &str,
+    conn: Option<&Connection>,
+    manifest: Option<&mut ManifestWriter>,
+    message_source: &MessageSource,
+) -> Result<ScanOutcome> {
+    let source_relative_path = format!(
+        "db_storage/message:talker={}:local_id={}:create_time={}:file_name={}",
+        resource.key.talker, resource.key.local_id, resource.key.create_time, resource.file_name
+    );
+    let source_path = account_dir
+        .join(&source_relative_path)
+        .to_string_lossy()
+        .to_string();
+    let event = ManifestEvent {
+        event: "media_item".to_string(),
+        run_id: run_id.to_string(),
+        timestamp_epoch_ms: now_epoch_ms(),
+        source_path,
+        source_relative_path,
+        source_kind: "message_db_file".to_string(),
+        media_type: "file".to_string(),
+        message_talker: message_source.talker.clone(),
+        message_sender: message_source.sender.clone(),
+        message_local_id: message_source.local_id,
+        message_create_time: message_source.create_time,
+        decoder: None,
+        action: ScanAction::Failed,
+        archive_path: None,
+        sha256: None,
+        size_bytes: None,
+        extension: direct_file_extension(Path::new(&resource.file_name)),
+        decrypt_status: "source_missing".to_string(),
+        verify_status: "failed".to_string(),
+        error: Some("local_file_not_found".to_string()),
+    };
+    persist(conn, manifest, &event)?;
+    Ok(ScanOutcome::new(ScanAction::Failed))
+}
+
 fn find_video_file(video_root: &Path, file_md5: &str, create_time: i64) -> Option<PathBuf> {
     for month in month_candidates(create_time) {
         let video_dir = video_root.join(month);
@@ -683,6 +917,35 @@ fn pick_video_file(video_dir: &Path, file_md5: &str) -> Option<PathBuf> {
         .collect::<Vec<_>>();
     candidates.sort();
     candidates.into_iter().next()
+}
+
+fn find_file_attachment(file_root: &Path, file_name: &str, create_time: i64) -> Option<PathBuf> {
+    if !safe_leaf_name(file_name) {
+        return None;
+    }
+
+    for month in month_candidates(create_time) {
+        let path = file_root.join(month).join(file_name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let mut month_dirs = fs::read_dir(file_root)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    month_dirs.sort();
+
+    for month_dir in month_dirs {
+        let path = month_dir.join(file_name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn message_db_paths(message_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -925,6 +1188,65 @@ fn extract_md5_from_packed_info(blob: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_printable_strings(blob: &[u8]) -> Vec<String> {
+    let mut strings = Vec::new();
+    let mut start = None;
+    for (index, byte) in blob.iter().copied().enumerate() {
+        let readable = byte == b' ' || byte >= 0x21 && byte != 0x7f;
+        match (start, readable) {
+            (None, true) => start = Some(index),
+            (Some(begin), false) => {
+                push_printable_string(blob, begin, index, &mut strings);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        push_printable_string(blob, begin, blob.len(), &mut strings);
+    }
+
+    let mut seen = HashSet::new();
+    strings
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+fn push_printable_string(blob: &[u8], begin: usize, end: usize, strings: &mut Vec<String>) {
+    if end.saturating_sub(begin) < 2 || end.saturating_sub(begin) > 512 {
+        return;
+    }
+    let Ok(value) = std::str::from_utf8(&blob[begin..end]) else {
+        return;
+    };
+    let value = value.trim();
+    if !value.is_empty() {
+        strings.push(value.to_string());
+    }
+}
+
+fn safe_leaf_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+    if name.contains('\0') || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    Path::new(name)
+        .file_name()
+        .and_then(|leaf| leaf.to_str())
+        .map(|leaf| leaf == name)
+        .unwrap_or(false)
+}
+
+fn plausible_file_attachment_name(name: &str) -> bool {
+    if !safe_leaf_name(name) || is_md5_hex(name) {
+        return false;
+    }
+    direct_file_extension(Path::new(name)).is_some()
 }
 
 fn is_md5_hex(value: &str) -> bool {
@@ -1219,6 +1541,144 @@ mod tests {
     }
 
     #[test]
+    fn extracts_message_db_files_with_message_source_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let archive = tmp.path().join("archive");
+        let talker = "room@example";
+        let local_id = 31;
+        let create_time = 1_779_472_800;
+        let file_name = "项目报告.pdf";
+        create_file_fixture_account(&account, talker, local_id, create_time, file_name, true);
+
+        let file_path = account
+            .join("msg")
+            .join("file")
+            .join("2026-05")
+            .join(file_name);
+        let db_path = account
+            .join("db_storage")
+            .join("message")
+            .join("message_0.db");
+        let file_hash_before = sha256_file(&file_path).unwrap();
+        let db_hash_before = sha256_file(&db_path).unwrap();
+
+        let summary = extract_message_db_files(MessageDbExtractConfig {
+            account_dir: account.clone(),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+        assert_eq!(sha256_file(&file_path).unwrap(), file_hash_before);
+        assert_eq!(sha256_file(&db_path).unwrap(), db_hash_before);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (
+            source_kind,
+            media_type,
+            extension,
+            message_talker,
+            message_local_id,
+            message_create_time,
+        ): (String, String, String, String, i64, i64) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, media_type, extension, message_talker, message_local_id, message_create_time
+                FROM media_items
+                WHERE source_kind = 'message_db_file'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(source_kind, "message_db_file");
+        assert_eq!(media_type, "file");
+        assert_eq!(extension, "pdf");
+        assert_eq!(message_talker, talker);
+        assert_eq!(message_local_id, local_id);
+        assert_eq!(message_create_time, create_time);
+
+        let verify = verify_archive(&archive).unwrap();
+        assert_eq!(verify.checked, 1);
+        assert_eq!(verify.ok, 1);
+    }
+
+    #[test]
+    fn missing_local_file_is_recorded_as_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = tmp.path().join("wxid_example");
+        let archive = tmp.path().join("archive");
+        create_file_fixture_account(
+            &account,
+            "wxid_friend",
+            32,
+            1_779_472_800,
+            "missing.docx",
+            false,
+        );
+
+        let summary = extract_message_db_files(MessageDbExtractConfig {
+            account_dir: account,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.failed, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_kind, error, extension, message_local_id): (String, String, String, i64) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, error, extension, message_local_id
+                FROM media_items
+                WHERE verify_status = 'failed'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(source_kind, "message_db_file");
+        assert_eq!(error, "local_file_not_found");
+        assert_eq!(extension, "docx");
+        assert_eq!(message_local_id, 32);
+    }
+
+    #[test]
+    fn file_attachment_names_must_be_safe_leaf_names() {
+        assert!(plausible_file_attachment_name("report.pdf"));
+        assert!(plausible_file_attachment_name("2026 final.xlsx"));
+        assert!(plausible_file_attachment_name("项目报告.pdf"));
+        assert!(!plausible_file_attachment_name(""));
+        assert!(!plausible_file_attachment_name("../report.pdf"));
+        assert!(!plausible_file_attachment_name("a/report.pdf"));
+        assert!(!plausible_file_attachment_name("a\\report.pdf"));
+        assert!(!plausible_file_attachment_name("no_extension"));
+        assert!(!plausible_file_attachment_name(
+            "00112233445566778899aabbccddeeff"
+        ));
+    }
+
+    #[test]
     fn extracts_md5_from_marker_and_fallback() {
         let mut marker_blob = vec![0x12, 0x22, 0x0a, 0x20];
         marker_blob.extend_from_slice(b"DEADBEEFCAFEBABE1234567890ABCDEF");
@@ -1486,5 +1946,108 @@ mod tests {
             params![20, 2, packed_md5(file_md5)],
         )
         .unwrap();
+    }
+
+    fn create_file_fixture_account(
+        account: &Path,
+        talker: &str,
+        local_id: i64,
+        create_time: i64,
+        file_name: &str,
+        create_file: bool,
+    ) {
+        let message_dir = account.join("db_storage").join("message");
+        fs::create_dir_all(&message_dir).unwrap();
+        create_message_db_with_type(
+            &message_dir.join("message_0.db"),
+            talker,
+            local_id,
+            create_time,
+            49,
+        );
+        create_file_resource_db(
+            &message_dir.join("message_resource.db"),
+            talker,
+            local_id,
+            create_time,
+            file_name,
+        );
+
+        let file_dir = account.join("msg").join("file").join("2026-05");
+        fs::create_dir_all(&file_dir).unwrap();
+        if create_file {
+            fs::write(file_dir.join(file_name), b"synthetic-file-attachment").unwrap();
+        }
+    }
+
+    fn create_file_resource_db(
+        path: &Path,
+        talker: &str,
+        local_id: i64,
+        create_time: i64,
+        file_name: &str,
+    ) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE ChatName2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE MessageResourceInfo (
+                message_id INTEGER,
+                chat_id INTEGER,
+                message_local_id INTEGER,
+                message_create_time INTEGER,
+                message_local_type INTEGER,
+                packed_info BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE MessageResourceDetail (
+                message_id INTEGER,
+                packed_info BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ChatName2Id(rowid, user_name) VALUES (?1, ?2)",
+            params![1, talker],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO MessageResourceInfo (
+                message_id,
+                chat_id,
+                message_local_id,
+                message_create_time,
+                message_local_type,
+                packed_info
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                30,
+                1,
+                local_id,
+                create_time,
+                (1_i64 << 32) + 49,
+                packed_file_name(file_name)
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO MessageResourceDetail(message_id, packed_info) VALUES (?1, ?2)",
+            params![30, packed_file_name(file_name)],
+        )
+        .unwrap();
+    }
+
+    fn packed_file_name(file_name: &str) -> Vec<u8> {
+        let mut blob = b"prefix\0".to_vec();
+        blob.extend_from_slice(b"00112233445566778899aabbccddeeff");
+        blob.push(0);
+        blob.extend_from_slice(file_name.as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(b"suffix");
+        blob
     }
 }
