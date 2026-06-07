@@ -21,7 +21,7 @@ pub use message_db::{
     extract_message_db_files, extract_message_db_images, extract_message_db_videos,
     inspect_message_db, MessageDbDirectoryStatus, MessageDbExtractConfig, MessageDbFileInspection,
     MessageDbFileRole, MessageDbFileStatus, MessageDbInspectConfig, MessageDbInspection,
-    MessageDbInspectionStatus,
+    MessageDbInspectionStatus, MessageDbNextAction,
 };
 pub use scanner::{extract_files, extract_images, extract_videos, extract_voices};
 pub use status::{archive_status, ArchiveStatus};

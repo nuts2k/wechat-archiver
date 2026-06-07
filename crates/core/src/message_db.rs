@@ -44,6 +44,8 @@ pub struct MessageDbInspection {
     pub message_dbs: Vec<MessageDbFileInspection>,
     pub total_message_dbs: usize,
     pub readable_message_dbs: usize,
+    pub message: String,
+    pub next_action: MessageDbNextAction,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -54,6 +56,14 @@ pub enum MessageDbInspectionStatus {
     EncryptedOrNotSqlite,
     Unsupported,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDbNextAction {
+    RunExtractDb,
+    ProvideDecryptedMessageDbDir,
+    CheckMessageDbPath,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -520,6 +530,8 @@ fn inspect_message_db_dir(
         .filter(|db| db.status == MessageDbFileStatus::ReadableSqlite)
         .count();
     let status = summarize_inspection_status(directory_status, &resource_db, &message_dbs);
+    let message = inspection_message(status);
+    let next_action = inspection_next_action(status);
 
     MessageDbInspection {
         account_dir,
@@ -531,6 +543,44 @@ fn inspect_message_db_dir(
         message_dbs,
         total_message_dbs,
         readable_message_dbs,
+        message,
+        next_action,
+    }
+}
+
+fn inspection_message(status: MessageDbInspectionStatus) -> String {
+    match status {
+        MessageDbInspectionStatus::Ready => {
+            "消息库是当前可读的普通 SQLite，可继续运行 extract-db-* 或先 dry-run。"
+                .to_string()
+        }
+        MessageDbInspectionStatus::Missing => {
+            "消息库目录或必要数据库文件缺失，请检查 --account 或 --message-db-dir。"
+                .to_string()
+        }
+        MessageDbInspectionStatus::EncryptedOrNotSqlite => {
+            "消息库不是当前可读的普通 SQLite，通常是微信 4.x SQLCipher/WCDB 加密库。本工具不读取进程内存、不提权、不重签微信；请先通过独立流程准备已解密副本，再用 --message-db-dir 指向该目录。"
+                .to_string()
+        }
+        MessageDbInspectionStatus::Unsupported => {
+            "数据库可被 SQLite 打开，但缺少当前抽取命令需要的微信消息库基础表结构。"
+                .to_string()
+        }
+        MessageDbInspectionStatus::Error => {
+            "消息库诊断遇到未分类错误，请查看各数据库条目的 error 字段。".to_string()
+        }
+    }
+}
+
+fn inspection_next_action(status: MessageDbInspectionStatus) -> MessageDbNextAction {
+    match status {
+        MessageDbInspectionStatus::Ready => MessageDbNextAction::RunExtractDb,
+        MessageDbInspectionStatus::Missing | MessageDbInspectionStatus::Unsupported => {
+            MessageDbNextAction::CheckMessageDbPath
+        }
+        MessageDbInspectionStatus::EncryptedOrNotSqlite | MessageDbInspectionStatus::Error => {
+            MessageDbNextAction::ProvideDecryptedMessageDbDir
+        }
     }
 }
 
@@ -1990,6 +2040,8 @@ mod tests {
 
         assert_eq!(inspection.account_dir, account.canonicalize().unwrap());
         assert_eq!(inspection.status, MessageDbInspectionStatus::Ready);
+        assert_eq!(inspection.next_action, MessageDbNextAction::RunExtractDb);
+        assert!(inspection.message.contains("extract-db"));
         assert_eq!(inspection.directory_status, MessageDbDirectoryStatus::Ready);
         assert!(!inspection.message_db_dir_overridden);
         assert_eq!(
@@ -2024,6 +2076,11 @@ mod tests {
             inspection.status,
             MessageDbInspectionStatus::EncryptedOrNotSqlite
         );
+        assert_eq!(
+            inspection.next_action,
+            MessageDbNextAction::ProvideDecryptedMessageDbDir
+        );
+        assert!(inspection.message.contains("--message-db-dir"));
         assert_eq!(
             inspection.resource_db.status,
             MessageDbFileStatus::EncryptedOrNotSqlite

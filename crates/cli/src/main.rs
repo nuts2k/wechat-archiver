@@ -648,6 +648,8 @@ fn print_message_db_inspection(inspection: &MessageDbInspection, json: bool) -> 
     );
     println!("status: {:?}", inspection.status);
     println!("directory_status: {:?}", inspection.directory_status);
+    println!("message: {}", inspection.message);
+    println!("next_action: {:?}", inspection.next_action);
     print_message_db_file("resource_db", &inspection.resource_db);
     println!("message_dbs: {}", inspection.total_message_dbs);
     println!("readable_message_dbs: {}", inspection.readable_message_dbs);

@@ -81,6 +81,10 @@ cargo run -p wechat-archiver -- inspect-db \
 
 `inspect-db` 不写归档目录，也不写微信源目录。它只检查 `message_resource.db` 和 `message_*.db` 是否存在、是否有 SQLite header、是否能以只读 SQLite 打开，以及是否包含当前抽取命令需要的基础表结构。
 
+如果输出 `status=encrypted_or_not_sqlite`，通常表示微信 4.x SQLCipher/WCDB 加密库。本项目不会读取微信进程内存、不会提权、不会重签微信，也不会内置密钥提取流程；下一步应由用户通过独立可信流程准备已解密消息库副本，然后先用 `inspect-db --message-db-dir` 校验，再运行 `extract-db-* --message-db-dir`。
+
+消息库解密边界和已解密副本工作流见 [docs/message-db-decryption-boundary.md](docs/message-db-decryption-boundary.md)。
+
 只读扫描，不写入归档目录：
 
 ```bash
@@ -274,4 +278,4 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-路线图见 [ROADMAP.md](ROADMAP.md)，原始规划见 [wechat-media-archive-plan.md](wechat-media-archive-plan.md)，代理开发约束见 [AGENTS.md](AGENTS.md)。
+路线图见 [ROADMAP.md](ROADMAP.md)，消息库解密边界见 [docs/message-db-decryption-boundary.md](docs/message-db-decryption-boundary.md)，原始规划见 [wechat-media-archive-plan.md](wechat-media-archive-plan.md)，代理开发约束见 [AGENTS.md](AGENTS.md)。
