@@ -21,6 +21,8 @@ pub struct ManifestEvent {
     pub source_relative_path: String,
     pub source_kind: String,
     pub media_type: String,
+    pub original_filename: Option<String>,
+    pub mime_type: Option<String>,
     pub message_talker: Option<String>,
     pub message_sender: Option<String>,
     pub message_local_id: Option<i64>,

@@ -64,6 +64,10 @@ mod tests {
                 .to_string(),
             source_kind: "direct_image".to_string(),
             media_type: "image".to_string(),
+            original_filename: Path::new(source_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string()),
+            mime_type: Some("image/jpeg".to_string()),
             message_talker: Some("chat_a".to_string()),
             message_sender: None,
             message_local_id: Some(42),
@@ -115,6 +119,11 @@ mod tests {
         assert_eq!(report.records[0].source_path, "/tmp/source/a.jpg");
         assert_eq!(report.records[1].source_path, "/tmp/source/b.jpg");
         assert_eq!(report.records[2].source_path, "/tmp/source/c.dat");
+        assert_eq!(
+            report.records[0].original_filename.as_deref(),
+            Some("a.jpg")
+        );
+        assert_eq!(report.records[0].mime_type.as_deref(), Some("image/jpeg"));
         assert_eq!(report.records[0].message_talker.as_deref(), Some("chat_a"));
         assert_eq!(report.records[1].error.as_deref(), Some("copy_failed"));
     }

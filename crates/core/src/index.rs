@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OpenFlags};
 
 use crate::error::{ArchiverError, Result};
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 type MigrationFn = fn(&Connection) -> Result<()>;
 
@@ -30,6 +30,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_message_metadata_columns",
         apply: migration_3_add_message_metadata_columns,
     },
+    Migration {
+        version: 4,
+        name: "add_file_metadata_columns",
+        apply: migration_4_add_file_metadata_columns,
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -38,6 +43,8 @@ pub(crate) struct MediaRecord {
     pub source_relative_path: String,
     pub source_kind: String,
     pub media_type: String,
+    pub original_filename: Option<String>,
+    pub mime_type: Option<String>,
     pub message_talker: Option<String>,
     pub message_sender: Option<String>,
     pub message_local_id: Option<i64>,
@@ -226,6 +233,12 @@ fn migration_3_add_message_metadata_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migration_4_add_file_metadata_columns(conn: &Connection) -> Result<()> {
+    ensure_column(conn, "original_filename", "TEXT")?;
+    ensure_column(conn, "mime_type", "TEXT")?;
+    Ok(())
+}
+
 fn media_item_columns(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("PRAGMA table_info(media_items)")?;
     let columns = stmt
@@ -254,6 +267,8 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             source_relative_path,
             source_kind,
             media_type,
+            original_filename,
+            mime_type,
             message_talker,
             message_sender,
             message_local_id,
@@ -269,7 +284,7 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             created_at_ms,
             updated_at_ms
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)
         ON CONFLICT(source_path)
         DO UPDATE SET
             archive_path = excluded.archive_path,
@@ -278,6 +293,8 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             source_relative_path = excluded.source_relative_path,
             source_kind = excluded.source_kind,
             media_type = excluded.media_type,
+            original_filename = excluded.original_filename,
+            mime_type = excluded.mime_type,
             message_talker = excluded.message_talker,
             message_sender = excluded.message_sender,
             message_local_id = excluded.message_local_id,
@@ -294,6 +311,8 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             record.source_relative_path,
             record.source_kind,
             record.media_type,
+            record.original_filename,
+            record.mime_type,
             record.message_talker,
             record.message_sender,
             record.message_local_id,
@@ -333,7 +352,10 @@ mod tests {
     }
 
     fn assert_current_migrations(conn: &Connection) {
-        assert_eq!(migration_versions(conn), vec![1, 2, CURRENT_SCHEMA_VERSION]);
+        assert_eq!(
+            migration_versions(conn),
+            vec![1, 2, 3, CURRENT_SCHEMA_VERSION]
+        );
         assert_eq!(
             migration_count(conn),
             CURRENT_SCHEMA_VERSION,
@@ -366,6 +388,8 @@ mod tests {
                 "source_relative_path",
                 "source_kind",
                 "media_type",
+                "original_filename",
+                "mime_type",
                 "decoder",
                 "message_talker",
                 "message_sender",
@@ -380,7 +404,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(latest_migration_name, "add_message_metadata_columns");
+        assert_eq!(latest_migration_name, "add_file_metadata_columns");
     }
 
     #[test]
@@ -445,6 +469,8 @@ mod tests {
                 "message_sender",
                 "message_local_id",
                 "message_create_time",
+                "original_filename",
+                "mime_type",
             ],
         );
 

@@ -230,6 +230,12 @@ mod tests {
                 .to_string(),
             source_kind: "direct_file".to_string(),
             media_type: "file".to_string(),
+            original_filename: source_path
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .map(str::to_string),
+            mime_type: None,
             message_talker: None,
             message_sender: None,
             message_local_id: None,

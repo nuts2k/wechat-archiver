@@ -164,8 +164,9 @@ wechat-archive/
 - `objects` 按内容 hash 存储真实文件。
 - `index.sqlite` 保存当前索引状态。
 - `manifests/*.jsonl` 保存每次运行审计记录。
-- `index.sqlite` 使用 `schema_migrations` 记录已应用的 schema 版本，当前会显式迁移基础表、`decoder` 字段和消息来源字段。
+- `index.sqlite` 使用 `schema_migrations` 记录已应用的 schema 版本，当前会显式迁移基础表、`decoder` 字段、消息来源字段和文件元数据字段。
 - `index.sqlite` 和 manifest 独立记录 `source_kind` 与 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。
+- `index.sqlite` 和 manifest 支持 `original_filename` 与 `mime_type`；MIME 当前基于归档扩展名保守推断，不做内容嗅探。
 - `index.sqlite` 和 manifest 支持可空消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；当前消息库图片、视频、文件附件和语音归档会写入 `talker/local_id/create_time`，`sender` 暂不猜测。
 - 支持 `status` 查看索引统计，并按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组。
 - 支持 `lookup` 只读按 `sha256` 反查所有来源，或按 `source_path` 查询单个源文件归档状态。
@@ -176,7 +177,7 @@ wechat-archive/
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder` 和消息来源记录、消息库诊断、消息库图片/视频/文件附件/语音归档、外部已解密消息库目录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
+- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder`、原始文件名、MIME 和消息来源记录、消息库诊断、消息库图片/视频/文件附件/语音归档、外部已解密消息库目录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
 - 已通过：
 
 ```bash
@@ -282,10 +283,11 @@ wechat-archiver extract --type voice
 - 增强 `verify`，覆盖归档对象完整性和索引引用完整性。
 - 支持 CSV/JSON 索引报告导出。
 - 支持 `views/` 生成可浏览派生视图，默认 dry-run，显式 `--write` 才写入。
+- 支持 `original_filename` 和 `mime_type` 字段，并在 `lookup`、JSON/CSV `report`、SQLite 索引和 manifest 中输出。
 
 计划：
 
-- 丰富 `media_items` 字段：消息时间、会话 ID、发送人、媒体类型、原始文件名、MIME、宽高、时长。
+- 丰富 `media_items` 字段：会话 ID、发送人、宽高、时长。
 - 支持增量扫描状态，减少重复遍历。
 
 验收标准：
@@ -366,7 +368,7 @@ wechat-archiver extract --type voice
 
 建议继续推进 P2 索引增强：
 
-- 优先继续丰富 `media_items` 字段，例如原始文件名、MIME、宽高、时长和发送人。
+- 优先继续丰富 `media_items` 字段，例如宽高、时长、发送人和更完整的会话上下文。
 - 然后补增量扫描状态，减少重复遍历。
 - 语音后续增强重点是时长、发送人和可选转码/转写，而不是继续扩大直接文件扫描范围。
 - 所有路线都应继续保持 dry-run、结构化错误、manifest/index 和安全边界一致。

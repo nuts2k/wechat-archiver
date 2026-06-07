@@ -1055,6 +1055,11 @@ fn print_index_lookup(lookup: &IndexLookup, json: bool) -> Result<()> {
         println!("  source_relative_path: {}", record.source_relative_path);
         println!("  source_kind: {}", record.source_kind);
         println!("  media_type: {}", record.media_type);
+        println!(
+            "  original_filename: {}",
+            optional_string(&record.original_filename)
+        );
+        println!("  mime_type: {}", optional_string(&record.mime_type));
         println!("  archive_path: {}", optional_string(&record.archive_path));
         println!("  sha256: {}", optional_string(&record.sha256));
         println!("  size_bytes: {}", optional_u64(record.size_bytes));
@@ -1102,6 +1107,8 @@ fn print_archive_report_csv(report: &ArchiveReport) {
         "source_relative_path",
         "source_kind",
         "media_type",
+        "original_filename",
+        "mime_type",
         "message_talker",
         "message_sender",
         "message_local_id",
@@ -1130,6 +1137,8 @@ fn print_archive_report_csv(report: &ArchiveReport) {
             &record.source_relative_path,
             &record.source_kind,
             &record.media_type,
+            optional_string_csv(&record.original_filename),
+            optional_string_csv(&record.mime_type),
             optional_string_csv(&record.message_talker),
             optional_string_csv(&record.message_sender),
             &message_local_id,

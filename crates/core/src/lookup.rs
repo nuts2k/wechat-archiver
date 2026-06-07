@@ -29,6 +29,8 @@ pub struct IndexLookupRecord {
     pub source_relative_path: String,
     pub source_kind: String,
     pub media_type: String,
+    pub original_filename: Option<String>,
+    pub mime_type: Option<String>,
     pub message_talker: Option<String>,
     pub message_sender: Option<String>,
     pub message_local_id: Option<i64>,
@@ -138,6 +140,8 @@ fn query_records_with_params(
             source_relative_path,
             source_kind,
             media_type,
+            {original_filename},
+            {mime_type},
             {message_talker},
             {message_sender},
             {message_local_id},
@@ -156,6 +160,8 @@ fn query_records_with_params(
         WHERE {predicate}
         ORDER BY {order_by}
         "#,
+        original_filename = column_or_null(&columns, "original_filename", "TEXT"),
+        mime_type = column_or_null(&columns, "mime_type", "TEXT"),
         message_talker = column_or_null(&columns, "message_talker", "TEXT"),
         message_sender = column_or_null(&columns, "message_sender", "TEXT"),
         message_local_id = column_or_null(&columns, "message_local_id", "INTEGER"),
@@ -187,7 +193,7 @@ fn column_or_null(columns: &[String], column_name: &str, column_type: &str) -> S
 
 fn row_to_record(row: &Row<'_>) -> rusqlite::Result<IndexLookupRecord> {
     let size_bytes = row
-        .get::<_, Option<i64>>(12)?
+        .get::<_, Option<i64>>(14)?
         .map(|value| value.max(0) as u64);
     Ok(IndexLookupRecord {
         id: row.get(0)?,
@@ -195,20 +201,22 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<IndexLookupRecord> {
         source_relative_path: row.get(2)?,
         source_kind: row.get(3)?,
         media_type: row.get(4)?,
-        message_talker: row.get(5)?,
-        message_sender: row.get(6)?,
-        message_local_id: row.get(7)?,
-        message_create_time: row.get(8)?,
-        decoder: row.get(9)?,
-        archive_path: row.get(10)?,
-        sha256: row.get(11)?,
+        original_filename: row.get(5)?,
+        mime_type: row.get(6)?,
+        message_talker: row.get(7)?,
+        message_sender: row.get(8)?,
+        message_local_id: row.get(9)?,
+        message_create_time: row.get(10)?,
+        decoder: row.get(11)?,
+        archive_path: row.get(12)?,
+        sha256: row.get(13)?,
         size_bytes,
-        extension: row.get(13)?,
-        decrypt_status: row.get(14)?,
-        verify_status: row.get(15)?,
-        error: row.get(16)?,
-        created_at_ms: row.get(17)?,
-        updated_at_ms: row.get(18)?,
+        extension: row.get(15)?,
+        decrypt_status: row.get(16)?,
+        verify_status: row.get(17)?,
+        error: row.get(18)?,
+        created_at_ms: row.get(19)?,
+        updated_at_ms: row.get(20)?,
     })
 }
 
@@ -227,6 +235,10 @@ mod tests {
                 .to_string(),
             source_kind: "direct_image".to_string(),
             media_type: "image".to_string(),
+            original_filename: Path::new(source_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string()),
+            mime_type: Some("image/jpeg".to_string()),
             message_talker: Some("chat_a".to_string()),
             message_sender: None,
             message_local_id: Some(42),
@@ -258,6 +270,11 @@ mod tests {
         assert_eq!(lookup.matched_records, 2);
         assert_eq!(lookup.records[0].source_path, "/tmp/source/a.jpg");
         assert_eq!(lookup.records[1].source_path, "/tmp/source/b.jpg");
+        assert_eq!(
+            lookup.records[0].original_filename.as_deref(),
+            Some("a.jpg")
+        );
+        assert_eq!(lookup.records[0].mime_type.as_deref(), Some("image/jpeg"));
         assert_eq!(lookup.records[0].message_talker.as_deref(), Some("chat_a"));
         assert_eq!(lookup.records[0].size_bytes, Some(123));
     }

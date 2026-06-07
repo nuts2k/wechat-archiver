@@ -12,7 +12,7 @@ use crate::error::{ArchiverError, IoContext, Result};
 use crate::hash::sha256_bytes;
 use crate::index::{index_path, open_index};
 use crate::manifest::ManifestWriter;
-use crate::media::{direct_file_extension, direct_video_extension};
+use crate::media::{direct_file_extension, direct_video_extension, mime_type_for_extension};
 use crate::scanner::{
     apply_result, persist, process_dat_image_with_message_source,
     process_direct_media_with_message_source, MessageSource, ScanOutcome,
@@ -1520,6 +1520,8 @@ fn record_missing_dat(
         source_relative_path,
         source_kind: "message_db_image".to_string(),
         media_type: "image".to_string(),
+        original_filename: Some(format!("{}.dat", resource.file_md5)),
+        mime_type: None,
         message_talker: message_source.talker.clone(),
         message_sender: message_source.sender.clone(),
         message_local_id: message_source.local_id,
@@ -1562,6 +1564,8 @@ fn record_missing_video(
         source_relative_path,
         source_kind: "message_db_video".to_string(),
         media_type: "video".to_string(),
+        original_filename: Some(format!("{}.mp4", resource.file_md5)),
+        mime_type: Some("video/mp4".to_string()),
         message_talker: message_source.talker.clone(),
         message_sender: message_source.sender.clone(),
         message_local_id: message_source.local_id,
@@ -1596,6 +1600,7 @@ fn record_missing_file(
         .join(&source_relative_path)
         .to_string_lossy()
         .to_string();
+    let extension = direct_file_extension(Path::new(&resource.file_name));
     let event = ManifestEvent {
         event: "media_item".to_string(),
         run_id: run_id.to_string(),
@@ -1604,6 +1609,11 @@ fn record_missing_file(
         source_relative_path,
         source_kind: "message_db_file".to_string(),
         media_type: "file".to_string(),
+        original_filename: Some(resource.file_name.clone()),
+        mime_type: extension
+            .as_deref()
+            .and_then(mime_type_for_extension)
+            .map(str::to_string),
         message_talker: message_source.talker.clone(),
         message_sender: message_source.sender.clone(),
         message_local_id: message_source.local_id,
@@ -1613,7 +1623,7 @@ fn record_missing_file(
         archive_path: None,
         sha256: None,
         size_bytes: None,
-        extension: direct_file_extension(Path::new(&resource.file_name)),
+        extension,
         decrypt_status: "source_missing".to_string(),
         verify_status: "failed".to_string(),
         error: Some("local_file_not_found".to_string()),
@@ -1646,6 +1656,8 @@ fn record_missing_voice(
         source_relative_path,
         source_kind: "message_db_voice".to_string(),
         media_type: "voice".to_string(),
+        original_filename: None,
+        mime_type: Some("audio/silk".to_string()),
         message_talker: message_source.talker.clone(),
         message_sender: message_source.sender.clone(),
         message_local_id: message_source.local_id,
@@ -1708,6 +1720,8 @@ fn process_voice_resource(
         source_relative_path,
         source_kind: "message_db_voice".to_string(),
         media_type: "voice".to_string(),
+        original_filename: None,
+        mime_type: mime_type_for_extension(&extension).map(str::to_string),
         message_talker: message_source.talker.clone(),
         message_sender: message_source.sender.clone(),
         message_local_id: message_source.local_id,
@@ -2227,26 +2241,44 @@ mod tests {
         assert_eq!(sha256_file(&db_path).unwrap(), db_hash_before);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (stored_talker, stored_sender, stored_local_id, stored_create_time): (
-            String,
-            Option<String>,
-            i64,
-            i64,
-        ) = conn
+        let (
+            stored_talker,
+            stored_sender,
+            stored_local_id,
+            stored_create_time,
+            original_filename,
+            mime_type,
+        ): (String, Option<String>, i64, i64, String, String) = conn
             .query_row(
                 r#"
-                SELECT message_talker, message_sender, message_local_id, message_create_time
+                SELECT message_talker,
+                       message_sender,
+                       message_local_id,
+                       message_create_time,
+                       original_filename,
+                       mime_type
                 FROM media_items
                 WHERE source_kind = 'message_db_image'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(stored_talker, talker);
         assert_eq!(stored_sender, None);
         assert_eq!(stored_local_id, local_id);
         assert_eq!(stored_create_time, create_time);
+        assert_eq!(original_filename, format!("{file_md5}.dat"));
+        assert_eq!(mime_type, "image/png");
 
         let manifest_path = summary.manifest_path.clone().unwrap();
         let manifest = fs::read_to_string(manifest_path).unwrap();
@@ -2259,6 +2291,11 @@ mod tests {
         assert_eq!(event.message_sender, None);
         assert_eq!(event.message_local_id, Some(local_id));
         assert_eq!(event.message_create_time, Some(create_time));
+        assert_eq!(
+            event.original_filename.as_deref(),
+            Some(format!("{file_md5}.dat").as_str())
+        );
+        assert_eq!(event.mime_type.as_deref(), Some("image/png"));
 
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
@@ -2328,20 +2365,40 @@ mod tests {
         assert_eq!(summary.failed, 1);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (message_talker, message_local_id, message_create_time): (String, i64, i64) = conn
+        let (message_talker, message_local_id, message_create_time, original_filename, mime_type): (
+            String,
+            i64,
+            i64,
+            String,
+            Option<String>,
+        ) = conn
             .query_row(
                 r#"
-                SELECT message_talker, message_local_id, message_create_time
+                SELECT message_talker,
+                       message_local_id,
+                       message_create_time,
+                       original_filename,
+                       mime_type
                 FROM media_items
                 WHERE verify_status = 'failed'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(message_talker, "wxid_friend");
         assert_eq!(message_local_id, 11);
         assert_eq!(message_create_time, 1_779_472_800);
+        assert_eq!(original_filename, "abcdefabcdefabcdefabcdefabcdefab.dat");
+        assert_eq!(mime_type, None);
 
         let status = archive_status(&archive).unwrap();
         assert_eq!(status.total_records, 1);
@@ -2388,16 +2445,24 @@ mod tests {
         assert_eq!(sha256_file(&db_path).unwrap(), db_hash_before);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, media_type, message_talker, message_local_id, message_create_time): (
-            String,
-            String,
-            String,
-            i64,
-            i64,
-        ) = conn
+        let (
+            source_kind,
+            media_type,
+            message_talker,
+            message_local_id,
+            message_create_time,
+            original_filename,
+            mime_type,
+        ): (String, String, String, i64, i64, String, String) = conn
             .query_row(
                 r#"
-                SELECT source_kind, media_type, message_talker, message_local_id, message_create_time
+                SELECT source_kind,
+                       media_type,
+                       message_talker,
+                       message_local_id,
+                       message_create_time,
+                       original_filename,
+                       mime_type
                 FROM media_items
                 WHERE source_kind = 'message_db_video'
                 "#,
@@ -2409,6 +2474,8 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -2418,6 +2485,8 @@ mod tests {
         assert_eq!(message_talker, talker);
         assert_eq!(message_local_id, local_id);
         assert_eq!(message_create_time, create_time);
+        assert_eq!(original_filename, format!("{file_md5}.mp4"));
+        assert_eq!(mime_type, "video/mp4");
 
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
@@ -2453,20 +2522,36 @@ mod tests {
         assert_eq!(summary.failed, 1);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, error, message_local_id): (String, String, i64) = conn
+        let (source_kind, error, message_local_id, original_filename, mime_type): (
+            String,
+            String,
+            i64,
+            String,
+            String,
+        ) = conn
             .query_row(
                 r#"
-                SELECT source_kind, error, message_local_id
+                SELECT source_kind, error, message_local_id, original_filename, mime_type
                 FROM media_items
                 WHERE verify_status = 'failed'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(source_kind, "message_db_video");
         assert_eq!(error, "local_video_not_found");
         assert_eq!(message_local_id, 22);
+        assert_eq!(original_filename, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.mp4");
+        assert_eq!(mime_type, "video/mp4");
     }
 
     #[test]
@@ -2516,10 +2601,19 @@ mod tests {
             message_talker,
             message_local_id,
             message_create_time,
-        ): (String, String, String, String, i64, i64) = conn
+            original_filename,
+            mime_type,
+        ): (String, String, String, String, i64, i64, String, String) = conn
             .query_row(
                 r#"
-                SELECT source_kind, media_type, extension, message_talker, message_local_id, message_create_time
+                SELECT source_kind,
+                       media_type,
+                       extension,
+                       message_talker,
+                       message_local_id,
+                       message_create_time,
+                       original_filename,
+                       mime_type
                 FROM media_items
                 WHERE source_kind = 'message_db_file'
                 "#,
@@ -2532,6 +2626,8 @@ mod tests {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
@@ -2542,6 +2638,8 @@ mod tests {
         assert_eq!(message_talker, talker);
         assert_eq!(message_local_id, local_id);
         assert_eq!(message_create_time, create_time);
+        assert_eq!(original_filename, file_name);
+        assert_eq!(mime_type, "application/pdf");
 
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
@@ -2577,21 +2675,47 @@ mod tests {
         assert_eq!(summary.failed, 1);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, error, extension, message_local_id): (String, String, String, i64) = conn
+        let (source_kind, error, extension, message_local_id, original_filename, mime_type): (
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+        ) = conn
             .query_row(
                 r#"
-                SELECT source_kind, error, extension, message_local_id
+                SELECT source_kind,
+                       error,
+                       extension,
+                       message_local_id,
+                       original_filename,
+                       mime_type
                 FROM media_items
                 WHERE verify_status = 'failed'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(source_kind, "message_db_file");
         assert_eq!(error, "local_file_not_found");
         assert_eq!(extension, "docx");
         assert_eq!(message_local_id, 32);
+        assert_eq!(original_filename, "missing.docx");
+        assert_eq!(
+            mime_type,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        );
     }
 
     #[test]
@@ -2641,10 +2765,30 @@ mod tests {
             message_talker,
             message_local_id,
             message_create_time,
-        ): (String, String, String, u64, String, i64, i64) = conn
+            original_filename,
+            mime_type,
+        ): (
+            String,
+            String,
+            String,
+            u64,
+            String,
+            i64,
+            i64,
+            Option<String>,
+            String,
+        ) = conn
             .query_row(
                 r#"
-                SELECT source_kind, media_type, extension, size_bytes, message_talker, message_local_id, message_create_time
+                SELECT source_kind,
+                       media_type,
+                       extension,
+                       size_bytes,
+                       message_talker,
+                       message_local_id,
+                       message_create_time,
+                       original_filename,
+                       mime_type
                 FROM media_items
                 WHERE source_kind = 'message_db_voice'
                 "#,
@@ -2658,6 +2802,8 @@ mod tests {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -2669,6 +2815,8 @@ mod tests {
         assert_eq!(message_talker, talker);
         assert_eq!(message_local_id, local_id);
         assert_eq!(message_create_time, create_time);
+        assert_eq!(original_filename, None);
+        assert_eq!(mime_type, "audio/silk");
 
         let manifest_path = summary.manifest_path.clone().unwrap();
         let manifest = fs::read_to_string(manifest_path).unwrap();
@@ -2681,6 +2829,8 @@ mod tests {
         assert_eq!(event.message_local_id, Some(local_id));
         assert_eq!(event.message_create_time, Some(create_time));
         assert_eq!(event.size_bytes, Some(voice_data.len() as u64));
+        assert_eq!(event.original_filename, None);
+        assert_eq!(event.mime_type.as_deref(), Some("audio/silk"));
 
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
@@ -2783,21 +2933,44 @@ mod tests {
         assert_eq!(summary.failed, 1);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, error, extension, message_local_id): (String, String, String, i64) = conn
+        let (source_kind, error, extension, message_local_id, original_filename, mime_type): (
+            String,
+            String,
+            String,
+            i64,
+            Option<String>,
+            String,
+        ) = conn
             .query_row(
                 r#"
-                SELECT source_kind, error, extension, message_local_id
+                SELECT source_kind,
+                       error,
+                       extension,
+                       message_local_id,
+                       original_filename,
+                       mime_type
                 FROM media_items
                 WHERE verify_status = 'failed'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(source_kind, "message_db_voice");
         assert_eq!(error, "voice_blob_not_found");
         assert_eq!(extension, "silk");
         assert_eq!(message_local_id, 37);
+        assert_eq!(original_filename, None);
+        assert_eq!(mime_type, "audio/silk");
     }
 
     #[test]

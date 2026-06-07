@@ -346,6 +346,10 @@ mod tests {
                 .to_string(),
             source_kind: "direct_image".to_string(),
             media_type: media_type.to_string(),
+            original_filename: Path::new(source_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string()),
+            mime_type: Some("image/jpeg".to_string()),
             message_talker: message_talker.map(str::to_string),
             message_sender: None,
             message_local_id: Some(42),

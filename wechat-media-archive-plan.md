@@ -79,7 +79,7 @@ wechat-archive/
 说明：
 
 - `objects` 只按内容 hash 存一份真实文件。
-- `index.sqlite` 保存消息、来源、文件、hash、归档路径等结构化信息，并通过 `schema_migrations` 记录显式 schema 版本迁移；索引 API 支持只读按 `sha256` 或 `source_path` 反查归档记录，并支持 `status` 分组统计和 `verify` 索引引用完整性检查。
+- `index.sqlite` 保存消息、来源、文件、hash、归档路径、原始文件名、MIME 类型等结构化信息，并通过 `schema_migrations` 记录显式 schema 版本迁移；索引 API 支持只读按 `sha256` 或 `source_path` 反查归档记录，并支持 `status` 分组统计和 `verify` 索引引用完整性检查。
 - `manifests` 保存每次扫描和归档结果，便于审计和回滚。
 - `views` 可以通过软链接或索引生成“按联系人、群、年份、类型”的视图。
 - `staging` 用于临时解密、转换和校验，成功后再移动到正式归档区。
@@ -105,7 +105,7 @@ wechat-archive/
 | `sha256` | 内容 hash |
 | `size_bytes` | 文件大小 |
 | `mime_type` | 文件类型 |
-| `filename` | 原始文件名 |
+| `original_filename` | 原始文件名 |
 | `extension` | 扩展名 |
 | `decoder` | 解码路径，例如 `legacy_xor`、`v1_aes`、`v2_aes`、`wxgf_jpg` |
 | `decrypt_status` | 解密状态 |
@@ -146,6 +146,7 @@ wechat-archive/
 - 计算 `sha256`。
 - 复制到归档目录。
 - 写入 SQLite 索引，并保持 schema 迁移可追踪、可幂等复跑。
+- 索引和 manifest 会记录 `original_filename` 与 `mime_type`；MIME 当前基于归档扩展名保守推断，不做内容嗅探。
 - 消息库图片、视频、文件附件和语音归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
 - 支持 `status` 查看索引总量、唯一对象、唯一字节数，并按媒体类型、来源类型、解密状态和校验状态分组。
 - 支持 `report` 只读导出 JSON/CSV 索引报告，供人工审计、备份流程和后续 AI 分类使用。
@@ -182,7 +183,7 @@ wechat-archiver views
 wechat-archiver verify
 ```
 
-说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`count-db-media` 用于在已解密/普通 SQLite 消息库上估算 image/video/file/voice 候选量，不读取微信媒体目录、不写归档目录。`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定。图片、视频和文件仍从 `--account/msg` 定位，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。`lookup` 只读打开索引，支持按 `sha256` 反查来源或按 `source_path` 查归档状态。`status` 输出归档总量和按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组的索引健康统计。`report` 只读导出全量索引记录，支持 JSON 和 CSV。`views` 默认 dry-run 预览 `views/` 相对软链接计划，传 `--write` 才写入。`verify` 覆盖对象 hash 校验和索引引用完整性检查，异常时返回非零退出码。`extract-images` 保留用于兼容旧脚本。
+说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`count-db-media` 用于在已解密/普通 SQLite 消息库上估算 image/video/file/voice 候选量，不读取微信媒体目录、不写归档目录。`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定。图片、视频和文件仍从 `--account/msg` 定位，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。`lookup` 只读打开索引，支持按 `sha256` 反查来源或按 `source_path` 查归档状态，并输出原始文件名和 MIME 类型。`status` 输出归档总量和按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组的索引健康统计。`report` 只读导出全量索引记录，支持包含原始文件名和 MIME 类型的 JSON/CSV。`views` 默认 dry-run 预览 `views/` 相对软链接计划，传 `--write` 才写入。`verify` 覆盖对象 hash 校验和索引引用完整性检查，异常时返回非零退出码。`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 
@@ -199,7 +200,7 @@ wechat-archiver verify
 功能：
 
 - 视频归档：已支持直接文件和消息库枚举；后续再补时长和分辨率。
-- 文件归档：已支持直接文件和保守消息库枚举；后续再补更完整的 appmsg 元数据、大小和发送人。
+- 文件归档：已支持直接文件和保守消息库枚举，并记录原始文件名和 MIME 类型；后续再补更完整的 appmsg 元数据、大小和发送人。
 - 语音归档：已支持直接语音/音频文件和消息库 `VoiceInfo.voice_data` 原始 BLOB；后续再支持可选转换为 `wav` 或 `mp3`、时长提取和转写。
 - 支持按时间范围、会话、类型过滤。
 

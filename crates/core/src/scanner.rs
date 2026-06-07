@@ -10,7 +10,9 @@ use crate::hash::{sha256_bytes, sha256_file};
 use crate::image::{decode_dat, direct_image_extension, is_dat_file, validate_dat, DatDecode};
 use crate::index::{index_path, insert_record, open_index, MediaRecord};
 use crate::manifest::ManifestWriter;
-use crate::media::{direct_file_extension, direct_video_extension, direct_voice_extension};
+use crate::media::{
+    direct_file_extension, direct_video_extension, direct_voice_extension, mime_type_for_extension,
+};
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 
 #[derive(Debug, Clone, Default)]
@@ -598,6 +600,11 @@ fn build_event(
         source_relative_path: source_relative_path.to_string(),
         source_kind: source_kind.to_string(),
         media_type: media_type.to_string(),
+        original_filename: original_filename(source_path),
+        mime_type: extension
+            .as_deref()
+            .and_then(mime_type_for_extension)
+            .map(str::to_string),
         message_talker: message_source.talker,
         message_sender: message_source.sender,
         message_local_id: message_source.local_id,
@@ -627,6 +634,8 @@ pub(crate) fn persist(
                 source_relative_path: event.source_relative_path.clone(),
                 source_kind: event.source_kind.clone(),
                 media_type: event.media_type.clone(),
+                original_filename: event.original_filename.clone(),
+                mime_type: event.mime_type.clone(),
                 message_talker: event.message_talker.clone(),
                 message_sender: event.message_sender.clone(),
                 message_local_id: event.message_local_id,
@@ -649,6 +658,13 @@ pub(crate) fn persist(
     }
 
     Ok(())
+}
+
+fn original_filename(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 fn relative_path(path: &Path, source_root: &Path) -> Result<String> {
@@ -702,6 +718,21 @@ mod tests {
         assert!(archive.join("index.sqlite").exists());
         assert!(summary.manifest_path.unwrap().exists());
 
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (original_filename, mime_type): (String, String) = conn
+            .query_row(
+                r#"
+                SELECT original_filename, mime_type
+                FROM media_items
+                WHERE source_relative_path = 'image.jpg'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(original_filename, "image.jpg");
+        assert_eq!(mime_type, "image/jpeg");
+
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 2);
         assert_eq!(verify.ok, 2);
@@ -731,19 +762,36 @@ mod tests {
         .unwrap();
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, decoder): (String, Option<String>) = conn
+        let (source_kind, decoder, extension, original_filename, mime_type): (
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+        ) = conn
             .query_row(
                 r#"
-                SELECT source_kind, decoder
+                SELECT source_kind, decoder, extension, original_filename, mime_type
                 FROM media_items
                 WHERE source_relative_path = 'attach/hash/2026-01/Img/sample.dat'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(source_kind, "dat_image");
         assert_eq!(decoder.as_deref(), Some("legacy_xor"));
+        assert_eq!(extension, "png");
+        assert_eq!(original_filename, "sample.dat");
+        assert_eq!(mime_type, "image/png");
 
         let manifest_path = summary.manifest_path.unwrap();
         let manifest = std::fs::read_to_string(manifest_path).unwrap();
@@ -754,6 +802,8 @@ mod tests {
             .unwrap();
         assert_eq!(event.source_kind, "dat_image");
         assert_eq!(event.decoder.as_deref(), Some("legacy_xor"));
+        assert_eq!(event.original_filename.as_deref(), Some("sample.dat"));
+        assert_eq!(event.mime_type.as_deref(), Some("image/png"));
     }
 
     #[test]
@@ -805,20 +855,36 @@ mod tests {
         assert_eq!(std::fs::read(&video_path).unwrap(), video_bytes);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, media_type, extension): (String, String, String) = conn
+        let (source_kind, media_type, extension, original_filename, mime_type): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = conn
             .query_row(
                 r#"
-                SELECT source_kind, media_type, extension
+                SELECT source_kind, media_type, extension, original_filename, mime_type
                 FROM media_items
                 WHERE source_relative_path = 'clip.MP4'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(source_kind, "direct_video");
         assert_eq!(media_type, "video");
         assert_eq!(extension, "mp4");
+        assert_eq!(original_filename, "clip.MP4");
+        assert_eq!(mime_type, "video/mp4");
 
         let manifest_path = summary.manifest_path.unwrap();
         assert!(manifest_path
@@ -835,6 +901,8 @@ mod tests {
         assert_eq!(event.source_kind, "direct_video");
         assert_eq!(event.media_type, "video");
         assert_eq!(event.extension.as_deref(), Some("mp4"));
+        assert_eq!(event.original_filename.as_deref(), Some("clip.MP4"));
+        assert_eq!(event.mime_type.as_deref(), Some("video/mp4"));
 
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
@@ -926,20 +994,36 @@ mod tests {
         assert_eq!(std::fs::read(&file_path).unwrap(), file_bytes);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, media_type, extension): (String, String, String) = conn
+        let (source_kind, media_type, extension, original_filename, mime_type): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = conn
             .query_row(
                 r#"
-                SELECT source_kind, media_type, extension
+                SELECT source_kind, media_type, extension, original_filename, mime_type
                 FROM media_items
                 WHERE source_relative_path = 'report.PDF'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(source_kind, "direct_file");
         assert_eq!(media_type, "file");
         assert_eq!(extension, "pdf");
+        assert_eq!(original_filename, "report.PDF");
+        assert_eq!(mime_type, "application/pdf");
 
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
@@ -1031,20 +1115,36 @@ mod tests {
         assert_eq!(std::fs::read(&voice_path).unwrap(), voice_bytes);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, media_type, extension): (String, String, String) = conn
+        let (source_kind, media_type, extension, original_filename, mime_type): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = conn
             .query_row(
                 r#"
-                SELECT source_kind, media_type, extension
+                SELECT source_kind, media_type, extension, original_filename, mime_type
                 FROM media_items
                 WHERE source_relative_path = 'sample.SILK'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(source_kind, "direct_voice");
         assert_eq!(media_type, "voice");
         assert_eq!(extension, "silk");
+        assert_eq!(original_filename, "sample.SILK");
+        assert_eq!(mime_type, "audio/silk");
 
         let manifest_path = summary.manifest_path.unwrap();
         assert!(manifest_path
