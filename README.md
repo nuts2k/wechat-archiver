@@ -165,4 +165,4 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-更多规划见 [wechat-media-archive-plan.md](wechat-media-archive-plan.md)，代理开发约束见 [AGENTS.md](AGENTS.md)。
+路线图见 [ROADMAP.md](ROADMAP.md)，原始规划见 [wechat-media-archive-plan.md](wechat-media-archive-plan.md)，代理开发约束见 [AGENTS.md](AGENTS.md)。
