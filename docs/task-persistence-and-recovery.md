@@ -198,19 +198,21 @@ wechat-archiver tasks clear --older-than 30d
 
 ## 实施顺序
 
-建议分三步做：
+当前第一步已实现，后续仍按三步推进：
 
-1. 增加 `TaskStore` trait 和 SQLite 实现，只记录 `task_runs` 快照，不保存完整事件流。
+1. 已增加 `TaskStore` trait 和 `SqliteTaskStore` SQLite 实现，只记录 `task_runs` 快照，不保存完整事件流。
 2. 让 `TaskRunner` 可选接入 store，在状态变化和事件到来时更新快照。
 3. 为 Tauri 或 CLI tasks 子命令提供只读任务历史查询和显式 retry。
 
-第一步验收：
+第一步当前能力：
 
 - 新任务创建时写入 `queued`。
-- worker 开始时更新为 `running`。
-- 完成、失败、取消时写入终态和结果摘要。
-- 启动恢复能把遗留 `queued/running` 标记为 `interrupted`。
+- 调用方可在 worker 开始时更新为 `running`。
+- 完成、失败、取消时可写入终态和结果摘要。
+- 启动恢复可把遗留 `queued/running` 标记为 `interrupted`。
 - 单元测试覆盖 schema 初始化、幂等迁移、终态更新和敏感参数不落盘。
+
+当前实现仍未把 `TaskRunner` 自动接入 store；CLI 默认也不会创建 app 配置库。任务历史写入需要调用方显式打开 `SqliteTaskStore` 并调用 core API。
 
 ## 当前保持不实现的内容
 
