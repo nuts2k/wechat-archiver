@@ -42,8 +42,8 @@ pub use scanner::{
 };
 pub use status::{archive_status, ArchiveStatus, StatusCount};
 pub use task::{
-    CancelToken, TaskEvent, TaskEventKind, TaskHandle, TaskOptions, TaskProgress, TaskReporter,
-    TaskRunner, TaskSnapshot, TaskStatus,
+    CancelToken, TaskEvent, TaskEventKind, TaskHandle, TaskMetadata, TaskOptions, TaskProgress,
+    TaskReporter, TaskRunner, TaskSnapshot, TaskStatus,
 };
 pub use task_store::{PersistentTaskStatus, SqliteTaskStore, TaskCreate, TaskRecord, TaskStore};
 pub use types::{

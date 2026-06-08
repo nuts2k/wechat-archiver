@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ const MIGRATIONS: &[Migration] = &[Migration {
     apply: migration_1_create_task_runs,
 }];
 
-pub trait TaskStore {
+pub trait TaskStore: Send + Sync {
     fn create_task(&self, task: &TaskCreate) -> Result<TaskRecord>;
     fn mark_running(&self, task_id: &str) -> Result<()>;
     fn update_snapshot(
@@ -136,20 +137,30 @@ pub struct TaskRecord {
 
 #[derive(Debug)]
 pub struct SqliteTaskStore {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl SqliteTaskStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         initialize(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         initialize(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn
+            .lock()
+            .map_err(|_| ArchiverError::Other("任务历史数据库锁已损坏".to_string()))
     }
 }
 
@@ -160,7 +171,8 @@ impl TaskStore for SqliteTaskStore {
         let params_summary_json = serde_json::to_string(&task.params_summary_json)?;
         let progress_json = serde_json::to_string(&progress)?;
 
-        self.conn.execute(
+        let conn = self.connection()?;
+        conn.execute(
             r#"
             INSERT INTO task_runs (
                 task_id,
@@ -210,7 +222,8 @@ impl TaskStore for SqliteTaskStore {
     }
 
     fn mark_running(&self, task_id: &str) -> Result<()> {
-        let updated = self.conn.execute(
+        let conn = self.connection()?;
+        let updated = conn.execute(
             r#"
             UPDATE task_runs
             SET status = ?2,
@@ -230,7 +243,8 @@ impl TaskStore for SqliteTaskStore {
     ) -> Result<()> {
         let progress_json = serde_json::to_string(progress)?;
         let last_event_json = last_event.map(serde_json::to_string).transpose()?;
-        let updated = self.conn.execute(
+        let conn = self.connection()?;
+        let updated = conn.execute(
             r#"
             UPDATE task_runs
             SET progress_json = ?2,
@@ -261,7 +275,8 @@ impl TaskStore for SqliteTaskStore {
             Some(summary) => serde_json::to_string(&TaskProgress::from(summary))?,
             None => self.current_progress_json(task_id)?,
         };
-        let updated = self.conn.execute(
+        let conn = self.connection()?;
+        let updated = conn.execute(
             r#"
             UPDATE task_runs
             SET status = ?2,
@@ -284,7 +299,8 @@ impl TaskStore for SqliteTaskStore {
     }
 
     fn mark_unfinished_interrupted(&self, error: &str) -> Result<usize> {
-        let updated = self.conn.execute(
+        let conn = self.connection()?;
+        let updated = conn.execute(
             r#"
             UPDATE task_runs
             SET status = ?1,
@@ -304,41 +320,41 @@ impl TaskStore for SqliteTaskStore {
     }
 
     fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>> {
-        self.conn
-            .query_row(
-                r#"
-                SELECT
-                    task_id,
-                    task_name,
-                    task_kind,
-                    archive_dir,
-                    source_dir,
-                    status,
-                    created_at_ms,
-                    started_at_ms,
-                    finished_at_ms,
-                    dry_run,
-                    params_summary_json,
-                    progress_json,
-                    last_event_json,
-                    result_summary_json,
-                    error
-                FROM task_runs
-                WHERE task_id = ?1
-                "#,
-                params![task_id],
-                task_record_from_row,
-            )
-            .optional()
-            .map_err(ArchiverError::from)
-            .and_then(|record| record.transpose())
+        let conn = self.connection()?;
+        conn.query_row(
+            r#"
+            SELECT
+                task_id,
+                task_name,
+                task_kind,
+                archive_dir,
+                source_dir,
+                status,
+                created_at_ms,
+                started_at_ms,
+                finished_at_ms,
+                dry_run,
+                params_summary_json,
+                progress_json,
+                last_event_json,
+                result_summary_json,
+                error
+            FROM task_runs
+            WHERE task_id = ?1
+            "#,
+            params![task_id],
+            task_record_from_row,
+        )
+        .optional()
+        .map_err(ArchiverError::from)
+        .and_then(|record| record.transpose())
     }
 }
 
 impl SqliteTaskStore {
     fn current_progress_json(&self, task_id: &str) -> Result<String> {
-        let progress_json = self
-            .conn
+        let conn = self.connection()?;
+        let progress_json = conn
             .query_row(
                 "SELECT progress_json FROM task_runs WHERE task_id = ?1",
                 params![task_id],
@@ -567,14 +583,13 @@ mod tests {
         drop(first);
         let second = SqliteTaskStore::open(&db_path).unwrap();
 
-        let migration_count: i64 = second
-            .conn
+        let conn = second.connection().unwrap();
+        let migration_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        let task_table_count: i64 = second
-            .conn
+        let task_table_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_runs'",
                 [],
@@ -679,8 +694,8 @@ mod tests {
         let store = SqliteTaskStore::open_in_memory().unwrap();
         store.create_task(&task_create("task-1")).unwrap();
 
-        let stored_json: String = store
-            .conn
+        let conn = store.connection().unwrap();
+        let stored_json: String = conn
             .query_row(
                 "SELECT params_summary_json FROM task_runs WHERE task_id = ?1",
                 params!["task-1"],
