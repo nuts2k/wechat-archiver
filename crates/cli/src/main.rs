@@ -378,6 +378,9 @@ struct TasksArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum TaskCommands {
+    /// 显式初始化 app SQLite 任务历史库；只创建新文件。
+    InitDb(TasksInitDbArgs),
+
     /// 列出最近任务历史；只读打开 --app-db。
     List(TasksListArgs),
 
@@ -389,6 +392,17 @@ enum TaskCommands {
 
     /// 基于安全 retry 候选重新发起任务；写入新的任务历史记录。
     Retry(TasksRetryArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct TasksInitDbArgs {
+    /// 显式 app SQLite 路径；必须不存在，且父目录必须已存在。
+    #[arg(long)]
+    app_db: PathBuf,
+
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -791,6 +805,11 @@ fn main() -> Result<()> {
 
 fn run_tasks(args: TasksArgs) -> Result<()> {
     match args.command {
+        TaskCommands::InitDb(args) => {
+            let json = args.json;
+            let init = init_task_db(args)?;
+            print_task_init_db(&init, json)?;
+        }
         TaskCommands::List(args) => {
             let store = open_task_store_readonly(&args.app_db)?;
             let records = store.list_tasks(&TaskListQuery {
@@ -825,6 +844,31 @@ fn run_tasks(args: TasksArgs) -> Result<()> {
     Ok(())
 }
 
+fn init_task_db(args: TasksInitDbArgs) -> Result<TaskInitDbResult> {
+    anyhow::ensure!(
+        !args.app_db.exists(),
+        "app db already exists: {}",
+        args.app_db.display()
+    );
+    let parent = args
+        .app_db
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    anyhow::ensure!(
+        parent.is_dir(),
+        "app db parent directory does not exist or is not a directory: {}",
+        parent.display()
+    );
+
+    let store = SqliteTaskStore::open(&args.app_db)?;
+    drop(store);
+    Ok(TaskInitDbResult {
+        app_db: args.app_db,
+        created: true,
+    })
+}
+
 fn open_task_store_readonly(app_db: &Path) -> Result<SqliteTaskStore> {
     anyhow::ensure!(
         app_db.is_file(),
@@ -841,6 +885,12 @@ fn open_task_store_writable(app_db: &Path) -> Result<SqliteTaskStore> {
         app_db.display()
     );
     Ok(SqliteTaskStore::open(app_db)?)
+}
+
+#[derive(Debug, Serialize)]
+struct TaskInitDbResult {
+    app_db: PathBuf,
+    created: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2012,6 +2062,17 @@ fn print_task_retry_candidate(candidate: &TaskRetryCandidate, json: bool) -> Res
     Ok(())
 }
 
+fn print_task_init_db(init: &TaskInitDbResult, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(init)?);
+        return Ok(());
+    }
+
+    println!("app_db: {}", init.app_db.display());
+    println!("created: {}", init.created);
+    Ok(())
+}
+
 fn print_task_retry_run(retry_run: &TaskRetryRun, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(retry_run)?);
@@ -2620,6 +2681,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_tasks_init_db_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "tasks",
+            "init-db",
+            "--app-db",
+            "/tmp/app.sqlite",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Tasks(TasksArgs {
+                command: TaskCommands::InitDb(args),
+            }) => {
+                assert_eq!(args.app_db, PathBuf::from("/tmp/app.sqlite"));
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_tasks_show_command() {
         let cli = Cli::try_parse_from([
             "wechat-archiver",
@@ -2697,6 +2781,67 @@ mod tests {
     fn rejects_tasks_without_explicit_app_db() {
         let result = Cli::try_parse_from(["wechat-archiver", "tasks", "list"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn tasks_init_db_creates_new_app_db_and_list_reads_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("app.sqlite");
+
+        run_tasks(TasksArgs {
+            command: TaskCommands::InitDb(TasksInitDbArgs {
+                app_db: app_db.clone(),
+                json: true,
+            }),
+        })
+        .unwrap();
+
+        assert!(app_db.is_file());
+        run_tasks(TasksArgs {
+            command: TaskCommands::List(TasksListArgs {
+                app_db,
+                status: Vec::new(),
+                task_kind: None,
+                created_at_from_ms: None,
+                created_at_to_ms: None,
+                limit: None,
+                json: true,
+            }),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn tasks_init_db_rejects_existing_app_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("app.sqlite");
+        std::fs::write(&app_db, b"existing").unwrap();
+
+        let result = run_tasks(TasksArgs {
+            command: TaskCommands::InitDb(TasksInitDbArgs {
+                app_db: app_db.clone(),
+                json: true,
+            }),
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&app_db).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn tasks_init_db_rejects_missing_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("missing-parent").join("app.sqlite");
+
+        let result = run_tasks(TasksArgs {
+            command: TaskCommands::InitDb(TasksInitDbArgs {
+                app_db: app_db.clone(),
+                json: true,
+            }),
+        });
+
+        assert!(result.is_err());
+        assert!(!app_db.exists());
     }
 
     #[test]

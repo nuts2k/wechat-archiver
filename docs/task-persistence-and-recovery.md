@@ -60,7 +60,7 @@
 
 - 每个 archive 可继续保留 `manifests/*.jsonl` 作为归档审计事实。
 - app 配置库只保存任务控制平面，不替代 manifest。
-- CLI 默认不创建 app 配置库；只有桌面客户端、显式任务历史命令或显式 `--app-db` 抽取命令需要写入。
+- CLI 默认不创建 app 配置库；只有桌面客户端、显式 `tasks init-db` 初始化命令、显式任务历史命令或显式 `--app-db` 抽取命令需要写入。
 
 ## 建议 schema
 
@@ -168,9 +168,10 @@ running -> interrupted
 4. 展示最近任务列表。
 5. 对 `interrupted` 任务提供重新发起入口，但不自动执行。
 
-CLI 默认不执行上述恢复流程。当前已有显式命令可读取或写入指定 app SQLite，但都不会自动创建 app 配置库：
+CLI 默认不执行上述恢复流程。当前已有显式命令可初始化、读取或写入指定 app SQLite，但不会隐式创建 app 配置库：
 
 ```bash
+wechat-archiver tasks init-db --app-db <path>
 wechat-archiver extract --type image --app-db <path>
 wechat-archiver extract-db-images --app-db <path>
 wechat-archiver tasks list --app-db <path>
@@ -179,7 +180,7 @@ wechat-archiver tasks retry-candidate --app-db <path> <task_id>
 wechat-archiver tasks retry --app-db <path> <task_id>
 ```
 
-其中抽取类 `--app-db` 命令和 `tasks retry` 会读写打开已有 app SQLite；`list`、`show` 和 `retry-candidate` 只读打开 app SQLite。`retry` 会基于安全候选创建新的任务记录并执行，不会修改原任务记录，也不会自动恢复明文 key。
+其中 `tasks init-db` 是唯一显式创建 app SQLite 的 CLI 入口，只创建不存在的目标文件，拒绝覆盖已有文件，也不会创建缺失的父目录。抽取类 `--app-db` 命令和 `tasks retry` 会读写打开已有 app SQLite；`list`、`show` 和 `retry-candidate` 只读打开 app SQLite。`retry` 会基于安全候选创建新的任务记录并执行，不会修改原任务记录，也不会自动恢复明文 key。
 
 ## 与 archive manifest 的关系
 
@@ -203,15 +204,16 @@ wechat-archiver tasks retry --app-db <path> <task_id>
 
 ## 实施顺序
 
-当前持久化、runner 接入、只读历史查询、retry 候选准备、显式只读 CLI、最小显式 retry CLI 和抽取类 `--app-db` 任务记录已实现，后续继续扩展长任务控制：
+当前持久化、runner 接入、只读历史查询、retry 候选准备、显式 init-db CLI、显式只读 CLI、最小显式 retry CLI 和抽取类 `--app-db` 任务记录已实现，后续继续扩展长任务控制：
 
 1. 已增加 `TaskStore` trait 和 `SqliteTaskStore` SQLite 实现，只记录 `task_runs` 快照，不保存完整事件流。
 2. 已让 `TaskRunner` 可选接入 store，在状态变化和事件到来时更新快照。
 3. 已提供 `TaskListQuery` 和 `TaskStore::list_tasks` 只读查询。
 4. 已提供 `TaskStore::retry_candidate` 和 `TaskRetryCandidate`，只从非敏感参数摘要准备可重试候选，不自动执行任务。
-5. 已提供 `wechat-archiver tasks list/show/retry-candidate --app-db <path>` 只读 CLI，支持人类可读输出和 `--json`。
-6. 已提供 `wechat-archiver tasks retry --app-db <path> <task_id>` 显式 CLI，会写入新的任务历史记录并通过 `TaskRunner::with_store` 执行。
-7. 已让 `extract`、`extract-images` 和 `extract-db-*` 在显式传入已有 `--app-db` 时写入任务历史；未传时保持原同步抽取行为。
+5. 已提供 `wechat-archiver tasks init-db --app-db <path>` 显式初始化 CLI，只创建不存在的 app SQLite。
+6. 已提供 `wechat-archiver tasks list/show/retry-candidate --app-db <path>` 只读 CLI，支持人类可读输出和 `--json`。
+7. 已提供 `wechat-archiver tasks retry --app-db <path> <task_id>` 显式 CLI，会写入新的任务历史记录并通过 `TaskRunner::with_store` 执行。
+8. 已让 `extract`、`extract-images` 和 `extract-db-*` 在显式传入已有 `--app-db` 时写入任务历史；未传时保持原同步抽取行为。
 
 当前能力：
 
@@ -223,12 +225,13 @@ wechat-archiver tasks retry --app-db <path> <task_id>
 - 启动恢复可把遗留 `queued/running` 标记为 `interrupted`。
 - 可按状态、任务类型、`created_at_ms` 时间范围和 limit 查询最近任务历史，默认按 `created_at_ms DESC` 返回。
 - 可为已完成、失败、取消或中断任务生成 retry 候选；`queued/running`、缺少必要目录、缺少任务类型、未知任务类型、参数摘要非对象、包含疑似明文 key/token/cookie/secret 或图片任务历史参数显示曾提供 AES key 的任务会标记为不可重试。
-- CLI `tasks` 子命令必须显式传入已有 `--app-db`，缺失路径不会创建数据库；`list/show/retry-candidate` 只读打开，`retry` 读写打开并只写任务历史和归档目录。
+- CLI `tasks init-db` 必须显式传入不存在的 `--app-db`，只初始化任务历史 schema；已有路径或缺失父目录会报错。
+- 其他 CLI `tasks` 子命令必须显式传入已有 `--app-db`，缺失路径不会创建数据库；`list/show/retry-candidate` 只读打开，`retry` 读写打开并只写任务历史和归档目录。
 - CLI `tasks retry` 必须显式传入已有 `--app-db`，当前支持 `extract_images`、`extract_videos`、`extract_files`、`extract_voices`、`extract_db_images`、`extract_db_videos`、`extract_db_files` 和 `extract_db_voices`；图片任务若历史参数显示曾提供 AES key，会被候选规则拒绝，要求用户手动重新运行并显式提供 key。
 - CLI `extract`、`extract-images` 和 `extract-db-*` 可显式传入已有 `--app-db` 记录任务历史；缺失路径不会创建数据库，任务摘要只保存非敏感参数，不保存 AES key 明文。
-- 单元测试覆盖 schema 初始化、幂等迁移、终态更新、runner/store 集成、只读历史查询、retry 候选安全边界、CLI 只读任务命令、CLI 显式 retry、抽取类 `--app-db` 记录和敏感参数不落盘。
+- 单元测试覆盖 schema 初始化、幂等迁移、终态更新、runner/store 集成、只读历史查询、retry 候选安全边界、CLI 显式初始化、CLI 只读任务命令、CLI 显式 retry、抽取类 `--app-db` 记录和敏感参数不落盘。
 
-CLI 默认仍不会创建 app 配置库。任务历史写入需要调用方显式打开 `SqliteTaskStore`，并创建带 store 的 `TaskRunner`。
+CLI 默认仍不会创建 app 配置库；只有 `tasks init-db` 会按用户给定路径创建新的 app SQLite。任务历史写入需要调用方显式打开 `SqliteTaskStore`，并创建带 store 的 `TaskRunner`。
 
 ## 当前保持不实现的内容
 

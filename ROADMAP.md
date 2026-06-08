@@ -182,7 +182,7 @@ wechat-archive/
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、图片宽高解析、MP4 视频时长/宽高解析、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder`、原始文件名、MIME、图片/视频元数据和消息来源记录、任务级抽取统计、消息库诊断、消息库图片/视频/文件附件/语音归档、外部已解密消息库目录、直接视频、文件和语音归档、统一 `extract --type` CLI 解析，以及抽取类 `--app-db` 任务历史记录。
+- 单元测试覆盖普通图片格式识别、图片宽高解析、MP4 视频时长/宽高解析、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder`、原始文件名、MIME、图片/视频元数据和消息来源记录、任务级抽取统计、消息库诊断、消息库图片/视频/文件附件/语音归档、外部已解密消息库目录、直接视频、文件和语音归档、统一 `extract --type` CLI 解析、抽取类 `--app-db` 任务历史记录，以及任务历史初始化和 retry CLI。
 - 已通过：
 
 ```bash
@@ -260,7 +260,7 @@ wechat-archiver extract --type voice
 - `extract --type image,video,file,voice` 支持多类型顺序执行，并输出聚合 summary 和各类型子 summary。
 - 聚合 summary 会汇总每个子任务的新对象、已有对象、旧索引复用、实际 `.dat` 解码和元数据补写计数。
 - core 已提供任务级 `TaskEvent`、`TaskProgress`、`TaskReporter`、`CancelToken`、`TaskRunner` 和 `TaskHandle`；直接扫描和消息库抽取均可发出结构化进度事件，CLI 抽取类命令可通过 `--jsonl-progress` 输出 JSONL 事件到 stderr，也可显式传入已有 `--app-db` 记录任务历史。后台任务队列雏形支持单 worker 顺序执行、任务 ID、排队/运行/完成/失败/取消状态、进度快照、事件消费和取消句柄。
-- core 已提供 `TaskStore` trait 和 `SqliteTaskStore` 最小实现；`TaskRunner` 可通过显式 store 接入，在独立 app SQLite 中记录 `task_runs`、更新进度快照、写入完成/失败/取消终态，并在启动恢复时把遗留 `queued/running` 标记为 `interrupted`。任务历史支持按状态、任务类型、时间范围和 limit 只读查询，并可生成安全 retry 候选；CLI 已提供 `tasks list/show/retry-candidate --app-db <path>` 只读命令和显式 `tasks retry --app-db <path> <task_id>` 执行命令，支持 direct 与 message-db 抽取任务。
+- core 已提供 `TaskStore` trait 和 `SqliteTaskStore` 最小实现；`TaskRunner` 可通过显式 store 接入，在独立 app SQLite 中记录 `task_runs`、更新进度快照、写入完成/失败/取消终态，并在启动恢复时把遗留 `queued/running` 标记为 `interrupted`。任务历史支持按状态、任务类型、时间范围和 limit 只读查询，并可生成安全 retry 候选；CLI 已提供 `tasks init-db --app-db <path>` 显式初始化命令、`tasks list/show/retry-candidate --app-db <path>` 只读命令和显式 `tasks retry --app-db <path> <task_id>` 执行命令，支持 direct 与 message-db 抽取任务。
 - 已补充任务队列持久化与恢复设计文档：`docs/task-persistence-and-recovery.md`。
 
 计划：
