@@ -2326,6 +2326,7 @@ fn print_verify_summary(summary: &VerifySummary, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::{params, Connection};
 
     #[test]
     fn parses_unified_extract_image_command() {
@@ -3005,6 +3006,109 @@ mod tests {
     }
 
     #[test]
+    fn extract_db_with_app_db_records_completed_tasks() {
+        let cases = [
+            (
+                MediaType::Image,
+                "extract_db_images",
+                "消息库抽取图片",
+                "image",
+            ),
+            (
+                MediaType::Video,
+                "extract_db_videos",
+                "消息库抽取视频",
+                "video",
+            ),
+            (
+                MediaType::File,
+                "extract_db_files",
+                "消息库抽取文件",
+                "file",
+            ),
+            (
+                MediaType::Voice,
+                "extract_db_voices",
+                "消息库抽取语音",
+                "voice",
+            ),
+        ];
+        let plain_key = "plain-message-db-aes-key";
+
+        for (media_type, task_kind, task_name, media_name) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let app_db = tmp.path().join("app.sqlite");
+            SqliteTaskStore::open(&app_db).unwrap();
+            let account_dir = tmp.path().join("wxid_cli");
+            let message_db_dir = tmp.path().join("decrypted-message");
+            let archive_dir = tmp.path().join("archive");
+            create_cli_message_db_fixture(&account_dir, &message_db_dir, media_type);
+
+            let dat_options = if media_type == MediaType::Image {
+                DatDecodeOptions {
+                    image_aes_key: Some(plain_key.as_bytes().to_vec()),
+                    image_xor_key: 0x88,
+                    wxgf_mode: CoreWxgfMode::Off,
+                    wxgf_ffmpeg_path: None,
+                }
+            } else {
+                DatDecodeOptions::default()
+            };
+
+            let summary = run_message_db_extract(
+                media_type,
+                Some(&app_db),
+                false,
+                MessageDbExtractConfig {
+                    account_dir: account_dir.clone(),
+                    message_db_dir: Some(message_db_dir.clone()),
+                    archive_dir: archive_dir.clone(),
+                    dry_run: true,
+                    dat_options,
+                    explain_unsupported: false,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(summary.scanned_files, 1);
+            assert_eq!(summary.candidates, 1);
+            assert_eq!(summary.would_archive, 1);
+            assert!(!archive_dir.exists());
+
+            let store = SqliteTaskStore::open_readonly(&app_db).unwrap();
+            let records = store.list_tasks(&TaskListQuery::default()).unwrap();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record.status, PersistentTaskStatus::Completed);
+            assert_eq!(record.task_name, task_name);
+            assert_eq!(record.task_kind, task_kind);
+            assert_eq!(record.source_dir.as_deref(), Some(account_dir.as_path()));
+            assert_eq!(record.archive_dir.as_deref(), Some(archive_dir.as_path()));
+            assert!(record.dry_run);
+            assert_eq!(record.params_summary_json["task_kind"], task_kind);
+            assert_eq!(record.params_summary_json["media_types"][0], media_name);
+            assert_eq!(
+                record.params_summary_json["message_db_dir"].as_str(),
+                Some(message_db_dir.to_string_lossy().as_ref())
+            );
+            assert_eq!(record.progress.scanned_files, 1);
+            assert_eq!(record.progress.candidates, 1);
+
+            if media_type == MediaType::Image {
+                let params = record.params_summary_json.to_string();
+                assert_eq!(record.params_summary_json["image_aes_key_provided"], true);
+                assert!(!params.contains(plain_key));
+
+                let candidate = store.retry_candidate(&record.task_id).unwrap().unwrap();
+                assert!(!candidate.retryable);
+                assert!(candidate
+                    .reasons
+                    .contains(&"params_summary_requires_image_aes_key".to_string()));
+            }
+        }
+    }
+
+    #[test]
     fn parses_extract_db_videos_command() {
         let cli = Cli::try_parse_from([
             "wechat-archiver",
@@ -3194,5 +3298,263 @@ mod tests {
         assert_eq!(summary.new_objects, 0);
         assert_eq!(summary.existing_objects, 0);
         assert!(!archive.exists());
+    }
+
+    const CLI_TALKER: &str = "wxid_cli_fixture";
+    const CLI_TALKER_HASH: &str = "ed75d36aa601543e1bdd8a5a282af2a2";
+    const CLI_SENDER_ID: i64 = 2;
+    const CLI_SENDER: &str = "wxid_cli_sender";
+    const CLI_LOCAL_ID: i64 = 901;
+    const CLI_CREATE_TIME: i64 = 1_779_472_800;
+    const CLI_FILE_MD5: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const CLI_FILE_NAME: &str = "cli-fixture.txt";
+
+    fn create_cli_message_db_fixture(
+        account_dir: &Path,
+        message_db_dir: &Path,
+        media_type: MediaType,
+    ) {
+        std::fs::create_dir_all(account_dir).unwrap();
+        std::fs::create_dir_all(message_db_dir).unwrap();
+        create_cli_message_db(
+            &message_db_dir.join("message_0.db"),
+            cli_message_local_type(media_type),
+        );
+        create_cli_resource_db(&message_db_dir.join("message_resource.db"), media_type);
+
+        match media_type {
+            MediaType::Image => create_cli_image_file(account_dir),
+            MediaType::Video => create_cli_video_file(account_dir),
+            MediaType::File => create_cli_file_attachment(account_dir),
+            MediaType::Voice => create_cli_voice_media_db(&message_db_dir.join("media_0.db")),
+        }
+    }
+
+    fn cli_message_local_type(media_type: MediaType) -> i64 {
+        match media_type {
+            MediaType::Image => 3,
+            MediaType::Video => 43,
+            MediaType::File => 49,
+            MediaType::Voice => 34,
+        }
+    }
+
+    fn create_cli_message_db(path: &Path, local_type: i64) {
+        let conn = Connection::open(path).unwrap();
+        let table_name = quote_cli_identifier(&format!("Msg_{CLI_TALKER_HASH}"));
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO Name2Id(rowid, user_name) VALUES (?1, ?2), (?3, ?4)",
+            params![1, CLI_TALKER, CLI_SENDER_ID, CLI_SENDER],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "CREATE TABLE {table_name} (
+                    local_id INTEGER,
+                    create_time INTEGER,
+                    local_type INTEGER,
+                    real_sender_id INTEGER
+                )"
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {table_name} (
+                    local_id,
+                    create_time,
+                    local_type,
+                    real_sender_id
+                ) VALUES (?1, ?2, ?3, ?4)"
+            ),
+            params![
+                CLI_LOCAL_ID,
+                CLI_CREATE_TIME,
+                (1_i64 << 32) + local_type,
+                CLI_SENDER_ID
+            ],
+        )
+        .unwrap();
+    }
+
+    fn create_cli_resource_db(path: &Path, media_type: MediaType) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE ChatName2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE MessageResourceInfo (
+                message_id INTEGER,
+                chat_id INTEGER,
+                message_local_id INTEGER,
+                message_create_time INTEGER,
+                message_local_type INTEGER,
+                packed_info BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ChatName2Id(rowid, user_name) VALUES (?1, ?2)",
+            params![1, CLI_TALKER],
+        )
+        .unwrap();
+
+        match media_type {
+            MediaType::Image => {
+                conn.execute(
+                    "CREATE TABLE MessageResourceDetail (
+                        message_id INTEGER,
+                        packed_info BLOB
+                    )",
+                    [],
+                )
+                .unwrap();
+                insert_cli_resource_info(&conn, 10, 3, packed_cli_md5());
+                conn.execute(
+                    "INSERT INTO MessageResourceDetail(message_id, packed_info) VALUES (?1, ?2)",
+                    params![10, packed_cli_md5()],
+                )
+                .unwrap();
+            }
+            MediaType::Video => {
+                conn.execute(
+                    "CREATE TABLE MessageResourceDetail (
+                        message_id INTEGER,
+                        type INTEGER,
+                        packed_info BLOB
+                    )",
+                    [],
+                )
+                .unwrap();
+                insert_cli_resource_info(&conn, 20, 43, Vec::new());
+                conn.execute(
+                    "INSERT INTO MessageResourceDetail(message_id, type, packed_info) VALUES (?1, ?2, ?3)",
+                    params![20, 2, packed_cli_md5()],
+                )
+                .unwrap();
+            }
+            MediaType::File => {
+                conn.execute(
+                    "CREATE TABLE MessageResourceDetail (
+                        message_id INTEGER,
+                        packed_info BLOB
+                    )",
+                    [],
+                )
+                .unwrap();
+                insert_cli_resource_info(&conn, 30, 49, packed_cli_file_name());
+                conn.execute(
+                    "INSERT INTO MessageResourceDetail(message_id, packed_info) VALUES (?1, ?2)",
+                    params![30, packed_cli_file_name()],
+                )
+                .unwrap();
+            }
+            MediaType::Voice => {}
+        }
+    }
+
+    fn insert_cli_resource_info(
+        conn: &Connection,
+        message_id: i64,
+        local_type: i64,
+        packed_info: Vec<u8>,
+    ) {
+        conn.execute(
+            "INSERT INTO MessageResourceInfo (
+                message_id,
+                chat_id,
+                message_local_id,
+                message_create_time,
+                message_local_type,
+                packed_info
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                message_id,
+                1,
+                CLI_LOCAL_ID,
+                CLI_CREATE_TIME,
+                (1_i64 << 32) + local_type,
+                packed_info
+            ],
+        )
+        .unwrap();
+    }
+
+    fn create_cli_image_file(account_dir: &Path) {
+        let img_dir = account_dir
+            .join("msg")
+            .join("attach")
+            .join(CLI_TALKER_HASH)
+            .join("2026-05")
+            .join("Img");
+        std::fs::create_dir_all(&img_dir).unwrap();
+        let decoded = b"\x89PNG\r\n\x1a\nsynthetic-cli-message-db-png";
+        let encrypted = decoded.iter().map(|byte| byte ^ 0x88).collect::<Vec<_>>();
+        std::fs::write(img_dir.join(format!("{CLI_FILE_MD5}.dat")), encrypted).unwrap();
+    }
+
+    fn create_cli_video_file(account_dir: &Path) {
+        let video_dir = account_dir.join("msg").join("video").join("2026-05");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        std::fs::write(
+            video_dir.join(format!("{CLI_FILE_MD5}.mp4")),
+            b"synthetic-cli-video",
+        )
+        .unwrap();
+    }
+
+    fn create_cli_file_attachment(account_dir: &Path) {
+        let file_dir = account_dir.join("msg").join("file").join("2026-05");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        std::fs::write(file_dir.join(CLI_FILE_NAME), b"synthetic-cli-file").unwrap();
+    }
+
+    fn create_cli_voice_media_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE VoiceInfo (
+                chat_name_id INTEGER,
+                local_id INTEGER,
+                create_time INTEGER,
+                voice_data BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Name2Id(rowid, user_name) VALUES (?1, ?2)",
+            params![1, CLI_TALKER],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO VoiceInfo(chat_name_id, local_id, create_time, voice_data) VALUES (?1, ?2, ?3, ?4)",
+            params![1, CLI_LOCAL_ID, CLI_CREATE_TIME, b"\x02synthetic-cli-voice"],
+        )
+        .unwrap();
+    }
+
+    fn packed_cli_md5() -> Vec<u8> {
+        let mut blob = vec![0x12, 0x22, 0x0a, 0x20];
+        blob.extend_from_slice(CLI_FILE_MD5.as_bytes());
+        blob
+    }
+
+    fn packed_cli_file_name() -> Vec<u8> {
+        let mut blob = b"prefix\0".to_vec();
+        blob.extend_from_slice(CLI_FILE_MD5.as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(CLI_FILE_NAME.as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(b"suffix");
+        blob
+    }
+
+    fn quote_cli_identifier(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
     }
 }
