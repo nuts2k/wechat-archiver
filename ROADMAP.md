@@ -172,6 +172,7 @@ wechat-archive/
 - `index.sqlite` 和 manifest 支持 `width_px`、`height_px`、`duration_ms`；当前直接图片和解码后的图片会 best-effort 写入宽高，视频会 best-effort 写入宽高和时长，部分音频会 best-effort 写入时长。
 - `index.sqlite` 和 manifest 支持 `source_size_bytes`、`source_modified_ms` 与 `decode_fingerprint`；直接媒体复跑时可用源文件指纹复用已校验记录，`.dat` 图片可在源文件指纹、解码参数指纹和已校验对象都匹配时跳过重解码。
 - `index.sqlite` 和 manifest 支持可空消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；当前消息库图片、视频、文件附件和语音归档会写入 `talker/local_id/create_time`，并在 `Msg_*` 表存在 `real_sender_id` 且同库 `Name2Id` 可映射时写入稳定 sender `user_name`。
+- 抽取 summary 会输出 `reused_records`、`decoded_dat`、`metadata_backfilled`、`new_objects` 和 `existing_objects`，区分旧索引复用、实际 `.dat` 解码、元数据补写、新对象写入和内容去重命中。
 - 支持 `status` 查看索引统计，并按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组。
 - 支持 `lookup` 只读按 `sha256` 反查所有来源，或按 `source_path` 查询单个源文件归档状态。
 - 支持 `report` 只读导出 JSON/CSV 索引报告。
@@ -181,7 +182,7 @@ wechat-archive/
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、图片宽高解析、MP4 视频时长/宽高解析、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder`、原始文件名、MIME、图片/视频元数据和消息来源记录、消息库诊断、消息库图片/视频/文件附件/语音归档、外部已解密消息库目录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
+- 单元测试覆盖普通图片格式识别、图片宽高解析、MP4 视频时长/宽高解析、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder`、原始文件名、MIME、图片/视频元数据和消息来源记录、任务级抽取统计、消息库诊断、消息库图片/视频/文件附件/语音归档、外部已解密消息库目录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
 - 已通过：
 
 ```bash
@@ -257,6 +258,7 @@ wechat-archiver extract --type voice
 - `extract-db-voices` 当前从消息库枚举 `local_type=34` 语音消息，读取 `media_*.db/VoiceInfo.voice_data` 原始 BLOB，并记录消息来源字段。
 - `voice` 入口当前扫描直接语音/音频文件；对微信账号目录或 `msg/attach` 只在存在 `msg/voice` 或 `msg/audio` 专用目录时扫描，避免把 `msg/file` 中的音乐附件误归为语音消息。
 - `extract --type image,video,file,voice` 支持多类型顺序执行，并输出聚合 summary 和各类型子 summary。
+- 聚合 summary 会汇总每个子任务的新对象、已有对象、旧索引复用、实际 `.dat` 解码和元数据补写计数。
 
 计划：
 
@@ -295,7 +297,7 @@ wechat-archiver extract --type voice
 计划：
 
 - 继续丰富 `media_items` 字段：会话 ID、发送人显示名、更多音频格式时长和更多视频容器元数据。
-- 继续扩展增量扫描状态：任务级扫描游标和更完整的变更统计。
+- 继续扩展增量扫描状态：任务级扫描游标和跨运行状态缓存。
 
 验收标准：
 

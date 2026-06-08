@@ -151,6 +151,7 @@ wechat-archive/
 - 复制到归档目录。
 - 写入 SQLite 索引，并保持 schema 迁移可追踪、可幂等复跑。
 - 索引和 manifest 会记录 `original_filename`、`mime_type`、`width_px`、`height_px`、`duration_ms`、`source_size_bytes`、`source_modified_ms`、`decode_fingerprint`；MIME 当前基于归档扩展名保守推断，不做内容嗅探，图片宽高、视频宽高/时长和部分音频时长当前 best-effort 写入。直接媒体复跑时可基于未变源文件指纹复用已校验记录，`.dat` 图片可基于未变源文件指纹、解码参数指纹和已校验对象复用旧记录；`decode_fingerprint` 只保存参数哈希，不保存原始 key。
+- 抽取 summary 会输出旧索引复用、实际 `.dat` 解码、元数据补写、新对象写入和已有对象命中计数，便于判断每次运行的真实工作量。
 - 消息库图片、视频、文件附件和语音归档会在索引和 manifest 中记录可用的 `message_talker`、`message_sender`、`message_local_id`、`message_create_time`；`message_sender` 当前仅在 `Msg_*` 表存在 `real_sender_id` 且同库 `Name2Id` 可映射时写入稳定 `user_name`。
 - 支持 `status` 查看索引总量、唯一对象、唯一字节数，并按媒体类型、来源类型、解密状态和校验状态分组。
 - 支持 `report` 只读导出 JSON/CSV 索引报告，供人工审计、备份流程和后续 AI 分类使用。
@@ -216,7 +217,7 @@ wechat-archiver extract --chat "某个群名"
 wechat-archiver extract --since 2025-01-01
 ```
 
-当前 `extract --type image,video,file,voice` 已支持按类型顺序执行并输出聚合 summary；总计字段是各子任务相加，不代表跨类型去重后的唯一文件数。
+当前 `extract --type image,video,file,voice` 已支持按类型顺序执行并输出聚合 summary；总计字段是各子任务相加，不代表跨类型去重后的唯一文件数。聚合 summary 会同时汇总 `reused_records`、`decoded_dat`、`metadata_backfilled`、`new_objects` 和 `existing_objects`。
 
 ### 第 3 阶段：去重和 AI 管理
 

@@ -694,6 +694,11 @@ struct AggregateExtractSummary {
     would_archive: u64,
     archived: u64,
     already_archived: u64,
+    reused_records: u64,
+    decoded_dat: u64,
+    metadata_backfilled: u64,
+    new_objects: u64,
+    existing_objects: u64,
     unsupported: u64,
     failed: u64,
     summaries: Vec<MediaTypeExtractSummary>,
@@ -733,6 +738,26 @@ impl AggregateExtractSummary {
             already_archived: summaries
                 .iter()
                 .map(|summary| summary.summary.already_archived)
+                .sum(),
+            reused_records: summaries
+                .iter()
+                .map(|summary| summary.summary.reused_records)
+                .sum(),
+            decoded_dat: summaries
+                .iter()
+                .map(|summary| summary.summary.decoded_dat)
+                .sum(),
+            metadata_backfilled: summaries
+                .iter()
+                .map(|summary| summary.summary.metadata_backfilled)
+                .sum(),
+            new_objects: summaries
+                .iter()
+                .map(|summary| summary.summary.new_objects)
+                .sum(),
+            existing_objects: summaries
+                .iter()
+                .map(|summary| summary.summary.existing_objects)
                 .sum(),
             unsupported: summaries
                 .iter()
@@ -881,6 +906,11 @@ fn print_extract_summary(summary: &ExtractSummary, json: bool) -> Result<()> {
     println!("would_archive: {}", summary.would_archive);
     println!("archived: {}", summary.archived);
     println!("already_archived: {}", summary.already_archived);
+    println!("reused_records: {}", summary.reused_records);
+    println!("decoded_dat: {}", summary.decoded_dat);
+    println!("metadata_backfilled: {}", summary.metadata_backfilled);
+    println!("new_objects: {}", summary.new_objects);
+    println!("existing_objects: {}", summary.existing_objects);
     println!("unsupported: {}", summary.unsupported);
     println!("failed: {}", summary.failed);
     if let Some(explanation) = &summary.unsupported_explanation {
@@ -916,6 +946,11 @@ fn print_aggregate_extract_summary(summary: &AggregateExtractSummary, json: bool
     println!("would_archive: {}", summary.would_archive);
     println!("archived: {}", summary.archived);
     println!("already_archived: {}", summary.already_archived);
+    println!("reused_records: {}", summary.reused_records);
+    println!("decoded_dat: {}", summary.decoded_dat);
+    println!("metadata_backfilled: {}", summary.metadata_backfilled);
+    println!("new_objects: {}", summary.new_objects);
+    println!("existing_objects: {}", summary.existing_objects);
     println!("unsupported: {}", summary.unsupported);
     println!("failed: {}", summary.failed);
     println!("summaries:");
@@ -927,6 +962,14 @@ fn print_aggregate_extract_summary(summary: &AggregateExtractSummary, json: bool
         println!("    would_archive: {}", item.summary.would_archive);
         println!("    archived: {}", item.summary.archived);
         println!("    already_archived: {}", item.summary.already_archived);
+        println!("    reused_records: {}", item.summary.reused_records);
+        println!("    decoded_dat: {}", item.summary.decoded_dat);
+        println!(
+            "    metadata_backfilled: {}",
+            item.summary.metadata_backfilled
+        );
+        println!("    new_objects: {}", item.summary.new_objects);
+        println!("    existing_objects: {}", item.summary.existing_objects);
         println!("    unsupported: {}", item.summary.unsupported);
         println!("    failed: {}", item.summary.failed);
         if let Some(path) = &item.summary.index_path {
@@ -1729,6 +1772,12 @@ mod tests {
         assert_eq!(summary.candidates, 7);
         assert_eq!(summary.would_archive, 7);
         assert_eq!(summary.archived, 0);
+        assert_eq!(summary.already_archived, 0);
+        assert_eq!(summary.reused_records, 0);
+        assert_eq!(summary.decoded_dat, 0);
+        assert_eq!(summary.metadata_backfilled, 0);
+        assert_eq!(summary.new_objects, 0);
+        assert_eq!(summary.existing_objects, 0);
         assert!(!archive.exists());
     }
 }

@@ -25,6 +25,7 @@
 - 对未知 `.dat`、缺少 V2 key 或无法识别文件记录为 `unsupported`，不会写出不可信的垃圾文件；对消息库中存在但本地 `.dat` 缺失的资源记录为 `failed`。
 - 归档文件写入独立 archive 目录，使用内容寻址路径 `objects/sha256/<prefix>/<sha256>.<ext>`。
 - 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind`、独立 `decoder`、`.dat` 解码参数指纹、原始文件名、MIME 类型、图片/视频宽高、部分媒体时长、源文件指纹和可用的消息来源字段；索引库通过 `schema_migrations` 记录显式 schema 版本迁移。
+- 抽取 summary 会区分本轮新写对象、命中已有对象、复用旧索引记录、实际 `.dat` 解码次数和元数据补写次数，便于判断复跑是否真的减少了 hash、复制或解码工作。
 - 支持 `status` 查看索引统计，支持 `lookup` 按 `sha256` 或源路径反查索引记录，支持 `report` 导出 JSON/CSV 索引报告，支持 `views` 生成归档目录内的可浏览派生视图，支持 `verify` 重新计算归档对象 hash。
 
 当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`count-db-media`、`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；图片、视频和文件附件仍只从 `--account` 下的 `msg/*` 读取，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。
@@ -137,7 +138,7 @@ cargo run -p wechat-archiver -- extract --type image,video,file,voice \
   --json
 ```
 
-多类型聚合复用各单类型抽取器；总计中的 `candidates`、`scanned_files` 等字段是各类型结果相加，不代表跨类型去重后的唯一文件数。
+多类型聚合复用各单类型抽取器；总计中的 `candidates`、`scanned_files`、`reused_records`、`decoded_dat`、`metadata_backfilled`、`new_objects`、`existing_objects` 等字段是各类型结果相加，不代表跨类型去重后的唯一文件数。
 
 归档直接视频文件：
 
@@ -346,7 +347,7 @@ wechat-archive/
   views/
 ```
 
-`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`views/` 是由索引再生成的相对软链接视图，可删除后重建。`index.sqlite` 通过 `schema_migrations` 记录已应用的 schema 版本，便于后续安全升级旧归档库。`lookup` 会只读打开索引，可按 `sha256` 反查所有来源，也可按 `source_path` 查询单个源文件的当前归档状态；`report` 会只读导出全量索引报告。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`，并记录 `decode_fingerprint`、`original_filename`、基于扩展名保守推断的 `mime_type`、图片/视频 `width_px`/`height_px`、视频和部分音频 `duration_ms`、`source_size_bytes` 和 `source_modified_ms`。直接媒体复跑时，如果源文件指纹未变且既有索引记录已校验通过，会复用索引记录并跳过重新 hash/复制；`.dat` 图片会在源文件指纹、解码参数指纹和已校验对象都匹配时复用旧记录并跳过重解码。`decode_fingerprint` 只保存参数哈希，覆盖 AES key 哈希、XOR key、`wxgf` mode 和 ffmpeg 路径，不保存原始 key。通过消息库归档的图片、视频、文件附件和语音还会记录可用的消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；`message_sender` 当前只写入可从 `real_sender_id` + `Name2Id` 解析到的稳定 `user_name`。
+`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`views/` 是由索引再生成的相对软链接视图，可删除后重建。`index.sqlite` 通过 `schema_migrations` 记录已应用的 schema 版本，便于后续安全升级旧归档库。`lookup` 会只读打开索引，可按 `sha256` 反查所有来源，也可按 `source_path` 查询单个源文件的当前归档状态；`report` 会只读导出全量索引报告。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`，并记录 `decode_fingerprint`、`original_filename`、基于扩展名保守推断的 `mime_type`、图片/视频 `width_px`/`height_px`、视频和部分音频 `duration_ms`、`source_size_bytes` 和 `source_modified_ms`。直接媒体复跑时，如果源文件指纹未变且既有索引记录已校验通过，会复用索引记录并跳过重新 hash/复制；`.dat` 图片会在源文件指纹、解码参数指纹和已校验对象都匹配时复用旧记录并跳过重解码。抽取 summary 会把这类索引复用、实际 `.dat` 解码、元数据补写、新对象写入和已有对象命中分开计数。`decode_fingerprint` 只保存参数哈希，覆盖 AES key 哈希、XOR key、`wxgf` mode 和 ffmpeg 路径，不保存原始 key。通过消息库归档的图片、视频、文件附件和语音还会记录可用的消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；`message_sender` 当前只写入可从 `real_sender_id` + `Name2Id` 解析到的稳定 `user_name`。
 
 ## 外部项目参考
 

@@ -15,8 +15,8 @@ use crate::index::{index_path, open_index};
 use crate::manifest::ManifestWriter;
 use crate::media::{direct_file_extension, direct_video_extension, mime_type_for_extension};
 use crate::scanner::{
-    apply_result, persist, process_dat_image_with_message_source,
-    process_direct_media_with_message_source, MessageSource, ScanOutcome,
+    apply_result, outcome_with_object_stat, persist, process_dat_image_with_message_source,
+    process_direct_media_with_message_source, MessageSource, ObjectWriteStat, ScanOutcome,
 };
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 
@@ -1800,17 +1800,21 @@ fn process_voice_resource(
     let extension = voice_extension_for_data(&resource.data).to_string();
     let audio_metadata = detect_audio_metadata(&resource.data, &extension);
     let (sha256, size_bytes) = sha256_bytes(&resource.data);
-    let (action, archive_path, verify_status) = if dry_run {
-        (ScanAction::WouldArchive, None, "not_run".to_string())
+    let (action, archive_path, verify_status, object_write_stat) = if dry_run {
+        (ScanAction::WouldArchive, None, "not_run".to_string(), None)
     } else {
         match store_bytes(archive_root, run_id, &resource.data, &sha256, &extension)? {
-            StoreOutcome::Stored { archive_path } => {
-                (ScanAction::Archived, Some(archive_path), "ok".to_string())
-            }
+            StoreOutcome::Stored { archive_path } => (
+                ScanAction::Archived,
+                Some(archive_path),
+                "ok".to_string(),
+                Some(ObjectWriteStat::New),
+            ),
             StoreOutcome::AlreadyExists { archive_path } => (
                 ScanAction::AlreadyArchived,
                 Some(archive_path),
                 "ok".to_string(),
+                Some(ObjectWriteStat::Existing),
             ),
         }
     };
@@ -1854,7 +1858,10 @@ fn process_voice_resource(
         error: None,
     };
     persist(conn, manifest, &event)?;
-    Ok(ScanOutcome::new(action))
+    Ok(outcome_with_object_stat(
+        ScanOutcome::new(action),
+        object_write_stat,
+    ))
 }
 
 fn find_video_file(video_root: &Path, file_md5: &str, create_time: i64) -> Option<PathBuf> {

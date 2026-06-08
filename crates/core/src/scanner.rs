@@ -57,6 +57,12 @@ struct SourceFingerprint {
     modified_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ObjectWriteStat {
+    New,
+    Existing,
+}
+
 pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
     let resolved = config.resolve()?;
     let mut run = ScanRun::new(&resolved, "extract-images")?;
@@ -352,6 +358,11 @@ pub(crate) struct ScanOutcome {
     pub action: ScanAction,
     pub unsupported_reason: Option<String>,
     pub unsupported_sample: Option<String>,
+    pub reused_records: u64,
+    pub decoded_dat: u64,
+    pub metadata_backfilled: u64,
+    pub new_objects: u64,
+    pub existing_objects: u64,
 }
 
 impl ScanOutcome {
@@ -360,7 +371,37 @@ impl ScanOutcome {
             action,
             unsupported_reason: None,
             unsupported_sample: None,
+            reused_records: 0,
+            decoded_dat: 0,
+            metadata_backfilled: 0,
+            new_objects: 0,
+            existing_objects: 0,
         }
+    }
+
+    fn reused_record(mut self) -> Self {
+        self.reused_records += 1;
+        self
+    }
+
+    fn decoded_dat(mut self) -> Self {
+        self.decoded_dat += 1;
+        self
+    }
+
+    fn metadata_backfilled(mut self) -> Self {
+        self.metadata_backfilled += 1;
+        self
+    }
+
+    pub(crate) fn new_object(mut self) -> Self {
+        self.new_objects += 1;
+        self
+    }
+
+    pub(crate) fn existing_object(mut self) -> Self {
+        self.existing_objects += 1;
+        self
     }
 
     fn unsupported(reason: impl Into<String>, sample: impl Into<String>) -> Self {
@@ -368,6 +409,11 @@ impl ScanOutcome {
             action: ScanAction::Unsupported,
             unsupported_reason: Some(reason.into()),
             unsupported_sample: Some(sample.into()),
+            reused_records: 0,
+            decoded_dat: 0,
+            metadata_backfilled: 0,
+            new_objects: 0,
+            existing_objects: 0,
         }
     }
 }
@@ -389,7 +435,23 @@ pub(crate) fn apply_result(
         ScanAction::Failed => summary.failed += 1,
         ScanAction::WouldArchive => summary.would_archive += 1,
     }
+    summary.reused_records += result.reused_records;
+    summary.decoded_dat += result.decoded_dat;
+    summary.metadata_backfilled += result.metadata_backfilled;
+    summary.new_objects += result.new_objects;
+    summary.existing_objects += result.existing_objects;
     Ok(())
+}
+
+pub(crate) fn outcome_with_object_stat(
+    outcome: ScanOutcome,
+    object_write_stat: Option<ObjectWriteStat>,
+) -> ScanOutcome {
+    match object_write_stat {
+        Some(ObjectWriteStat::New) => outcome.new_object(),
+        Some(ObjectWriteStat::Existing) => outcome.existing_object(),
+        None => outcome,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -473,7 +535,7 @@ pub(crate) fn process_direct_media_with_message_source(
                 existing,
             );
             persist(conn, manifest, &event)?;
-            return Ok(ScanOutcome::new(ScanAction::AlreadyArchived));
+            return Ok(ScanOutcome::new(ScanAction::AlreadyArchived).reused_record());
         }
     }
 
@@ -481,6 +543,7 @@ pub(crate) fn process_direct_media_with_message_source(
 
     if let Some(existing) = reusable.as_ref() {
         if safe_archive_path_exists(archive_root, &existing.archive_path) {
+            let metadata_backfilled = metadata_adds_missing(existing, metadata);
             let event = build_reused_direct_media_event(
                 run_id,
                 path,
@@ -494,22 +557,31 @@ pub(crate) fn process_direct_media_with_message_source(
                 existing,
             );
             persist(conn, manifest, &event)?;
-            return Ok(ScanOutcome::new(ScanAction::AlreadyArchived));
+            let outcome = ScanOutcome::new(ScanAction::AlreadyArchived).reused_record();
+            return Ok(if metadata_backfilled {
+                outcome.metadata_backfilled()
+            } else {
+                outcome
+            });
         }
     }
 
     let (sha256, size_bytes) = sha256_file(path)?;
-    let (action, archive_path, verify_status) = if dry_run {
-        (ScanAction::WouldArchive, None, "not_run".to_string())
+    let (action, archive_path, verify_status, object_write_stat) = if dry_run {
+        (ScanAction::WouldArchive, None, "not_run".to_string(), None)
     } else {
         match store_file(archive_root, run_id, path, &sha256, extension)? {
-            StoreOutcome::Stored { archive_path } => {
-                (ScanAction::Archived, Some(archive_path), "ok".to_string())
-            }
+            StoreOutcome::Stored { archive_path } => (
+                ScanAction::Archived,
+                Some(archive_path),
+                "ok".to_string(),
+                Some(ObjectWriteStat::New),
+            ),
             StoreOutcome::AlreadyExists { archive_path } => (
                 ScanAction::AlreadyArchived,
                 Some(archive_path),
                 "ok".to_string(),
+                Some(ObjectWriteStat::Existing),
             ),
         }
     };
@@ -535,7 +607,10 @@ pub(crate) fn process_direct_media_with_message_source(
         None,
     );
     persist(conn, manifest, &event)?;
-    Ok(ScanOutcome::new(action))
+    Ok(outcome_with_object_stat(
+        ScanOutcome::new(action),
+        object_write_stat,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -692,7 +767,7 @@ pub(crate) fn process_dat_image_with_message_source(
                     existing,
                 );
                 persist(conn, manifest, &event)?;
-                return Ok(ScanOutcome::new(ScanAction::AlreadyArchived));
+                return Ok(ScanOutcome::new(ScanAction::AlreadyArchived).reused_record());
             }
         }
     }
@@ -711,17 +786,21 @@ pub(crate) fn process_dat_image_with_message_source(
         } => {
             let (sha256, size_bytes) = sha256_bytes(&bytes);
             let metadata = metadata_from_image_dimensions(detect_image_dimensions(&bytes));
-            let (action, archive_path, verify_status) = if dry_run {
-                (ScanAction::WouldArchive, None, "not_run".to_string())
+            let (action, archive_path, verify_status, object_write_stat) = if dry_run {
+                (ScanAction::WouldArchive, None, "not_run".to_string(), None)
             } else {
                 match store_bytes(archive_root, run_id, &bytes, &sha256, extension)? {
-                    StoreOutcome::Stored { archive_path } => {
-                        (ScanAction::Archived, Some(archive_path), "ok".to_string())
-                    }
+                    StoreOutcome::Stored { archive_path } => (
+                        ScanAction::Archived,
+                        Some(archive_path),
+                        "ok".to_string(),
+                        Some(ObjectWriteStat::New),
+                    ),
                     StoreOutcome::AlreadyExists { archive_path } => (
                         ScanAction::AlreadyArchived,
                         Some(archive_path),
                         "ok".to_string(),
+                        Some(ObjectWriteStat::Existing),
                     ),
                 }
             };
@@ -747,7 +826,7 @@ pub(crate) fn process_dat_image_with_message_source(
                 None,
             );
             persist(conn, manifest, &event)?;
-            Ok(ScanOutcome::new(action))
+            Ok(outcome_with_object_stat(ScanOutcome::new(action), object_write_stat).decoded_dat())
         }
         DatDecode::Validated { extension, decoder } => {
             let event = build_event(
@@ -940,6 +1019,12 @@ fn metadata_from_reusable(record: &ReusableMediaRecord) -> MediaMetadata {
     }
 }
 
+fn metadata_adds_missing(record: &ReusableMediaRecord, metadata: MediaMetadata) -> bool {
+    (record.width_px.is_none() && metadata.width_px.is_some())
+        || (record.height_px.is_none() && metadata.height_px.is_some())
+        || (record.duration_ms.is_none() && metadata.duration_ms.is_some())
+}
+
 fn metadata_complete_for_reuse(media_type: &str, record: &ReusableMediaRecord) -> bool {
     match media_type {
         "image" => record.width_px.is_some() && record.height_px.is_some(),
@@ -1088,6 +1173,12 @@ mod tests {
         assert_eq!(summary.scanned_files, 2);
         assert_eq!(summary.candidates, 2);
         assert_eq!(summary.archived, 2);
+        assert_eq!(summary.already_archived, 0);
+        assert_eq!(summary.reused_records, 0);
+        assert_eq!(summary.decoded_dat, 1);
+        assert_eq!(summary.metadata_backfilled, 0);
+        assert_eq!(summary.new_objects, 2);
+        assert_eq!(summary.existing_objects, 0);
         assert_eq!(std::fs::read(&direct_path).unwrap(), direct_bytes);
         assert_eq!(std::fs::read(&dat_path).unwrap(), encrypted);
         assert!(archive.join("index.sqlite").exists());
@@ -1155,6 +1246,9 @@ mod tests {
         .unwrap();
         assert_eq!(first.archived, 1);
         assert_eq!(first.already_archived, 0);
+        assert_eq!(first.reused_records, 0);
+        assert_eq!(first.new_objects, 1);
+        assert_eq!(first.existing_objects, 0);
 
         let mut permissions = std::fs::metadata(&direct_path).unwrap().permissions();
         permissions.set_mode(0o000);
@@ -1175,6 +1269,11 @@ mod tests {
 
         assert_eq!(second.archived, 0);
         assert_eq!(second.already_archived, 1);
+        assert_eq!(second.reused_records, 1);
+        assert_eq!(second.decoded_dat, 0);
+        assert_eq!(second.metadata_backfilled, 0);
+        assert_eq!(second.new_objects, 0);
+        assert_eq!(second.existing_objects, 0);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
         let (source_size_bytes, source_modified_ms): (Option<i64>, Option<i64>) = conn
@@ -1226,6 +1325,10 @@ mod tests {
         .unwrap();
         assert_eq!(first.archived, 1);
         assert_eq!(first.already_archived, 0);
+        assert_eq!(first.reused_records, 0);
+        assert_eq!(first.decoded_dat, 1);
+        assert_eq!(first.new_objects, 1);
+        assert_eq!(first.existing_objects, 0);
 
         let mut permissions = std::fs::metadata(&dat_path).unwrap().permissions();
         permissions.set_mode(0o000);
@@ -1246,6 +1349,11 @@ mod tests {
 
         assert_eq!(second.archived, 0);
         assert_eq!(second.already_archived, 1);
+        assert_eq!(second.reused_records, 1);
+        assert_eq!(second.decoded_dat, 0);
+        assert_eq!(second.metadata_backfilled, 0);
+        assert_eq!(second.new_objects, 0);
+        assert_eq!(second.existing_objects, 0);
 
         let manifest_path = second.manifest_path.unwrap();
         let manifest = std::fs::read_to_string(manifest_path).unwrap();
@@ -1264,6 +1372,101 @@ mod tests {
         assert_eq!(event.height_px, Some(8));
         assert!(event.source_size_bytes.is_some());
         assert!(event.source_modified_ms.is_some());
+    }
+
+    #[test]
+    fn duplicate_direct_media_counts_existing_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let image = synthetic_jpeg(64, 32);
+        std::fs::write(source.join("one.jpg"), &image).unwrap();
+        std::fs::write(source.join("two.jpg"), &image).unwrap();
+
+        let summary = extract_images(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive,
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.candidates, 2);
+        assert_eq!(summary.archived, 1);
+        assert_eq!(summary.already_archived, 1);
+        assert_eq!(summary.reused_records, 0);
+        assert_eq!(summary.decoded_dat, 0);
+        assert_eq!(summary.new_objects, 1);
+        assert_eq!(summary.existing_objects, 1);
+    }
+
+    #[test]
+    fn direct_media_reuse_counts_metadata_backfill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let direct_path = source.join("image.jpg");
+        std::fs::write(&direct_path, synthetic_jpeg(64, 32)).unwrap();
+
+        let first = extract_images(ArchiveConfig {
+            source_dir: source.clone(),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+        assert_eq!(first.archived, 1);
+        assert_eq!(first.new_objects, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        conn.execute(
+            r#"
+            UPDATE media_items
+            SET width_px = NULL,
+                height_px = NULL
+            WHERE source_relative_path = 'image.jpg'
+            "#,
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let second = extract_images(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(second.archived, 0);
+        assert_eq!(second.already_archived, 1);
+        assert_eq!(second.reused_records, 1);
+        assert_eq!(second.metadata_backfilled, 1);
+        assert_eq!(second.new_objects, 0);
+        assert_eq!(second.existing_objects, 0);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (width_px, height_px): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                r#"
+                SELECT width_px, height_px
+                FROM media_items
+                WHERE source_relative_path = 'image.jpg'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(width_px, Some(64));
+        assert_eq!(height_px, Some(32));
     }
 
     #[test]
