@@ -27,7 +27,7 @@
 - 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind`、独立 `decoder`、`.dat` 解码参数指纹、原始文件名、MIME 类型、图片/视频宽高、部分媒体时长、源文件指纹和可用的消息来源字段；索引库通过 `schema_migrations` 记录显式 schema 版本迁移。
 - 抽取 summary 会区分本轮新写对象、命中已有对象、复用旧索引记录、实际 `.dat` 解码次数和元数据补写次数，便于判断复跑是否真的减少了 hash、复制或解码工作。
 - core 暴露任务级 `TaskEvent`、`TaskProgress`、`TaskReporter`、`CancelToken`、`TaskRunner` 和 `TaskHandle`；CLI 抽取类命令支持 `--jsonl-progress` 将结构化进度事件输出到 stderr，供未来 Tauri 或脚本消费。
-- core 暴露 `TaskStore`、`TaskListQuery`、`TaskRetryCandidate` 和 `SqliteTaskStore`，`TaskRunner` 可显式接入 store 来记录、查询任务历史并生成不自动执行的安全 retry 候选；CLI 提供 `tasks list/show/retry-candidate --app-db <path>` 只读查看任务历史，持久化和重启恢复边界见 [docs/task-persistence-and-recovery.md](docs/task-persistence-and-recovery.md)。
+- core 暴露 `TaskStore`、`TaskListQuery`、`TaskRetryCandidate` 和 `SqliteTaskStore`，`TaskRunner` 可显式接入 store 来记录、查询任务历史并生成安全 retry 候选；CLI 提供 `tasks list/show/retry-candidate --app-db <path>` 只读查看任务历史，并提供显式 `tasks retry --app-db <path> <task_id>` 重新发起安全候选任务，持久化和重启恢复边界见 [docs/task-persistence-and-recovery.md](docs/task-persistence-and-recovery.md)。
 - 支持 `status` 查看索引统计，支持 `lookup` 按 `sha256` 或源路径反查索引记录，支持 `report` 导出 JSON/CSV 索引报告，支持 `views` 生成归档目录内的可浏览派生视图，支持 `verify` 重新计算归档对象 hash。
 
 当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`count-db-media`、`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；图片、视频和文件附件仍只从 `--account` 下的 `msg/*` 读取，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。
@@ -333,6 +333,24 @@ cargo run -p wechat-archiver -- verify \
 ```
 
 `verify` 会重新计算归档对象 sha256，并检查 `verify_status=ok` 的索引记录是否存在完整的 `archive_path`、`sha256`、对象文件，以及 `archive_path` 文件名中的 hash 是否与索引一致。发现对象缺失、不可读、hash 不一致或索引引用异常时，命令会返回退出码 `2`。
+
+查看任务历史和显式重试：
+
+```bash
+cargo run -p wechat-archiver -- tasks list \
+  --app-db "/path/to/app.sqlite" \
+  --status failed,interrupted
+
+cargo run -p wechat-archiver -- tasks retry-candidate \
+  --app-db "/path/to/app.sqlite" \
+  "task-id"
+
+cargo run -p wechat-archiver -- tasks retry \
+  --app-db "/path/to/app.sqlite" \
+  "task-id"
+```
+
+`tasks list/show/retry-candidate` 只读打开显式 `--app-db`；`tasks retry` 会读写打开已有 app SQLite，基于安全候选创建新的任务记录并执行。当前 retry 只支持直接媒体抽取任务，不自动恢复图片 AES key；需要 AES key 的图片任务应手动重新运行抽取命令并显式传入 key。
 
 多数查询命令支持 `--json` 输出结构化结果；`report` 通过 `--format json|csv` 选择输出格式。
 

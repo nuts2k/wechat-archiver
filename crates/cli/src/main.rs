@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
     archive_report, archive_status, count_message_db_media, derive_image_key, discover_wechat,
@@ -14,8 +16,9 @@ use wechat_archiver_core::{
     ImageKeyDerivation, ImageKeyMethod, IndexLookup, IndexLookupQuery, MessageDbExtractConfig,
     MessageDbInspectConfig, MessageDbInspection, MessageDbMediaCountConfig,
     MessageDbMediaCountSummary, MessageDbMediaTypeCount, PersistentTaskStatus, SqliteTaskStore,
-    TaskListQuery, TaskOptions, TaskRecord, TaskReporter, TaskRetryCandidate, TaskStore,
-    VerifySummary, ViewsConfig, ViewsSummary, WechatDiscovery,
+    TaskHandle, TaskListQuery, TaskMetadata, TaskOptions, TaskRecord, TaskReporter,
+    TaskRetryCandidate, TaskRunner, TaskStatus, TaskStore, VerifySummary, ViewsConfig,
+    ViewsSummary, WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -366,6 +369,9 @@ enum TaskCommands {
 
     /// 生成不自动执行的 retry 候选；只读打开 --app-db。
     RetryCandidate(TasksRetryCandidateArgs),
+
+    /// 基于安全 retry 候选重新发起任务；写入新的任务历史记录。
+    Retry(TasksRetryArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -416,6 +422,20 @@ struct TasksShowArgs {
 #[derive(Debug, Clone, Args)]
 struct TasksRetryCandidateArgs {
     /// 显式 app SQLite 路径；不会默认创建。
+    #[arg(long)]
+    app_db: PathBuf,
+
+    /// 历史任务 ID。
+    task_id: String,
+
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TasksRetryArgs {
+    /// 显式 app SQLite 路径；必须已存在，不会默认创建。
     #[arg(long)]
     app_db: PathBuf,
 
@@ -763,6 +783,11 @@ fn run_tasks(args: TasksArgs) -> Result<()> {
                 .with_context(|| format!("task not found: {}", args.task_id))?;
             print_task_retry_candidate(&candidate, args.json)?;
         }
+        TaskCommands::Retry(args) => {
+            let json = args.json;
+            let retry_run = run_task_retry(args)?;
+            print_task_retry_run(&retry_run, json)?;
+        }
     }
     Ok(())
 }
@@ -774,6 +799,258 @@ fn open_task_store_readonly(app_db: &Path) -> Result<SqliteTaskStore> {
         app_db.display()
     );
     Ok(SqliteTaskStore::open_readonly(app_db)?)
+}
+
+fn open_task_store_writable(app_db: &Path) -> Result<SqliteTaskStore> {
+    anyhow::ensure!(
+        app_db.is_file(),
+        "app db does not exist or is not a file: {}",
+        app_db.display()
+    );
+    Ok(SqliteTaskStore::open(app_db)?)
+}
+
+#[derive(Debug, Serialize)]
+struct TaskRetryRun {
+    source_task_id: String,
+    retry_task_id: String,
+    task_kind: String,
+    status: TaskStatus,
+    result_summary: Option<ExtractSummary>,
+    error: Option<String>,
+}
+
+fn run_task_retry(args: TasksRetryArgs) -> Result<TaskRetryRun> {
+    let store = Arc::new(open_task_store_writable(&args.app_db)?);
+    let candidate = store
+        .retry_candidate(&args.task_id)?
+        .with_context(|| format!("task not found: {}", args.task_id))?;
+    ensure_retry_candidate(&candidate)?;
+
+    let source_dir = candidate
+        .source_dir
+        .clone()
+        .context("retry candidate missing source_dir")?;
+    let archive_dir = candidate
+        .archive_dir
+        .clone()
+        .context("retry candidate missing archive_dir")?;
+    let params_summary_json = retry_params_for_new_task(&candidate)?;
+    let metadata = TaskMetadata::new(candidate.task_kind.clone())
+        .with_source_dir(source_dir)
+        .with_archive_dir(archive_dir)
+        .with_dry_run(candidate.dry_run)
+        .with_params_summary_json(params_summary_json);
+    let task_name = format!("retry: {}", candidate.task_name);
+    let runner = TaskRunner::with_store(Arc::clone(&store));
+    let handle = spawn_retry_task(&runner, task_name, metadata, &candidate)?;
+    let retry_task_id = handle.task_id().to_string();
+    let snapshot = handle.join();
+    let retry_run = TaskRetryRun {
+        source_task_id: candidate.source_task_id,
+        retry_task_id,
+        task_kind: candidate.task_kind,
+        status: snapshot.status.clone(),
+        result_summary: snapshot.result,
+        error: snapshot.error,
+    };
+
+    if retry_run.status != TaskStatus::Completed {
+        anyhow::bail!(
+            "retry task {} ended with {:?}: {}",
+            retry_run.retry_task_id,
+            retry_run.status,
+            retry_run.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+
+    Ok(retry_run)
+}
+
+fn ensure_retry_candidate(candidate: &TaskRetryCandidate) -> Result<()> {
+    anyhow::ensure!(
+        candidate.retryable,
+        "task is not retryable: {}",
+        candidate.reasons.join(",")
+    );
+    Ok(())
+}
+
+fn spawn_retry_task(
+    runner: &TaskRunner,
+    task_name: String,
+    metadata: TaskMetadata,
+    candidate: &TaskRetryCandidate,
+) -> Result<TaskHandle> {
+    match candidate.task_kind.as_str() {
+        "extract_images" => {
+            let config = retry_image_archive_config(candidate)?;
+            Ok(
+                runner.spawn_with_metadata(task_name, metadata, move |options| {
+                    extract_images_with_task(config, options)
+                }),
+            )
+        }
+        "extract_videos" => {
+            let config = retry_direct_archive_config(candidate)?;
+            Ok(
+                runner.spawn_with_metadata(task_name, metadata, move |options| {
+                    extract_videos_with_task(config, options)
+                }),
+            )
+        }
+        "extract_files" => {
+            let config = retry_direct_archive_config(candidate)?;
+            Ok(
+                runner.spawn_with_metadata(task_name, metadata, move |options| {
+                    extract_files_with_task(config, options)
+                }),
+            )
+        }
+        "extract_voices" => {
+            let config = retry_direct_archive_config(candidate)?;
+            Ok(
+                runner.spawn_with_metadata(task_name, metadata, move |options| {
+                    extract_voices_with_task(config, options)
+                }),
+            )
+        }
+        other => anyhow::bail!("unsupported retry task_kind: {other}"),
+    }
+}
+
+fn retry_direct_archive_config(candidate: &TaskRetryCandidate) -> Result<ArchiveConfig> {
+    let (source_dir, archive_dir) = retry_dirs(candidate)?;
+    Ok(ArchiveConfig {
+        source_dir,
+        archive_dir,
+        dry_run: candidate.dry_run,
+        dat_options: DatDecodeOptions::default(),
+        explain_unsupported: retry_optional_bool_param(candidate, "explain_unsupported")?
+            .unwrap_or(false),
+    })
+}
+
+fn retry_image_archive_config(candidate: &TaskRetryCandidate) -> Result<ArchiveConfig> {
+    let (source_dir, archive_dir) = retry_dirs(candidate)?;
+    let params = retry_params_object(candidate)?;
+    let image_aes_key_provided = retry_required_bool_param(params, "image_aes_key_provided")?;
+    anyhow::ensure!(
+        !image_aes_key_provided,
+        "retry will not restore image AES key; rerun extract-images manually with --image-aes-key"
+    );
+    let image_xor_key = retry_required_u8_param(params, "image_xor_key")?;
+    let wxgf_mode = retry_required_wxgf_mode_param(params, "wxgf_mode")?;
+    let wxgf_ffmpeg_path = retry_optional_path_param(params, "wxgf_ffmpeg_path")?;
+    let explain_unsupported =
+        retry_optional_bool_param(candidate, "explain_unsupported")?.unwrap_or(false);
+
+    Ok(ArchiveConfig {
+        source_dir,
+        archive_dir,
+        dry_run: candidate.dry_run,
+        dat_options: DatDecodeOptions {
+            image_aes_key: None,
+            image_xor_key,
+            wxgf_mode,
+            wxgf_ffmpeg_path,
+        },
+        explain_unsupported,
+    })
+}
+
+fn retry_dirs(candidate: &TaskRetryCandidate) -> Result<(PathBuf, PathBuf)> {
+    let source_dir = candidate
+        .source_dir
+        .clone()
+        .context("retry candidate missing source_dir")?;
+    let archive_dir = candidate
+        .archive_dir
+        .clone()
+        .context("retry candidate missing archive_dir")?;
+    Ok((source_dir, archive_dir))
+}
+
+fn retry_params_for_new_task(candidate: &TaskRetryCandidate) -> Result<JsonValue> {
+    let mut params = candidate
+        .params_summary_json
+        .clone()
+        .context("retry candidate missing params_summary_json")?;
+    let JsonValue::Object(object) = &mut params else {
+        anyhow::bail!("retry params_summary_json must be an object");
+    };
+    object.insert(
+        "retry_source_task_id".to_string(),
+        JsonValue::String(candidate.source_task_id.clone()),
+    );
+    Ok(params)
+}
+
+fn retry_params_object(candidate: &TaskRetryCandidate) -> Result<&JsonMap<String, JsonValue>> {
+    let Some(JsonValue::Object(params)) = candidate.params_summary_json.as_ref() else {
+        anyhow::bail!("retry params_summary_json must be an object");
+    };
+    Ok(params)
+}
+
+fn retry_optional_bool_param(candidate: &TaskRetryCandidate, key: &str) -> Result<Option<bool>> {
+    let params = retry_params_object(candidate)?;
+    match params.get(key) {
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .with_context(|| format!("retry param {key} must be boolean")),
+        None => Ok(None),
+    }
+}
+
+fn retry_required_bool_param(params: &JsonMap<String, JsonValue>, key: &str) -> Result<bool> {
+    params
+        .get(key)
+        .and_then(JsonValue::as_bool)
+        .with_context(|| format!("retry param {key} must be boolean"))
+}
+
+fn retry_required_u8_param(params: &JsonMap<String, JsonValue>, key: &str) -> Result<u8> {
+    let value = params
+        .get(key)
+        .with_context(|| format!("retry param {key} is required"))?;
+    if let Some(number) = value.as_u64() {
+        return u8::try_from(number).with_context(|| format!("retry param {key} must fit in u8"));
+    }
+    if let Some(text) = value.as_str() {
+        return parse_u8_key(text).with_context(|| format!("retry param {key} is invalid"));
+    }
+    anyhow::bail!("retry param {key} must be number or string")
+}
+
+fn retry_required_wxgf_mode_param(
+    params: &JsonMap<String, JsonValue>,
+    key: &str,
+) -> Result<CoreWxgfMode> {
+    let value = params
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .with_context(|| format!("retry param {key} must be string"))?;
+    match value {
+        "off" => Ok(CoreWxgfMode::Off),
+        "raw" => Ok(CoreWxgfMode::Raw),
+        "jpg" => Ok(CoreWxgfMode::Jpg),
+        "mp4" => Ok(CoreWxgfMode::Mp4),
+        _ => anyhow::bail!("retry param {key} has unsupported value: {value}"),
+    }
+}
+
+fn retry_optional_path_param(
+    params: &JsonMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<PathBuf>> {
+    match params.get(key) {
+        Some(JsonValue::Null) | None => Ok(None),
+        Some(JsonValue::String(value)) if value.is_empty() => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(PathBuf::from(value))),
+        Some(_) => anyhow::bail!("retry param {key} must be string or null"),
+    }
 }
 
 fn run_lookup(args: LookupArgs) -> Result<IndexLookup> {
@@ -1393,6 +1670,24 @@ fn print_task_retry_candidate(candidate: &TaskRetryCandidate, json: bool) -> Res
             .unwrap_or_else(|| "-".to_string())
     );
     println!("note: retry-candidate 只生成候选参数，不会执行任务。");
+    Ok(())
+}
+
+fn print_task_retry_run(retry_run: &TaskRetryRun, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(retry_run)?);
+        return Ok(());
+    }
+
+    println!("source_task_id: {}", retry_run.source_task_id);
+    println!("retry_task_id: {}", retry_run.retry_task_id);
+    println!("task_kind: {}", retry_run.task_kind);
+    println!("status: {:?}", retry_run.status);
+    if let Some(summary) = &retry_run.result_summary {
+        println!("result_summary:");
+        print_extract_summary(summary, false)?;
+    }
+    println!("error: {}", optional_string(&retry_run.error));
     Ok(())
 }
 
@@ -2031,6 +2326,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_tasks_retry_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "tasks",
+            "retry",
+            "--app-db",
+            "/tmp/app.sqlite",
+            "task-1",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Tasks(TasksArgs {
+                command: TaskCommands::Retry(args),
+            }) => {
+                assert_eq!(args.app_db, PathBuf::from("/tmp/app.sqlite"));
+                assert_eq!(args.task_id, "task-1");
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_tasks_without_explicit_app_db() {
         let result = Cli::try_parse_from(["wechat-archiver", "tasks", "list"]);
         assert!(result.is_err());
@@ -2113,6 +2433,120 @@ mod tests {
         .unwrap();
 
         assert!(!source_dir.exists());
+        assert!(!archive_dir.exists());
+    }
+
+    #[test]
+    fn tasks_retry_open_does_not_create_missing_app_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("missing.sqlite");
+
+        let result = run_tasks(TasksArgs {
+            command: TaskCommands::Retry(TasksRetryArgs {
+                app_db: app_db.clone(),
+                task_id: "task-1".to_string(),
+                json: true,
+            }),
+        });
+
+        assert!(result.is_err());
+        assert!(!app_db.exists());
+    }
+
+    #[test]
+    fn tasks_retry_rejects_image_tasks_that_need_aes_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("app.sqlite");
+        let source_dir = tmp.path().join("wechat-source");
+        let archive_dir = tmp.path().join("archive");
+        let store = SqliteTaskStore::open(&app_db).unwrap();
+        store
+            .create_task(&wechat_archiver_core::TaskCreate {
+                task_id: "task-1".to_string(),
+                task_name: "抽取图片".to_string(),
+                task_kind: "extract_images".to_string(),
+                archive_dir: Some(archive_dir.clone()),
+                source_dir: Some(source_dir.clone()),
+                dry_run: true,
+                params_summary_json: serde_json::json!({
+                    "task_kind": "extract_images",
+                    "media_types": ["image"],
+                    "image_aes_key_provided": true,
+                    "image_xor_key": 136,
+                    "wxgf_mode": "off",
+                    "wxgf_ffmpeg_path": null
+                }),
+            })
+            .unwrap();
+        store.mark_failed("task-1", "失败").unwrap();
+        drop(store);
+
+        let result = run_tasks(TasksArgs {
+            command: TaskCommands::Retry(TasksRetryArgs {
+                app_db,
+                task_id: "task-1".to_string(),
+                json: true,
+            }),
+        });
+
+        assert!(result.is_err());
+        assert!(!source_dir.exists());
+        assert!(!archive_dir.exists());
+    }
+
+    #[test]
+    fn tasks_retry_records_new_completed_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("app.sqlite");
+        let source_dir = tmp.path().join("wechat-source");
+        let archive_dir = tmp.path().join("archive");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::write(source_dir.join("image.jpg"), b"fake jpg").unwrap();
+        let store = SqliteTaskStore::open(&app_db).unwrap();
+        store
+            .create_task(&wechat_archiver_core::TaskCreate {
+                task_id: "task-1".to_string(),
+                task_name: "抽取图片".to_string(),
+                task_kind: "extract_images".to_string(),
+                archive_dir: Some(archive_dir.clone()),
+                source_dir: Some(source_dir.clone()),
+                dry_run: true,
+                params_summary_json: serde_json::json!({
+                    "task_kind": "extract_images",
+                    "media_types": ["image"],
+                    "image_aes_key_provided": false,
+                    "image_xor_key": 136,
+                    "wxgf_mode": "off",
+                    "wxgf_ffmpeg_path": null
+                }),
+            })
+            .unwrap();
+        store.mark_failed("task-1", "失败").unwrap();
+        drop(store);
+
+        run_tasks(TasksArgs {
+            command: TaskCommands::Retry(TasksRetryArgs {
+                app_db: app_db.clone(),
+                task_id: "task-1".to_string(),
+                json: true,
+            }),
+        })
+        .unwrap();
+
+        let store = SqliteTaskStore::open_readonly(&app_db).unwrap();
+        let records = store.list_tasks(&TaskListQuery::default()).unwrap();
+        let retry = records
+            .iter()
+            .find(|record| record.task_id != "task-1")
+            .expect("retry task record");
+        assert_eq!(retry.status, PersistentTaskStatus::Completed);
+        assert_eq!(retry.task_name, "retry: 抽取图片");
+        assert_eq!(retry.task_kind, "extract_images");
+        assert_eq!(retry.source_dir.as_deref(), Some(source_dir.as_path()));
+        assert_eq!(retry.archive_dir.as_deref(), Some(archive_dir.as_path()));
+        assert_eq!(retry.params_summary_json["retry_source_task_id"], "task-1");
+        assert_eq!(retry.progress.scanned_files, 1);
+        assert_eq!(retry.progress.candidates, 1);
         assert!(!archive_dir.exists());
     }
 

@@ -716,6 +716,15 @@ fn retry_params_summary(record: &TaskRecord, reasons: &mut Vec<String>) -> Optio
         _ => reasons.push("params_summary_missing_task_kind".to_string()),
     }
 
+    if record.task_kind == "extract_images"
+        && params
+            .get("image_aes_key_provided")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false)
+    {
+        reasons.push("params_summary_requires_image_aes_key".to_string());
+    }
+
     Some(record.params_summary_json.clone())
 }
 
@@ -815,8 +824,10 @@ mod tests {
             dry_run: false,
             params_summary_json: json!({
                 "task_kind": task_kind,
-                "image_aes_key_provided": true,
-                "image_aes_key_sha256": "cf20965eec1a6a1024eba8120c5b33a98a8e4e3b0f2a8218ecf7d70ac8a3f1bb"
+                "image_aes_key_provided": false,
+                "image_xor_key": 136,
+                "wxgf_mode": "off",
+                "wxgf_ffmpeg_path": null
             }),
         }
     }
@@ -993,7 +1004,16 @@ mod tests {
     #[test]
     fn task_store_does_not_require_sensitive_params() {
         let store = SqliteTaskStore::open_in_memory().unwrap();
-        store.create_task(&task_create("task-1")).unwrap();
+        store
+            .create_task(&task_create_with_params(
+                "task-1",
+                json!({
+                    "task_kind": "extract_images",
+                    "image_aes_key_provided": true,
+                    "image_aes_key_sha256": "cf20965eec1a6a1024eba8120c5b33a98a8e4e3b0f2a8218ecf7d70ac8a3f1bb"
+                }),
+            ))
+            .unwrap();
 
         let conn = store.connection().unwrap();
         let stored_json: String = conn
@@ -1172,6 +1192,31 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.starts_with("params_summary_contains_sensitive_key")));
+        assert!(!format!("{candidate:?}").contains("plain-secret-aes-key"));
+    }
+
+    #[test]
+    fn retry_candidate_rejects_image_tasks_that_need_aes_key() {
+        let store = SqliteTaskStore::open_in_memory().unwrap();
+        store
+            .create_task(&task_create_with_params(
+                "needs-aes",
+                json!({
+                    "task_kind": "extract_images",
+                    "image_aes_key_provided": true,
+                    "image_aes_key_sha256": "cf20965eec1a6a1024eba8120c5b33a98a8e4e3b0f2a8218ecf7d70ac8a3f1bb"
+                }),
+            ))
+            .unwrap();
+        store.mark_failed("needs-aes", "失败").unwrap();
+
+        let candidate = store.retry_candidate("needs-aes").unwrap().unwrap();
+
+        assert!(!candidate.retryable);
+        assert!(candidate
+            .reasons
+            .contains(&"params_summary_requires_image_aes_key".to_string()));
+        assert!(format!("{candidate:?}").contains("image_aes_key_sha256"));
         assert!(!format!("{candidate:?}").contains("plain-secret-aes-key"));
     }
 
