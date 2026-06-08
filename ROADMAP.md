@@ -260,7 +260,7 @@ wechat-archiver extract --type voice
 - `extract --type image,video,file,voice` 支持多类型顺序执行，并输出聚合 summary 和各类型子 summary。
 - 聚合 summary 会汇总每个子任务的新对象、已有对象、旧索引复用、实际 `.dat` 解码和元数据补写计数。
 - core 已提供任务级 `TaskEvent`、`TaskProgress`、`TaskReporter`、`CancelToken`、`TaskRunner` 和 `TaskHandle`；直接扫描和消息库抽取均可发出结构化进度事件，CLI 抽取类命令可通过 `--jsonl-progress` 输出 JSONL 事件到 stderr。后台任务队列雏形支持单 worker 顺序执行、任务 ID、排队/运行/完成/失败/取消状态、进度快照、事件消费和取消句柄。
-- core 已提供 `TaskStore` trait 和 `SqliteTaskStore` 最小实现；`TaskRunner` 可通过显式 store 接入，在独立 app SQLite 中记录 `task_runs`、更新进度快照、写入完成/失败/取消终态，并在启动恢复时把遗留 `queued/running` 标记为 `interrupted`。任务历史支持按状态、任务类型、时间范围和 limit 只读查询。
+- core 已提供 `TaskStore` trait 和 `SqliteTaskStore` 最小实现；`TaskRunner` 可通过显式 store 接入，在独立 app SQLite 中记录 `task_runs`、更新进度快照、写入完成/失败/取消终态，并在启动恢复时把遗留 `queued/running` 标记为 `interrupted`。任务历史支持按状态、任务类型、时间范围和 limit 只读查询，并可生成不自动执行的安全 retry 候选。
 - 已补充任务队列持久化与恢复设计文档：`docs/task-persistence-and-recovery.md`。
 
 计划：
@@ -270,7 +270,7 @@ wechat-archiver extract --type voice
 - 语音归档增强：在已支持原始 BLOB、部分音频时长和稳定 sender ID 的基础上，补充发送人显示名，再支持可选转换为 `wav` 或 `mp3`。
 - 表情归档：识别静态图、动图和专有格式。
 - 支持 `--since`、`--until`、`--chat`、`--type` 等过滤参数。
-- 继续完善长任务控制：补充显式 retry、多 worker 配置、暂停/恢复和更细粒度进度节流，为未来 Tauri 做准备。
+- 继续完善长任务控制：补充显式 retry 命令、多 worker 配置、暂停/恢复和更细粒度进度节流，为未来 Tauri 做准备。
 
 验收标准：
 

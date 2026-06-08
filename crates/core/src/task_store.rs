@@ -64,6 +64,12 @@ pub trait TaskStore: Send + Sync {
     fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>>;
     fn list_tasks(&self, query: &TaskListQuery) -> Result<Vec<TaskRecord>>;
 
+    fn retry_candidate(&self, task_id: &str) -> Result<Option<TaskRetryCandidate>> {
+        Ok(self
+            .get_task(task_id)?
+            .map(|record| record.retry_candidate()))
+    }
+
     fn mark_completed(&self, task_id: &str, result_summary: &ExtractSummary) -> Result<()> {
         self.finish_task(
             task_id,
@@ -153,6 +159,26 @@ pub struct TaskRecord {
     pub last_event: Option<TaskEvent>,
     pub result_summary: Option<ExtractSummary>,
     pub error: Option<String>,
+}
+
+impl TaskRecord {
+    pub fn retry_candidate(&self) -> TaskRetryCandidate {
+        task_retry_candidate_from_record(self)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRetryCandidate {
+    pub source_task_id: String,
+    pub source_status: PersistentTaskStatus,
+    pub task_name: String,
+    pub task_kind: String,
+    pub archive_dir: Option<PathBuf>,
+    pub source_dir: Option<PathBuf>,
+    pub dry_run: bool,
+    pub params_summary_json: Option<JsonValue>,
+    pub retryable: bool,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -621,6 +647,125 @@ fn build_list_tasks_query(query: &TaskListQuery) -> (String, Vec<SqlValue>) {
     (sql, params)
 }
 
+fn task_retry_candidate_from_record(record: &TaskRecord) -> TaskRetryCandidate {
+    let mut reasons = Vec::new();
+
+    if !matches!(
+        record.status,
+        PersistentTaskStatus::Completed
+            | PersistentTaskStatus::Failed
+            | PersistentTaskStatus::Cancelled
+            | PersistentTaskStatus::Interrupted
+    ) {
+        reasons.push("task_not_terminal".to_string());
+    }
+
+    if record.task_kind.trim().is_empty() {
+        reasons.push("missing_task_kind".to_string());
+    }
+
+    if record.source_dir.is_none() {
+        reasons.push("missing_source_dir".to_string());
+    }
+
+    if record.archive_dir.is_none() {
+        reasons.push("missing_archive_dir".to_string());
+    }
+
+    let params_summary_json = retry_params_summary(record, &mut reasons);
+    let retryable = reasons.is_empty();
+
+    TaskRetryCandidate {
+        source_task_id: record.task_id.clone(),
+        source_status: record.status.clone(),
+        task_name: record.task_name.clone(),
+        task_kind: record.task_kind.clone(),
+        archive_dir: record.archive_dir.clone(),
+        source_dir: record.source_dir.clone(),
+        dry_run: record.dry_run,
+        params_summary_json,
+        retryable,
+        reasons,
+    }
+}
+
+fn retry_params_summary(record: &TaskRecord, reasons: &mut Vec<String>) -> Option<JsonValue> {
+    let JsonValue::Object(params) = &record.params_summary_json else {
+        reasons.push("params_summary_not_object".to_string());
+        return None;
+    };
+
+    if let Some(key_path) = find_sensitive_param_key(&record.params_summary_json) {
+        reasons.push(format!("params_summary_contains_sensitive_key:{key_path}"));
+        return None;
+    }
+
+    match params.get("task_kind").and_then(JsonValue::as_str) {
+        Some(task_kind) if !task_kind.trim().is_empty() => {
+            if task_kind != record.task_kind {
+                reasons.push("params_summary_task_kind_mismatch".to_string());
+            }
+        }
+        _ => reasons.push("params_summary_missing_task_kind".to_string()),
+    }
+
+    Some(record.params_summary_json.clone())
+}
+
+fn find_sensitive_param_key(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::Object(params) => {
+            for (key, value) in params {
+                if is_sensitive_param_key(key) {
+                    return Some(key.clone());
+                }
+                if let Some(child_key) = find_sensitive_param_key(value) {
+                    return Some(format!("{key}.{child_key}"));
+                }
+            }
+            None
+        }
+        JsonValue::Array(values) => values.iter().enumerate().find_map(|(index, value)| {
+            find_sensitive_param_key(value).map(|key| format!("{index}.{key}"))
+        }),
+        _ => None,
+    }
+}
+
+fn is_sensitive_param_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace('-', "_");
+    if normalized.contains("cookie")
+        || normalized.contains("password")
+        || normalized.contains("private_key")
+        || normalized.contains("secret")
+        || normalized.contains("token")
+    {
+        return true;
+    }
+
+    if normalized.ends_with("_fingerprint")
+        || normalized.ends_with("_hash")
+        || normalized.ends_with("_present")
+        || normalized.ends_with("_provided")
+        || normalized.ends_with("_sha256")
+    {
+        return false;
+    }
+
+    [
+        "aes_key",
+        "database_key",
+        "db_key",
+        "decrypt_key",
+        "decryption_key",
+        "image_aes_key",
+        "message_db_key",
+        "sqlcipher_key",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 fn ensure_task_updated(task_id: &str, updated: usize) -> Result<()> {
     if updated == 0 {
         return Err(ArchiverError::Other(format!("任务不存在: {task_id}")));
@@ -662,10 +807,17 @@ mod tests {
             source_dir: Some(PathBuf::from("/tmp/source")),
             dry_run: false,
             params_summary_json: json!({
-                "task_kind": "extract_images",
+                "task_kind": task_kind,
                 "image_aes_key_provided": true,
                 "image_aes_key_sha256": "cf20965eec1a6a1024eba8120c5b33a98a8e4e3b0f2a8218ecf7d70ac8a3f1bb"
             }),
+        }
+    }
+
+    fn task_create_with_params(task_id: &str, params_summary_json: JsonValue) -> TaskCreate {
+        TaskCreate {
+            params_summary_json,
+            ..task_create(task_id)
         }
     }
 
@@ -960,5 +1112,104 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(!source_dir.exists());
         assert!(!archive_dir.exists());
+    }
+
+    #[test]
+    fn retry_candidate_allows_completed_failed_cancelled_and_interrupted_tasks() {
+        let store = SqliteTaskStore::open_in_memory().unwrap();
+        store.create_task(&task_create("completed")).unwrap();
+        store.create_task(&task_create("failed")).unwrap();
+        store.create_task(&task_create("cancelled")).unwrap();
+        store.create_task(&task_create("interrupted")).unwrap();
+        store
+            .mark_completed("completed", &summary("completed"))
+            .unwrap();
+        store.mark_failed("failed", "失败").unwrap();
+        store.mark_cancelled("cancelled", "取消").unwrap();
+        store
+            .mark_unfinished_interrupted("应用重启，上一进程任务未完成")
+            .unwrap();
+
+        for task_id in ["completed", "failed", "cancelled", "interrupted"] {
+            let candidate = store.retry_candidate(task_id).unwrap().unwrap();
+            assert!(candidate.retryable, "{task_id}: {:?}", candidate.reasons);
+            assert!(candidate.reasons.is_empty());
+            assert_eq!(candidate.source_task_id, task_id);
+            assert_eq!(candidate.task_kind, "extract_images");
+            assert_eq!(
+                candidate.params_summary_json.unwrap()["task_kind"].as_str(),
+                Some("extract_images")
+            );
+        }
+    }
+
+    #[test]
+    fn retry_candidate_does_not_expose_sensitive_plaintext_params() {
+        let store = SqliteTaskStore::open_in_memory().unwrap();
+        store
+            .create_task(&task_create_with_params(
+                "unsafe",
+                json!({
+                    "task_kind": "extract_images",
+                    "image_aes_key": "plain-secret-aes-key"
+                }),
+            ))
+            .unwrap();
+        store.mark_failed("unsafe", "失败").unwrap();
+
+        let candidate = store.retry_candidate("unsafe").unwrap().unwrap();
+
+        assert!(!candidate.retryable);
+        assert!(candidate.params_summary_json.is_none());
+        assert!(candidate
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("params_summary_contains_sensitive_key")));
+        assert!(!format!("{candidate:?}").contains("plain-secret-aes-key"));
+    }
+
+    #[test]
+    fn retry_candidate_marks_missing_fields_as_not_retryable() {
+        let store = SqliteTaskStore::open_in_memory().unwrap();
+        store
+            .create_task(&TaskCreate {
+                task_id: "incomplete".to_string(),
+                task_name: "缺字段任务".to_string(),
+                task_kind: String::new(),
+                archive_dir: None,
+                source_dir: None,
+                dry_run: false,
+                params_summary_json: json!({}),
+            })
+            .unwrap();
+        store.mark_failed("incomplete", "失败").unwrap();
+
+        let candidate = store.retry_candidate("incomplete").unwrap().unwrap();
+
+        assert!(!candidate.retryable);
+        assert!(candidate.reasons.contains(&"missing_task_kind".to_string()));
+        assert!(candidate
+            .reasons
+            .contains(&"missing_source_dir".to_string()));
+        assert!(candidate
+            .reasons
+            .contains(&"missing_archive_dir".to_string()));
+        assert!(candidate
+            .reasons
+            .contains(&"params_summary_missing_task_kind".to_string()));
+    }
+
+    #[test]
+    fn retry_candidate_rejects_active_tasks_without_executing_them() {
+        let store = SqliteTaskStore::open_in_memory().unwrap();
+        store.create_task(&task_create("queued")).unwrap();
+        store.create_task(&task_create("running")).unwrap();
+        store.mark_running("running").unwrap();
+
+        for task_id in ["queued", "running"] {
+            let candidate = store.retry_candidate(task_id).unwrap().unwrap();
+            assert!(!candidate.retryable);
+            assert!(candidate.reasons.contains(&"task_not_terminal".to_string()));
+        }
     }
 }

@@ -46,7 +46,8 @@ pub use task::{
     TaskReporter, TaskRunner, TaskSnapshot, TaskStatus,
 };
 pub use task_store::{
-    PersistentTaskStatus, SqliteTaskStore, TaskCreate, TaskListQuery, TaskRecord, TaskStore,
+    PersistentTaskStatus, SqliteTaskStore, TaskCreate, TaskListQuery, TaskRecord,
+    TaskRetryCandidate, TaskStore,
 };
 pub use types::{
     ExtractSummary, ManifestEvent, ScanAction, UnsupportedExplanation, UnsupportedReasonSummary,
