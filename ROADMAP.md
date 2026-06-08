@@ -259,7 +259,7 @@ wechat-archiver extract --type voice
 - `voice` 入口当前扫描直接语音/音频文件；对微信账号目录或 `msg/attach` 只在存在 `msg/voice` 或 `msg/audio` 专用目录时扫描，避免把 `msg/file` 中的音乐附件误归为语音消息。
 - `extract --type image,video,file,voice` 支持多类型顺序执行，并输出聚合 summary 和各类型子 summary。
 - 聚合 summary 会汇总每个子任务的新对象、已有对象、旧索引复用、实际 `.dat` 解码和元数据补写计数。
-- core 已提供任务级 `TaskEvent`、`TaskProgress`、`TaskReporter` 和 `CancelToken`；直接扫描和消息库抽取均可发出结构化进度事件，CLI 抽取类命令可通过 `--jsonl-progress` 输出 JSONL 事件到 stderr。
+- core 已提供任务级 `TaskEvent`、`TaskProgress`、`TaskReporter`、`CancelToken`、`TaskRunner` 和 `TaskHandle`；直接扫描和消息库抽取均可发出结构化进度事件，CLI 抽取类命令可通过 `--jsonl-progress` 输出 JSONL 事件到 stderr。后台任务队列雏形支持单 worker 顺序执行、任务 ID、排队/运行/完成/失败/取消状态、进度快照、事件消费和取消句柄。
 
 计划：
 
@@ -268,7 +268,7 @@ wechat-archiver extract --type voice
 - 语音归档增强：在已支持原始 BLOB、部分音频时长和稳定 sender ID 的基础上，补充发送人显示名，再支持可选转换为 `wav` 或 `mp3`。
 - 表情归档：识别静态图、动图和专有格式。
 - 支持 `--since`、`--until`、`--chat`、`--type` 等过滤参数。
-- 继续完善长任务控制：后台任务队列、暂停/恢复和更细粒度进度节流，为未来 Tauri 做准备。
+- 继续完善长任务控制：多 worker 配置、暂停/恢复、持久化任务记录和更细粒度进度节流，为未来 Tauri 做准备。
 
 验收标准：
 

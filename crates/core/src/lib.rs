@@ -40,7 +40,10 @@ pub use scanner::{
     extract_videos, extract_videos_with_task, extract_voices, extract_voices_with_task,
 };
 pub use status::{archive_status, ArchiveStatus, StatusCount};
-pub use task::{CancelToken, TaskEvent, TaskEventKind, TaskOptions, TaskProgress, TaskReporter};
+pub use task::{
+    CancelToken, TaskEvent, TaskEventKind, TaskHandle, TaskOptions, TaskProgress, TaskReporter,
+    TaskRunner, TaskSnapshot, TaskStatus,
+};
 pub use types::{
     ExtractSummary, ManifestEvent, ScanAction, UnsupportedExplanation, UnsupportedReasonSummary,
 };

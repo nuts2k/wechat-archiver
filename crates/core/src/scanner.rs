@@ -1240,7 +1240,9 @@ mod tests {
     use crate::config::ArchiveConfig;
     use crate::error::ArchiverError;
     use crate::status::archive_status;
-    use crate::task::{CancelToken, TaskEvent, TaskEventKind, TaskOptions, TaskReporter};
+    use crate::task::{
+        CancelToken, TaskEvent, TaskEventKind, TaskOptions, TaskReporter, TaskRunner, TaskStatus,
+    };
     use crate::verify::verify_archive;
     use rusqlite::Connection;
     use std::sync::{Arc, Mutex};
@@ -1351,6 +1353,47 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].kind, TaskEventKind::Started);
         assert_eq!(events[1].kind, TaskEventKind::Cancelled);
+    }
+
+    #[test]
+    fn task_runner_executes_image_extract_in_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let direct_path = source.join("image.jpg");
+        let direct_bytes = synthetic_jpeg(64, 32);
+        std::fs::write(&direct_path, &direct_bytes).unwrap();
+
+        let runner = TaskRunner::new();
+        let handle = runner.spawn("extract-images", move |options| {
+            extract_images_with_task(
+                ArchiveConfig {
+                    source_dir: source,
+                    archive_dir: archive,
+                    dry_run: false,
+                    dat_options: DatDecodeOptions::default(),
+                    explain_unsupported: false,
+                },
+                options,
+            )
+        });
+
+        let snapshot = handle.join();
+        assert_eq!(snapshot.status, TaskStatus::Completed);
+        let summary = snapshot.result.unwrap();
+        assert_eq!(summary.archived, 1);
+        assert_eq!(summary.new_objects, 1);
+        assert_eq!(std::fs::read(&direct_path).unwrap(), direct_bytes);
+
+        let events = handle.drain_events();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == TaskEventKind::Started));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == TaskEventKind::Completed));
     }
 
     #[test]

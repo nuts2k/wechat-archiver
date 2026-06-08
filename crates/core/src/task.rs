@@ -1,12 +1,17 @@
 use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ArchiverError, Result};
 use crate::types::{ExtractSummary, ScanAction};
+
+type TaskJob = Box<dyn FnOnce(TaskOptions) -> Result<ExtractSummary> + Send + 'static>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +69,33 @@ pub struct TaskEvent {
     pub source_path: Option<PathBuf>,
     pub action: Option<ScanAction>,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSnapshot {
+    pub task_id: String,
+    pub task_name: String,
+    pub status: TaskStatus,
+    pub progress: TaskProgress,
+    pub last_event: Option<TaskEvent>,
+    pub error: Option<String>,
+    pub result: Option<ExtractSummary>,
 }
 
 #[derive(Clone)]
@@ -179,5 +211,378 @@ pub(crate) fn task_event(
         source_path: source_path.map(Path::to_path_buf),
         action,
         message,
+    }
+}
+
+#[derive(Clone)]
+pub struct TaskRunner {
+    sequence: Arc<std::sync::atomic::AtomicU64>,
+    sender: mpsc::Sender<QueuedTask>,
+}
+
+impl TaskRunner {
+    pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel::<QueuedTask>();
+        thread::spawn(move || {
+            for task in receiver {
+                run_queued_task(task);
+            }
+        });
+
+        Self {
+            sequence: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            sender,
+        }
+    }
+
+    pub fn spawn(
+        &self,
+        task_name: impl Into<String>,
+        job: impl FnOnce(TaskOptions) -> Result<ExtractSummary> + Send + 'static,
+    ) -> TaskHandle {
+        let task_name = task_name.into();
+        let task_id = format!(
+            "task-{}",
+            self.sequence
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
+        let cancel_token = CancelToken::new();
+        let (event_sender, event_receiver) = mpsc::channel::<TaskEvent>();
+        let shared = Arc::new(TaskShared::new(TaskSnapshot {
+            task_id: task_id.clone(),
+            task_name: task_name.clone(),
+            status: TaskStatus::Queued,
+            progress: TaskProgress::default(),
+            last_event: None,
+            error: None,
+            result: None,
+        }));
+
+        let queued = QueuedTask {
+            task_id: task_id.clone(),
+            task_name: task_name.clone(),
+            cancel_token: cancel_token.clone(),
+            shared: Arc::clone(&shared),
+            event_sender,
+            job: Box::new(job),
+        };
+
+        let handle = TaskHandle {
+            task_id,
+            task_name,
+            cancel_token,
+            shared,
+            event_receiver: Arc::new(Mutex::new(event_receiver)),
+        };
+
+        if let Err(error) = self.sender.send(queued) {
+            handle.shared.update_terminal(
+                TaskStatus::Failed,
+                None,
+                Some(format!("任务队列已停止: {error}")),
+            );
+        }
+
+        handle
+    }
+}
+
+impl Default for TaskRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for TaskRunner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("TaskRunner").finish_non_exhaustive()
+    }
+}
+
+pub struct TaskHandle {
+    task_id: String,
+    task_name: String,
+    cancel_token: CancelToken,
+    shared: Arc<TaskShared>,
+    event_receiver: Arc<Mutex<mpsc::Receiver<TaskEvent>>>,
+}
+
+impl TaskHandle {
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn task_name(&self) -> &str {
+        &self.task_name
+    }
+
+    pub fn cancel(&self) {
+        self.cancel_token.cancel();
+    }
+
+    pub fn snapshot(&self) -> TaskSnapshot {
+        self.shared.snapshot()
+    }
+
+    pub fn status(&self) -> TaskStatus {
+        self.snapshot().status
+    }
+
+    pub fn progress(&self) -> TaskProgress {
+        self.snapshot().progress
+    }
+
+    pub fn try_recv_event(&self) -> Option<TaskEvent> {
+        self.event_receiver.lock().unwrap().try_recv().ok()
+    }
+
+    pub fn drain_events(&self) -> Vec<TaskEvent> {
+        let receiver = self.event_receiver.lock().unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    pub fn join(&self) -> TaskSnapshot {
+        self.shared.wait_terminal()
+    }
+}
+
+impl fmt::Debug for TaskHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TaskHandle")
+            .field("task_id", &self.task_id)
+            .field("task_name", &self.task_name)
+            .field("snapshot", &self.snapshot())
+            .finish()
+    }
+}
+
+struct QueuedTask {
+    task_id: String,
+    task_name: String,
+    cancel_token: CancelToken,
+    shared: Arc<TaskShared>,
+    event_sender: mpsc::Sender<TaskEvent>,
+    job: TaskJob,
+}
+
+struct TaskShared {
+    snapshot: Mutex<TaskSnapshot>,
+    finished: Condvar,
+}
+
+impl TaskShared {
+    fn new(snapshot: TaskSnapshot) -> Self {
+        Self {
+            snapshot: Mutex::new(snapshot),
+            finished: Condvar::new(),
+        }
+    }
+
+    fn snapshot(&self) -> TaskSnapshot {
+        self.snapshot.lock().unwrap().clone()
+    }
+
+    fn mark_running(&self) {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        snapshot.status = TaskStatus::Running;
+    }
+
+    fn record_event(&self, event: TaskEvent) {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        snapshot.progress = event.progress.clone();
+        snapshot.last_event = Some(event);
+    }
+
+    fn update_terminal(
+        &self,
+        status: TaskStatus,
+        result: Option<ExtractSummary>,
+        error: Option<String>,
+    ) {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        if let Some(result) = result {
+            snapshot.progress = TaskProgress::from(&result);
+            snapshot.result = Some(result);
+        }
+        snapshot.status = status;
+        snapshot.error = error;
+        self.finished.notify_all();
+    }
+
+    fn wait_terminal(&self) -> TaskSnapshot {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        while !snapshot.status.is_terminal() {
+            snapshot = self.finished.wait(snapshot).unwrap();
+        }
+        snapshot.clone()
+    }
+}
+
+fn run_queued_task(task: QueuedTask) {
+    task.shared.mark_running();
+    let reporter = TaskReporter::new({
+        let shared = Arc::clone(&task.shared);
+        let event_sender = task.event_sender.clone();
+        move |event| {
+            shared.record_event(event.clone());
+            let _ = event_sender.send(event);
+        }
+    });
+    let options = TaskOptions::new()
+        .with_cancel_token(task.cancel_token)
+        .with_reporter(reporter);
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| (task.job)(options)));
+    match result {
+        Ok(Ok(summary)) => {
+            task.shared
+                .update_terminal(TaskStatus::Completed, Some(summary), None);
+        }
+        Ok(Err(error)) => {
+            let status = if matches!(error, ArchiverError::TaskCancelled { .. }) {
+                TaskStatus::Cancelled
+            } else {
+                TaskStatus::Failed
+            };
+            task.shared
+                .update_terminal(status, None, Some(error.to_string()));
+        }
+        Err(_) => {
+            task.shared.update_terminal(
+                TaskStatus::Failed,
+                None,
+                Some(format!(
+                    "后台任务 panic: {} ({})",
+                    task.task_name, task.task_id
+                )),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn summary(run_id: &str) -> ExtractSummary {
+        let mut summary = ExtractSummary::new(
+            run_id.to_string(),
+            PathBuf::from("/tmp/source"),
+            PathBuf::from("/tmp/archive"),
+            false,
+        );
+        summary.scanned_files = 1;
+        summary.candidates = 1;
+        summary.archived = 1;
+        summary
+    }
+
+    fn wait_for_status(handle: &TaskHandle, status: TaskStatus) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if handle.status() == status {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "task {} did not reach {status:?}, latest={:?}",
+            handle.task_id(),
+            handle.snapshot()
+        );
+    }
+
+    #[test]
+    fn runner_keeps_later_task_queued_until_worker_is_available() {
+        let runner = TaskRunner::new();
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        let first = runner.spawn("blocking", move |_options| {
+            release_receiver.recv().unwrap();
+            Ok(summary("first"))
+        });
+        wait_for_status(&first, TaskStatus::Running);
+
+        let second = runner.spawn("queued", |_options| Ok(summary("second")));
+        assert_eq!(second.status(), TaskStatus::Queued);
+
+        release_sender.send(()).unwrap();
+        assert_eq!(first.join().status, TaskStatus::Completed);
+        assert_eq!(second.join().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn runner_completes_task_and_exposes_events() {
+        let runner = TaskRunner::new();
+        let handle = runner.spawn("complete", |options| {
+            let summary = summary("complete-run");
+            options.emit(task_event(
+                "complete-run",
+                "complete",
+                TaskEventKind::CandidateFound,
+                &summary,
+                None,
+                None,
+                None,
+            ));
+            Ok(summary)
+        });
+
+        let snapshot = handle.join();
+        assert_eq!(snapshot.status, TaskStatus::Completed);
+        assert_eq!(snapshot.result.unwrap().run_id, "complete-run");
+        assert_eq!(snapshot.progress.archived, 1);
+
+        let events = handle.drain_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, TaskEventKind::CandidateFound);
+        assert_eq!(events[0].progress.candidates, 1);
+    }
+
+    #[test]
+    fn runner_records_task_failure() {
+        let runner = TaskRunner::new();
+        let handle = runner.spawn("failure", |_options| {
+            Err(ArchiverError::Other("boom".to_string()))
+        });
+
+        let snapshot = handle.join();
+        assert_eq!(snapshot.status, TaskStatus::Failed);
+        assert_eq!(snapshot.error.as_deref(), Some("boom"));
+        assert!(snapshot.result.is_none());
+    }
+
+    #[test]
+    fn runner_cancels_task_and_emits_cancelled_event() {
+        let runner = TaskRunner::new();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let handle = runner.spawn("cancel", move |options| {
+            started_sender.send(()).unwrap();
+            while !options.cancel_token.is_cancelled() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            options.check_cancelled("cancel-run", "cancel", TaskProgress::default())?;
+            Ok(summary("unreachable"))
+        });
+
+        started_receiver.recv().unwrap();
+        handle.cancel();
+
+        let snapshot = handle.join();
+        assert_eq!(snapshot.status, TaskStatus::Cancelled);
+        assert_eq!(snapshot.error.as_deref(), Some("task cancelled: cancel"));
+
+        let events = handle.drain_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, TaskEventKind::Cancelled);
+        assert_eq!(events[0].run_id, "cancel-run");
     }
 }
