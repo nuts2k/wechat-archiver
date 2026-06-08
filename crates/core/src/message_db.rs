@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -136,6 +136,8 @@ struct MessageKey {
     create_time: i64,
 }
 
+type MessageSourceMap = BTreeMap<MessageKey, MessageSource>;
+
 #[derive(Debug, Clone)]
 struct ImageResource {
     key: MessageKey,
@@ -182,7 +184,7 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
 
     let resources = query_image_resources(&db_source.resource_db)?;
     let message_dbs = message_db_paths(&db_source.message_dir)?;
-    let (image_messages, scanned_rows) = query_image_message_keys(&message_dbs, &resources)?;
+    let (image_messages, scanned_rows) = query_image_message_sources(&message_dbs, &resources)?;
 
     let run_id = format!("{}", now_epoch_ms());
     let mut summary = ExtractSummary::new(
@@ -209,12 +211,12 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
     }
 
     for resource in resources {
-        if !image_messages.contains(&resource.key) {
+        if !image_messages.contains_key(&resource.key) {
             continue;
         }
 
         summary.candidates += 1;
-        let message_source = message_source_from_key(&resource.key);
+        let message_source = message_source_from_map(&image_messages, &resource.key);
         let result = match find_dat_file(
             &attach_root,
             &resource.key.talker,
@@ -273,7 +275,7 @@ pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<Extra
         .map(|resource| resource.key.clone())
         .collect::<Vec<_>>();
     let (video_messages, scanned_rows) =
-        query_message_keys_for_type(&message_dbs, &resource_keys, 43)?;
+        query_message_sources_for_type(&message_dbs, &resource_keys, 43)?;
 
     let run_id = format!("{}", now_epoch_ms());
     let mut summary = ExtractSummary::new(
@@ -300,12 +302,12 @@ pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<Extra
     }
 
     for resource in resources {
-        if !video_messages.contains(&resource.key) {
+        if !video_messages.contains_key(&resource.key) {
             continue;
         }
 
         summary.candidates += 1;
-        let message_source = message_source_from_key(&resource.key);
+        let message_source = message_source_from_map(&video_messages, &resource.key);
         let result =
             match find_video_file(&video_root, &resource.file_md5, resource.key.create_time) {
                 Some(video_path) => {
@@ -364,7 +366,7 @@ pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<Extrac
         .map(|resource| resource.key.clone())
         .collect::<Vec<_>>();
     let (file_messages, scanned_rows) =
-        query_message_keys_for_type(&message_dbs, &resource_keys, 49)?;
+        query_message_sources_for_type(&message_dbs, &resource_keys, 49)?;
 
     let run_id = format!("{}", now_epoch_ms());
     let mut summary = ExtractSummary::new(
@@ -391,12 +393,12 @@ pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<Extrac
     }
 
     for resource in resources {
-        if !file_messages.contains(&resource.key) {
+        if !file_messages.contains_key(&resource.key) {
             continue;
         }
 
         summary.candidates += 1;
-        let message_source = message_source_from_key(&resource.key);
+        let message_source = message_source_from_map(&file_messages, &resource.key);
         let result =
             match find_file_attachment(&file_root, &resource.file_name, resource.key.create_time) {
                 Some(file_path) => {
@@ -453,7 +455,7 @@ pub fn extract_message_db_voices(config: MessageDbExtractConfig) -> Result<Extra
     let mut talkers = query_resource_talkers(&db_source.resource_db)?;
     talkers.extend(query_voice_talkers(&db_source.message_dir)?);
     let (voice_messages, scanned_rows) =
-        query_message_keys_for_talkers(&message_dbs, &talkers, 34)?;
+        query_message_sources_for_talkers(&message_dbs, &talkers, 34)?;
 
     let run_id = format!("{}", now_epoch_ms());
     let mut summary = ExtractSummary::new(
@@ -479,9 +481,8 @@ pub fn extract_message_db_voices(config: MessageDbExtractConfig) -> Result<Extra
         manifest = Some(writer);
     }
 
-    for key in voice_messages {
+    for (key, message_source) in voice_messages {
         summary.candidates += 1;
-        let message_source = message_source_from_key(&key);
         let result = match find_voice_resource(&db_source.message_dir, &key)? {
             Some(resource) => process_voice_resource(
                 &resource,
@@ -543,7 +544,7 @@ pub fn count_message_db_media(
     let message_dbs = message_db_paths(&inspection.message_db_dir)?;
 
     let image_resources = query_image_resources(&inspection.resource_db.path)?;
-    let (image_messages, _) = query_image_message_keys(&message_dbs, &image_resources)?;
+    let (image_messages, _) = query_image_message_sources(&message_dbs, &image_resources)?;
     let image = MessageDbMediaTypeCount {
         resource_candidates: image_resources.len() as u64,
         message_rows: count_message_rows_for_type(&message_dbs, 3)?,
@@ -558,7 +559,8 @@ pub fn count_message_db_media(
         .iter()
         .map(|resource| resource.key.clone())
         .collect::<Vec<_>>();
-    let (video_messages, _) = query_message_keys_for_type(&message_dbs, &video_resource_keys, 43)?;
+    let (video_messages, _) =
+        query_message_sources_for_type(&message_dbs, &video_resource_keys, 43)?;
     let video = MessageDbMediaTypeCount {
         resource_candidates: video_resources.len() as u64,
         message_rows: count_message_rows_for_type(&message_dbs, 43)?,
@@ -573,7 +575,7 @@ pub fn count_message_db_media(
         .iter()
         .map(|resource| resource.key.clone())
         .collect::<Vec<_>>();
-    let (file_messages, _) = query_message_keys_for_type(&message_dbs, &file_resource_keys, 49)?;
+    let (file_messages, _) = query_message_sources_for_type(&message_dbs, &file_resource_keys, 49)?;
     let file = MessageDbMediaTypeCount {
         resource_candidates: file_resources.len() as u64,
         message_rows: count_message_rows_for_type(&message_dbs, 49)?,
@@ -591,7 +593,7 @@ pub fn count_message_db_media(
             .iter()
             .map(|resource_key| resource_key.talker.clone()),
     );
-    let (voice_messages, _) = query_message_keys_for_talkers(&message_dbs, &voice_talkers, 34)?;
+    let (voice_messages, _) = query_message_sources_for_talkers(&message_dbs, &voice_talkers, 34)?;
     let voice = MessageDbMediaTypeCount {
         resource_candidates: voice_resource_keys.len() as u64,
         message_rows: count_message_rows_for_type(&message_dbs, 34)?,
@@ -930,12 +932,85 @@ fn classify_db_error(error: &ArchiverError, sqlite_header: bool) -> MessageDbFil
 }
 
 fn message_source_from_key(key: &MessageKey) -> MessageSource {
+    message_source_from_key_and_sender(key, None)
+}
+
+fn message_source_from_key_and_sender(key: &MessageKey, sender: Option<String>) -> MessageSource {
     MessageSource {
         talker: Some(key.talker.clone()),
-        sender: None,
+        sender,
         local_id: Some(key.local_id),
         create_time: Some(key.create_time),
     }
+}
+
+fn message_source_from_map(sources: &MessageSourceMap, key: &MessageKey) -> MessageSource {
+    sources
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| message_source_from_key(key))
+}
+
+fn insert_message_source(sources: &mut MessageSourceMap, key: MessageKey, sender: Option<String>) {
+    let source = message_source_from_key_and_sender(&key, sender);
+    if let Some(existing) = sources.get_mut(&key) {
+        if existing.sender.is_none() {
+            existing.sender = source.sender;
+        }
+        return;
+    }
+    sources.insert(key, source);
+}
+
+fn load_name2id_map(conn: &Connection) -> Result<BTreeMap<i64, String>> {
+    if !table_has_column(conn, "Name2Id", "user_name")? {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT rowid, user_name
+        FROM Name2Id
+        WHERE user_name IS NOT NULL AND TRIM(user_name) != ''
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut names = BTreeMap::new();
+    for row in rows {
+        let (id, user_name) = row?;
+        if let Some(user_name) = normalize_sender_name(&user_name) {
+            names.insert(id, user_name);
+        }
+    }
+    Ok(names)
+}
+
+fn real_sender_id_select_expr(conn: &Connection, table_name: &str) -> Result<&'static str> {
+    if table_has_column(conn, table_name, "real_sender_id")? {
+        Ok("real_sender_id")
+    } else {
+        Ok("NULL")
+    }
+}
+
+fn sender_from_real_sender_id(
+    real_sender_id: Option<i64>,
+    sender_names: &BTreeMap<i64, String>,
+) -> Option<String> {
+    let real_sender_id = real_sender_id?;
+    if real_sender_id <= 0 {
+        return None;
+    }
+    sender_names
+        .get(&real_sender_id)
+        .and_then(|user_name| normalize_sender_name(user_name))
+}
+
+fn normalize_sender_name(user_name: &str) -> Option<String> {
+    let trimmed = user_name.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn query_image_resources(resource_db: &Path) -> Result<Vec<ImageResource>> {
@@ -1014,28 +1089,30 @@ fn query_image_resources(resource_db: &Path) -> Result<Vec<ImageResource>> {
     Ok(resources)
 }
 
-fn query_image_message_keys(
+fn query_image_message_sources(
     message_dbs: &[PathBuf],
     resources: &[ImageResource],
-) -> Result<(BTreeSet<MessageKey>, u64)> {
+) -> Result<(MessageSourceMap, u64)> {
     let talkers = resources
         .iter()
         .map(|resource| resource.key.talker.as_str())
         .collect::<BTreeSet<_>>();
-    let mut keys = BTreeSet::new();
+    let mut sources = MessageSourceMap::new();
     let mut scanned_rows = 0u64;
 
     for db_path in message_dbs {
         let conn = open_readonly_db(db_path)?;
+        let sender_names = load_name2id_map(&conn)?;
         for talker in &talkers {
             let table_name = message_table_name(talker);
             if !table_exists(&conn, &table_name)? {
                 continue;
             }
+            let sender_expr = real_sender_id_select_expr(&conn, &table_name)?;
 
             let sql = format!(
                 r#"
-                SELECT local_id, create_time
+                SELECT local_id, create_time, {sender_expr}
                 FROM {}
                 WHERE local_type = 3 OR local_type % 4294967296 = 3
                 "#,
@@ -1043,54 +1120,59 @@ fn query_image_message_keys(
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map([], |row| {
-                Ok(MessageKey {
+                let key = MessageKey {
                     talker: (*talker).to_string(),
                     local_id: row.get(0)?,
                     create_time: row.get(1)?,
-                })
+                };
+                let sender = sender_from_real_sender_id(row.get(2)?, &sender_names);
+                Ok((key, sender))
             })?;
 
             for row in rows {
-                keys.insert(row?);
+                let (key, sender) = row?;
+                insert_message_source(&mut sources, key, sender);
                 scanned_rows += 1;
             }
         }
     }
 
-    Ok((keys, scanned_rows))
+    Ok((sources, scanned_rows))
 }
 
-fn query_message_keys_for_type(
+fn query_message_sources_for_type(
     message_dbs: &[PathBuf],
     resource_keys: &[MessageKey],
     local_type: i64,
-) -> Result<(BTreeSet<MessageKey>, u64)> {
+) -> Result<(MessageSourceMap, u64)> {
     let talkers = resource_keys
         .iter()
         .map(|key| key.talker.clone())
         .collect::<BTreeSet<_>>();
-    query_message_keys_for_talkers(message_dbs, &talkers, local_type)
+    query_message_sources_for_talkers(message_dbs, &talkers, local_type)
 }
 
-fn query_message_keys_for_talkers(
+fn query_message_sources_for_talkers(
     message_dbs: &[PathBuf],
     talkers: &BTreeSet<String>,
     local_type: i64,
-) -> Result<(BTreeSet<MessageKey>, u64)> {
-    let mut keys = BTreeSet::new();
+) -> Result<(MessageSourceMap, u64)> {
+    let mut sources = MessageSourceMap::new();
     let mut scanned_rows = 0u64;
 
     for db_path in message_dbs {
         let conn = open_readonly_db(db_path)?;
+        let sender_names = load_name2id_map(&conn)?;
         for talker in talkers {
             let table_name = message_table_name(talker);
             if !table_exists(&conn, &table_name)? {
                 continue;
             }
+            let sender_expr = real_sender_id_select_expr(&conn, &table_name)?;
 
             let sql = format!(
                 r#"
-                SELECT local_id, create_time
+                SELECT local_id, create_time, {sender_expr}
                 FROM {}
                 WHERE local_type = ?1 OR local_type % 4294967296 = ?1
                 "#,
@@ -1098,21 +1180,24 @@ fn query_message_keys_for_talkers(
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map([local_type], |row| {
-                Ok(MessageKey {
+                let key = MessageKey {
                     talker: talker.clone(),
                     local_id: row.get(0)?,
                     create_time: row.get(1)?,
-                })
+                };
+                let sender = sender_from_real_sender_id(row.get(2)?, &sender_names);
+                Ok((key, sender))
             })?;
 
             for row in rows {
-                keys.insert(row?);
+                let (key, sender) = row?;
+                insert_message_source(&mut sources, key, sender);
                 scanned_rows += 1;
             }
         }
     }
 
-    Ok((keys, scanned_rows))
+    Ok((sources, scanned_rows))
 }
 
 fn count_message_rows_for_type(message_dbs: &[PathBuf], local_type: i64) -> Result<u64> {
@@ -1140,21 +1225,21 @@ fn count_message_rows_for_type(message_dbs: &[PathBuf], local_type: i64) -> Resu
 
 fn matched_message_count<'a>(
     resource_keys: impl IntoIterator<Item = &'a MessageKey>,
-    message_keys: &BTreeSet<MessageKey>,
+    message_sources: &MessageSourceMap,
 ) -> u64 {
     let resource_keys = resource_keys.into_iter().cloned().collect::<BTreeSet<_>>();
-    message_keys
-        .iter()
+    message_sources
+        .keys()
         .filter(|key| resource_keys.contains(*key))
         .count() as u64
 }
 
 fn matched_voice_message_count(
     resource_keys: &[MessageKey],
-    message_keys: &BTreeSet<MessageKey>,
+    message_sources: &MessageSourceMap,
 ) -> u64 {
-    message_keys
-        .iter()
+    message_sources
+        .keys()
         .filter(|message_key| {
             resource_keys.iter().any(|resource_key| {
                 resource_key.talker == message_key.talker
@@ -2232,6 +2317,9 @@ mod tests {
     use crate::verify::verify_archive;
     use rusqlite::Connection;
 
+    const FIXTURE_SENDER: &str = "wxid_sender";
+    const FIXTURE_SENDER_ID: i64 = 2;
+
     #[test]
     fn extracts_message_db_images_without_touching_source() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2307,7 +2395,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_talker, talker);
-        assert_eq!(stored_sender, None);
+        assert_eq!(stored_sender.as_deref(), Some(FIXTURE_SENDER));
         assert_eq!(stored_local_id, local_id);
         assert_eq!(stored_create_time, create_time);
         assert_eq!(original_filename, format!("{file_md5}.dat"));
@@ -2321,7 +2409,7 @@ mod tests {
             .find(|event| event.source_kind == "message_db_image")
             .unwrap();
         assert_eq!(event.message_talker.as_deref(), Some(talker));
-        assert_eq!(event.message_sender, None);
+        assert_eq!(event.message_sender.as_deref(), Some(FIXTURE_SENDER));
         assert_eq!(event.message_local_id, Some(local_id));
         assert_eq!(event.message_create_time, Some(create_time));
         assert_eq!(
@@ -2482,6 +2570,7 @@ mod tests {
             String,
             String,
             String,
+            Option<String>,
             i64,
             i64,
             String,
@@ -2495,6 +2584,7 @@ mod tests {
             source_kind,
             media_type,
             message_talker,
+            message_sender,
             message_local_id,
             message_create_time,
             original_filename,
@@ -2508,6 +2598,7 @@ mod tests {
                 SELECT source_kind,
                        media_type,
                        message_talker,
+                       message_sender,
                        message_local_id,
                        message_create_time,
                        original_filename,
@@ -2531,6 +2622,7 @@ mod tests {
                         row.get(7)?,
                         row.get(8)?,
                         row.get(9)?,
+                        row.get(10)?,
                     ))
                 },
             )
@@ -2538,6 +2630,7 @@ mod tests {
         assert_eq!(source_kind, "message_db_video");
         assert_eq!(media_type, "video");
         assert_eq!(message_talker, talker);
+        assert_eq!(message_sender.as_deref(), Some(FIXTURE_SENDER));
         assert_eq!(message_local_id, local_id);
         assert_eq!(message_create_time, create_time);
         assert_eq!(original_filename, format!("{file_md5}.mp4"));
@@ -2657,17 +2750,29 @@ mod tests {
             media_type,
             extension,
             message_talker,
+            message_sender,
             message_local_id,
             message_create_time,
             original_filename,
             mime_type,
-        ): (String, String, String, String, i64, i64, String, String) = conn
+        ): (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            String,
+            String,
+        ) = conn
             .query_row(
                 r#"
                 SELECT source_kind,
                        media_type,
                        extension,
                        message_talker,
+                       message_sender,
                        message_local_id,
                        message_create_time,
                        original_filename,
@@ -2686,6 +2791,7 @@ mod tests {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -2694,6 +2800,7 @@ mod tests {
         assert_eq!(media_type, "file");
         assert_eq!(extension, "pdf");
         assert_eq!(message_talker, talker);
+        assert_eq!(message_sender.as_deref(), Some(FIXTURE_SENDER));
         assert_eq!(message_local_id, local_id);
         assert_eq!(message_create_time, create_time);
         assert_eq!(original_filename, file_name);
@@ -2821,6 +2928,7 @@ mod tests {
             String,
             u64,
             String,
+            Option<String>,
             i64,
             i64,
             Option<String>,
@@ -2834,6 +2942,7 @@ mod tests {
             extension,
             size_bytes,
             message_talker,
+            message_sender,
             message_local_id,
             message_create_time,
             original_filename,
@@ -2847,6 +2956,7 @@ mod tests {
                        extension,
                        size_bytes,
                        message_talker,
+                       message_sender,
                        message_local_id,
                        message_create_time,
                        original_filename,
@@ -2868,6 +2978,7 @@ mod tests {
                         row.get(7)?,
                         row.get(8)?,
                         row.get(9)?,
+                        row.get(10)?,
                     ))
                 },
             )
@@ -2877,6 +2988,7 @@ mod tests {
         assert_eq!(extension, "wav");
         assert_eq!(size_bytes, voice_data.len() as u64);
         assert_eq!(message_talker, talker);
+        assert_eq!(message_sender.as_deref(), Some(FIXTURE_SENDER));
         assert_eq!(message_local_id, local_id);
         assert_eq!(message_create_time, create_time);
         assert_eq!(original_filename, None);
@@ -2891,6 +3003,7 @@ mod tests {
             .find(|event| event.source_kind == "message_db_voice")
             .unwrap();
         assert_eq!(event.message_talker.as_deref(), Some(talker));
+        assert_eq!(event.message_sender.as_deref(), Some(FIXTURE_SENDER));
         assert_eq!(event.message_local_id, Some(local_id));
         assert_eq!(event.message_create_time, Some(create_time));
         assert_eq!(event.size_bytes, Some(voice_data.len() as u64));
@@ -3358,9 +3471,21 @@ mod tests {
     ) {
         let conn = Connection::open(path).unwrap();
         let table_name = message_table_name(talker);
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO Name2Id(rowid, user_name) VALUES (?1, ?2), (?3, ?4)",
+            params![1, talker, FIXTURE_SENDER_ID, FIXTURE_SENDER],
+        )
+        .unwrap();
         conn.execute(
             &format!(
-                "CREATE TABLE {} (local_id INTEGER, create_time INTEGER, local_type INTEGER)",
+                "CREATE TABLE {} (
+                    local_id INTEGER,
+                    create_time INTEGER,
+                    local_type INTEGER,
+                    real_sender_id INTEGER
+                )",
                 quote_identifier(&table_name)
             ),
             [],
@@ -3368,10 +3493,20 @@ mod tests {
         .unwrap();
         conn.execute(
             &format!(
-                "INSERT INTO {} (local_id, create_time, local_type) VALUES (?1, ?2, ?3)",
+                "INSERT INTO {} (
+                    local_id,
+                    create_time,
+                    local_type,
+                    real_sender_id
+                ) VALUES (?1, ?2, ?3, ?4)",
                 quote_identifier(&table_name)
             ),
-            params![local_id, create_time, (1_i64 << 32) + local_type],
+            params![
+                local_id,
+                create_time,
+                (1_i64 << 32) + local_type,
+                FIXTURE_SENDER_ID
+            ],
         )
         .unwrap();
     }

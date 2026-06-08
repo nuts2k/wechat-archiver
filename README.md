@@ -198,7 +198,7 @@ cargo run -p wechat-archiver -- extract-db-videos \
   --archive "/path/to/wechat-archive"
 ```
 
-该命令会读取 `<account>/db_storage/message/message_*.db` 和 `message_resource.db`，基于 `MessageResourceInfo` / `MessageResourceDetail` 的资源 md5 定位 `<account>/msg/video/<YYYY-MM>/<md5>.mp4`，并复制可读视频到归档库，记录 `source_kind=message_db_video`、`media_type=video`、可用的 `message_talker`、`message_local_id`、`message_create_time`，以及 best-effort 解析得到的 `duration_ms`、`width_px` 和 `height_px`。它不会解密 SQLCipher 数据库，不会写入微信源目录。
+该命令会读取 `<account>/db_storage/message/message_*.db` 和 `message_resource.db`，基于 `MessageResourceInfo` / `MessageResourceDetail` 的资源 md5 定位 `<account>/msg/video/<YYYY-MM>/<md5>.mp4`，并复制可读视频到归档库，记录 `source_kind=message_db_video`、`media_type=video`、可用的 `message_talker`、`message_sender`、`message_local_id`、`message_create_time`，以及 best-effort 解析得到的 `duration_ms`、`width_px` 和 `height_px`。`message_sender` 仅在 `Msg_*` 表存在 `real_sender_id` 且同库 `Name2Id` 可映射时写入稳定 `user_name`，不做昵称解析。它不会解密 SQLCipher 数据库，不会写入微信源目录。
 
 按消息库枚举并归档文件附件：
 
@@ -208,7 +208,7 @@ cargo run -p wechat-archiver -- extract-db-files \
   --archive "/path/to/wechat-archive"
 ```
 
-该命令会读取 `<account>/db_storage/message/message_*.db` 和 `message_resource.db`，从资源 `packed_info` 中保守识别带扩展名的安全文件名，并定位 `<account>/msg/file/<YYYY-MM>/<file_name>`。归档成功后记录 `source_kind=message_db_file`、`media_type=file` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。它不会解密 SQLCipher 数据库，不会写入微信源目录；当前不猜测发送人，也不解析复杂 appmsg XML。
+该命令会读取 `<account>/db_storage/message/message_*.db` 和 `message_resource.db`，从资源 `packed_info` 中保守识别带扩展名的安全文件名，并定位 `<account>/msg/file/<YYYY-MM>/<file_name>`。归档成功后记录 `source_kind=message_db_file`、`media_type=file` 和可用的 `message_talker`、`message_sender`、`message_local_id`、`message_create_time`。它不会解密 SQLCipher 数据库，不会写入微信源目录；当前不解析复杂 appmsg XML。
 
 按消息库枚举并归档语音：
 
@@ -218,7 +218,7 @@ cargo run -p wechat-archiver -- extract-db-voices \
   --archive "/path/to/wechat-archive"
 ```
 
-该命令会读取 `<account>/db_storage/message/message_*.db`、`message_resource.db` 和 `media_*.db`，基于 `Msg_<md5(talker)>` 的 `local_type=34` 与 `VoiceInfo` 的 `talker/local_id/create_time` 匹配语音 BLOB，并将 `voice_data` 原始字节归档到内容寻址库。归档成功后记录 `source_kind=message_db_voice`、`media_type=voice`、可用的 `message_talker`、`message_local_id`、`message_create_time`，以及对可识别 `wav`、`mp3`、`aac` BLOB best-effort 解析得到的 `duration_ms`。它不会解密 SQLCipher 数据库，不会写入微信源目录；当前不做 SILK 转码、语音转写或发送人猜测。
+该命令会读取 `<account>/db_storage/message/message_*.db`、`message_resource.db` 和 `media_*.db`，基于 `Msg_<md5(talker)>` 的 `local_type=34` 与 `VoiceInfo` 的 `talker/local_id/create_time` 匹配语音 BLOB，并将 `voice_data` 原始字节归档到内容寻址库。归档成功后记录 `source_kind=message_db_voice`、`media_type=voice`、可用的 `message_talker`、`message_sender`、`message_local_id`、`message_create_time`，以及对可识别 `wav`、`mp3`、`aac` BLOB best-effort 解析得到的 `duration_ms`。它不会解密 SQLCipher 数据库，不会写入微信源目录；当前不做 SILK 转码或语音转写。
 
 如果使用已解密消息库副本，`extract-db-voices` 也支持 `--message-db-dir`。语音 BLOB 会从该目录下的 `media_*.db/VoiceInfo` 只读读取：
 
@@ -346,7 +346,7 @@ wechat-archive/
   views/
 ```
 
-`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`views/` 是由索引再生成的相对软链接视图，可删除后重建。`index.sqlite` 通过 `schema_migrations` 记录已应用的 schema 版本，便于后续安全升级旧归档库。`lookup` 会只读打开索引，可按 `sha256` 反查所有来源，也可按 `source_path` 查询单个源文件的当前归档状态；`report` 会只读导出全量索引报告。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`，并记录 `original_filename`、基于扩展名保守推断的 `mime_type`、图片/视频 `width_px`/`height_px`、视频和部分音频 `duration_ms`、`source_size_bytes` 和 `source_modified_ms`。直接媒体复跑时，如果源文件指纹未变且既有索引记录已校验通过，会复用索引记录并跳过重新 hash/复制；`.dat` 图片仍会按当前 key 和 `wxgf` 参数重新验证或解码。通过消息库归档的图片、视频、文件附件和语音还会记录可用的消息来源字段：`message_talker`、`message_local_id`、`message_create_time`；`message_sender` 已预留但当前不猜测不同微信版本的发送人列。
+`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`views/` 是由索引再生成的相对软链接视图，可删除后重建。`index.sqlite` 通过 `schema_migrations` 记录已应用的 schema 版本，便于后续安全升级旧归档库。`lookup` 会只读打开索引，可按 `sha256` 反查所有来源，也可按 `source_path` 查询单个源文件的当前归档状态；`report` 会只读导出全量索引报告。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`，并记录 `original_filename`、基于扩展名保守推断的 `mime_type`、图片/视频 `width_px`/`height_px`、视频和部分音频 `duration_ms`、`source_size_bytes` 和 `source_modified_ms`。直接媒体复跑时，如果源文件指纹未变且既有索引记录已校验通过，会复用索引记录并跳过重新 hash/复制；`.dat` 图片仍会按当前 key 和 `wxgf` 参数重新验证或解码。通过消息库归档的图片、视频、文件附件和语音还会记录可用的消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；`message_sender` 当前只写入可从 `real_sender_id` + `Name2Id` 解析到的稳定 `user_name`。
 
 ## 外部项目参考
 

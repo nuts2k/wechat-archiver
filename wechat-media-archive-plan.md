@@ -151,7 +151,7 @@ wechat-archive/
 - 复制到归档目录。
 - 写入 SQLite 索引，并保持 schema 迁移可追踪、可幂等复跑。
 - 索引和 manifest 会记录 `original_filename`、`mime_type`、`width_px`、`height_px`、`duration_ms`、`source_size_bytes`、`source_modified_ms`；MIME 当前基于归档扩展名保守推断，不做内容嗅探，图片宽高、视频宽高/时长和部分音频时长当前 best-effort 写入。直接媒体复跑时可基于未变源文件指纹复用已校验记录，`.dat` 图片仍按当前解码参数重新处理。
-- 消息库图片、视频、文件附件和语音归档会在索引和 manifest 中记录可用的 `message_talker`、`message_local_id`、`message_create_time`；`message_sender` 字段已预留，后续按微信版本适配。
+- 消息库图片、视频、文件附件和语音归档会在索引和 manifest 中记录可用的 `message_talker`、`message_sender`、`message_local_id`、`message_create_time`；`message_sender` 当前仅在 `Msg_*` 表存在 `real_sender_id` 且同库 `Name2Id` 可映射时写入稳定 `user_name`。
 - 支持 `status` 查看索引总量、唯一对象、唯一字节数，并按媒体类型、来源类型、解密状态和校验状态分组。
 - 支持 `report` 只读导出 JSON/CSV 索引报告，供人工审计、备份流程和后续 AI 分类使用。
 - 支持 `views` 基于索引生成 `archive/views/` 下的可浏览相对软链接视图；`views/` 是可再生成的派生层，不是客户端。
@@ -163,7 +163,7 @@ wechat-archive/
 - 不自动解密 SQLCipher 微信数据库。
 - 不提取微信进程密钥、不重签微信、不提升权限。
 - 不写入、不删除、不覆盖任何微信源目录文件。
-- 当前覆盖图片、直接视频文件、直接文件附件、直接语音/音频文件，以及消息库语音原始 BLOB；语音转码、转写和发送人补充仍在第 2 阶段增强。
+- 当前覆盖图片、直接视频文件、直接文件附件、直接语音/音频文件，以及消息库语音原始 BLOB；语音转码、转写和发送人显示名补充仍在第 2 阶段增强。
 
 建议命令：
 
@@ -204,7 +204,7 @@ wechat-archiver verify
 功能：
 
 - 视频归档：已支持直接文件和消息库枚举，并对 MP4/MOV/M4V best-effort 提取时长和分辨率；后续继续提高更多容器和异常样本覆盖率。
-- 文件归档：已支持直接文件和保守消息库枚举，并记录原始文件名和 MIME 类型；后续再补更完整的 appmsg 元数据、大小和发送人。
+- 文件归档：已支持直接文件和保守消息库枚举，并记录原始文件名、MIME 类型和可用的稳定 sender ID；后续再补更完整的 appmsg 元数据、大小和发送人显示名。
 - 语音归档：已支持直接语音/音频文件和消息库 `VoiceInfo.voice_data` 原始 BLOB，并对 WAV/MP3/M4A/AAC 或可识别 BLOB best-effort 提取时长；后续再支持可选转换为 `wav` 或 `mp3`、更多格式时长和转写。
 - 支持按时间范围、会话、类型过滤。
 
