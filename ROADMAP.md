@@ -1,6 +1,6 @@
 # 微信媒体归档器路线图
 
-更新日期：2026-06-07
+更新日期：2026-06-08
 
 本文记录 `wechat-archiver` 已实现能力、当前边界和后续规划。公开文档不记录任何本机账号 ID、目录、密钥或媒体样本。
 
@@ -89,7 +89,7 @@ Rust core library
 - 当前视频归档为直接文件扫描最小版，支持 `mp4`、`mov`、`m4v`。
 - 当 `--source` 是微信账号目录或该账号的 `msg/attach` 时，自动扫描同账号 `msg/video`；其他目录只扫描传入目录本身。
 - 视频对象复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
-- 当前记录 `source_kind=direct_video`、`media_type=video`；暂不解析消息库视频来源，也不提取时长和分辨率。
+- 当前记录 `source_kind=direct_video`、`media_type=video`，并对 MP4/MOV/M4V best-effort 提取时长和分辨率。
 
 ### 文件扫描与归档
 
@@ -105,6 +105,7 @@ Rust core library
 - 当前语音归档为直接音频文件扫描最小版，支持 `silk`、`slk`、`amr`、`mp3`、`m4a`、`aac`、`wav`、`ogg`、`opus`。
 - 当 `--source` 是微信账号目录或该账号的 `msg/attach` 时，只扫描同账号存在的 `msg/voice` 或 `msg/audio` 专用目录；其他目录只扫描传入目录本身。
 - 语音对象复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
+- 对 `wav`、`mp3`、`m4a`、`aac` 会 best-effort 提取时长；SILK/AMR/OGG/OPUS 当前不估算时长。
 - 当前直接文件扫描记录 `source_kind=direct_voice`、`media_type=voice`；消息库语音 BLOB 归档见 `extract-db-voices`。
 
 ### 消息库图片枚举
@@ -125,7 +126,7 @@ Rust core library
 - 支持基于 `MessageResourceInfo` / `MessageResourceDetail` 提取资源 md5。
 - 支持定位 `msg/video/<YYYY-MM>/<md5>.mp4`，并复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
 - 当前记录 `source_kind=message_db_video`、`media_type=video` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。
-- 对本地视频缺失的资源记录为 `failed`；暂不提取时长和分辨率。
+- 对本地视频缺失的资源记录为 `failed`；对可读 MP4/MOV/M4V best-effort 提取时长和分辨率。
 
 ### 消息库文件附件枚举
 
@@ -142,7 +143,8 @@ Rust core library
 - 支持基于 `Name2Id`、`VoiceInfo` 和 `Msg_<md5(talker)>` 的 `local_type=34` 按 `talker/local_id/create_time` 匹配语音 BLOB。
 - 语音 BLOB 复用内容寻址归档、SQLite 索引、manifest、dry-run 和 hash 校验流程。
 - 当前记录 `source_kind=message_db_voice`、`media_type=voice` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。
-- 对消息表存在但 `VoiceInfo.voice_data` 缺失的语音记录为 `failed`；当前不做 SILK 转码、语音转写、时长提取或发送人猜测。
+- 对可识别 `wav`、`mp3`、`aac` 语音 BLOB 会 best-effort 提取时长。
+- 对消息表存在但 `VoiceInfo.voice_data` 缺失的语音记录为 `failed`；当前不做 SILK 转码、语音转写或发送人猜测。
 
 ### 归档与索引
 
@@ -164,9 +166,11 @@ wechat-archive/
 - `objects` 按内容 hash 存储真实文件。
 - `index.sqlite` 保存当前索引状态。
 - `manifests/*.jsonl` 保存每次运行审计记录。
-- `index.sqlite` 使用 `schema_migrations` 记录已应用的 schema 版本，当前会显式迁移基础表、`decoder` 字段、消息来源字段和文件元数据字段。
+- `index.sqlite` 使用 `schema_migrations` 记录已应用的 schema 版本，当前会显式迁移基础表、`decoder` 字段、消息来源字段、文件元数据字段、媒体元数据字段和源文件指纹字段。
 - `index.sqlite` 和 manifest 独立记录 `source_kind` 与 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。
 - `index.sqlite` 和 manifest 支持 `original_filename` 与 `mime_type`；MIME 当前基于归档扩展名保守推断，不做内容嗅探。
+- `index.sqlite` 和 manifest 支持 `width_px`、`height_px`、`duration_ms`；当前直接图片和解码后的图片会 best-effort 写入宽高，视频会 best-effort 写入宽高和时长，部分音频会 best-effort 写入时长。
+- `index.sqlite` 和 manifest 支持 `source_size_bytes` 与 `source_modified_ms`；直接媒体复跑时可用源文件指纹复用已校验记录，减少重复 hash/复制，`.dat` 图片仍按当前解码参数重新处理。
 - `index.sqlite` 和 manifest 支持可空消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；当前消息库图片、视频、文件附件和语音归档会写入 `talker/local_id/create_time`，`sender` 暂不猜测。
 - 支持 `status` 查看索引统计，并按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组。
 - 支持 `lookup` 只读按 `sha256` 反查所有来源，或按 `source_path` 查询单个源文件归档状态。
@@ -177,7 +181,7 @@ wechat-archive/
 
 ### 验证状态
 
-- 单元测试覆盖普通图片格式识别、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder`、原始文件名、MIME 和消息来源记录、消息库诊断、消息库图片/视频/文件附件/语音归档、外部已解密消息库目录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
+- 单元测试覆盖普通图片格式识别、图片宽高解析、MP4 视频时长/宽高解析、旧 XOR `.dat`、V1/V2 AES `.dat`、`wxgf` 分区解析、`wxgf raw`、`wxgf jpg` 转换链路、`wxgf` dry-run validate-only、manifest/index 的 `decoder`、原始文件名、MIME、图片/视频元数据和消息来源记录、消息库诊断、消息库图片/视频/文件附件/语音归档、外部已解密消息库目录、直接视频、文件和语音归档，以及统一 `extract --type` CLI 解析。
 - 已通过：
 
 ```bash
@@ -200,9 +204,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 - `wxgf jpg/mp4` 依赖 `ffmpeg`，没有可用 `ffmpeg` 时应使用 `raw` 或 `off`。
 - `wxgf jpg` 当前输出首帧 JPG，不保留可能存在的动态效果。
 - 统一 `extract` 入口当前接入图片、直接视频文件、直接文件附件和直接语音/音频文件；表情、收藏、朋友圈等尚未接入归档流程。
-- 视频归档当前已覆盖直接文件扫描和消息库枚举，但暂不提取时长、分辨率等元数据。
+- 视频归档当前已覆盖直接文件扫描和消息库枚举，并对 MP4/MOV/M4V best-effort 提取时长、宽度和高度。
 - 文件归档当前已覆盖直接文件扫描和消息库枚举，但暂不解析复杂 appmsg XML，也不补充发送人。
-- 语音归档当前覆盖直接音频文件扫描和消息库 `VoiceInfo.voice_data` 原始 BLOB；暂不做 SILK 转码、语音转写、时长提取或发送人猜测。
+- 语音归档当前覆盖直接音频文件扫描和消息库 `VoiceInfo.voice_data` 原始 BLOB，并对 WAV/MP3/M4A/AAC 或可识别 BLOB best-effort 提取时长；暂不做 SILK 转码、语音转写或发送人猜测。
 - 尚未实现 Tauri 桌面客户端。
 - 尚未实现归档后的清理建议或删除操作。
 
@@ -256,9 +260,9 @@ wechat-archiver extract --type voice
 
 计划：
 
-- 视频归档增强：提取时长和分辨率。
+- 视频归档增强：继续提升更多容器和异常样本的时长、分辨率解析覆盖率。
 - 文件归档增强：解析更完整的 appmsg 元数据，补充大小、发送人等上下文。
-- 语音归档增强：在已支持原始 BLOB 归档的基础上，补充时长、发送人，再支持可选转换为 `wav` 或 `mp3`。
+- 语音归档增强：在已支持原始 BLOB 和部分音频时长的基础上，补充发送人，再支持可选转换为 `wav` 或 `mp3`。
 - 表情归档：识别静态图、动图和专有格式。
 - 支持 `--since`、`--until`、`--chat`、`--type` 等过滤参数。
 - 支持任务级进度统计和可取消执行，为未来 Tauri 做准备。
@@ -284,11 +288,14 @@ wechat-archiver extract --type voice
 - 支持 CSV/JSON 索引报告导出。
 - 支持 `views/` 生成可浏览派生视图，默认 dry-run，显式 `--write` 才写入。
 - 支持 `original_filename` 和 `mime_type` 字段，并在 `lookup`、JSON/CSV `report`、SQLite 索引和 manifest 中输出。
+- 支持 `width_px`、`height_px`、`duration_ms` 字段，并在 `lookup`、JSON/CSV `report`、SQLite 索引和 manifest 中输出；当前图片宽高、视频宽高/时长和部分音频时长 best-effort 解析。
+- 支持 `source_size_bytes` 和 `source_modified_ms` 字段，并在 `lookup`、JSON/CSV `report`、SQLite 索引和 manifest 中输出；直接媒体可基于未变源文件指纹复用已校验记录。
+- 支持直接媒体的最小增量复跑：同一源路径、同一媒体类型、同一源大小和修改时间、且既有记录 `verify_status=ok` 时跳过重新 hash/复制。
 
 计划：
 
-- 丰富 `media_items` 字段：会话 ID、发送人、宽高、时长。
-- 支持增量扫描状态，减少重复遍历。
+- 继续丰富 `media_items` 字段：会话 ID、发送人、更多音频格式时长和更多视频容器元数据。
+- 继续扩展增量扫描状态：任务级扫描游标、`.dat` 解码参数指纹和更完整的变更统计。
 
 验收标准：
 

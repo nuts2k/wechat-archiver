@@ -68,6 +68,9 @@ mod tests {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string()),
             mime_type: Some("image/jpeg".to_string()),
+            width_px: Some(640),
+            height_px: Some(480),
+            duration_ms: None,
             message_talker: Some("chat_a".to_string()),
             message_sender: None,
             message_local_id: Some(42),
@@ -76,6 +79,8 @@ mod tests {
             archive_path: sha256.map(|sha256| format!("objects/sha256/ab/{sha256}.jpg")),
             sha256: sha256.map(str::to_string),
             size_bytes: Some(123),
+            source_size_bytes: Some(123),
+            source_modified_ms: Some(1_700_000_000_000),
             extension: Some("jpg".to_string()),
             decrypt_status: decrypt_status.to_string(),
             verify_status: verify_status.to_string(),
@@ -124,6 +129,14 @@ mod tests {
             Some("a.jpg")
         );
         assert_eq!(report.records[0].mime_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(report.records[0].width_px, Some(640));
+        assert_eq!(report.records[0].height_px, Some(480));
+        assert_eq!(report.records[0].duration_ms, None);
+        assert_eq!(report.records[0].source_size_bytes, Some(123));
+        assert_eq!(
+            report.records[0].source_modified_ms,
+            Some(1_700_000_000_000)
+        );
         assert_eq!(report.records[0].message_talker.as_deref(), Some("chat_a"));
         assert_eq!(report.records[1].error.as_deref(), Some("copy_failed"));
     }

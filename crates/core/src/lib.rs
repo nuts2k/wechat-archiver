@@ -1,4 +1,5 @@
 mod archive;
+mod audio;
 mod config;
 mod error;
 mod hash;
@@ -14,6 +15,7 @@ mod scanner;
 mod status;
 mod types;
 mod verify;
+mod video;
 mod views;
 mod wechat;
 

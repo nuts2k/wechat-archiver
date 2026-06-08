@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::error::{ArchiverError, Result};
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 type MigrationFn = fn(&Connection) -> Result<()>;
 
@@ -35,6 +35,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_file_metadata_columns",
         apply: migration_4_add_file_metadata_columns,
     },
+    Migration {
+        version: 5,
+        name: "add_media_metadata_columns",
+        apply: migration_5_add_media_metadata_columns,
+    },
+    Migration {
+        version: 6,
+        name: "add_source_fingerprint_columns",
+        apply: migration_6_add_source_fingerprint_columns,
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -45,6 +55,9 @@ pub(crate) struct MediaRecord {
     pub media_type: String,
     pub original_filename: Option<String>,
     pub mime_type: Option<String>,
+    pub width_px: Option<u32>,
+    pub height_px: Option<u32>,
+    pub duration_ms: Option<u64>,
     pub message_talker: Option<String>,
     pub message_sender: Option<String>,
     pub message_local_id: Option<i64>,
@@ -53,11 +66,23 @@ pub(crate) struct MediaRecord {
     pub archive_path: Option<String>,
     pub sha256: Option<String>,
     pub size_bytes: Option<u64>,
+    pub source_size_bytes: Option<u64>,
+    pub source_modified_ms: Option<i64>,
     pub extension: Option<String>,
     pub decrypt_status: String,
     pub verify_status: String,
     pub error: Option<String>,
     pub timestamp_epoch_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReusableMediaRecord {
+    pub archive_path: String,
+    pub sha256: String,
+    pub size_bytes: Option<u64>,
+    pub width_px: Option<u32>,
+    pub height_px: Option<u32>,
+    pub duration_ms: Option<u64>,
 }
 
 pub(crate) fn index_path(archive_dir: &Path) -> PathBuf {
@@ -239,6 +264,26 @@ fn migration_4_add_file_metadata_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migration_5_add_media_metadata_columns(conn: &Connection) -> Result<()> {
+    ensure_column(conn, "width_px", "INTEGER")?;
+    ensure_column(conn, "height_px", "INTEGER")?;
+    ensure_column(conn, "duration_ms", "INTEGER")?;
+    Ok(())
+}
+
+fn migration_6_add_source_fingerprint_columns(conn: &Connection) -> Result<()> {
+    ensure_column(conn, "source_size_bytes", "INTEGER")?;
+    ensure_column(conn, "source_modified_ms", "INTEGER")?;
+    conn.execute(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_media_items_source_fingerprint
+            ON media_items(source_path, source_size_bytes, source_modified_ms)
+        "#,
+        [],
+    )?;
+    Ok(())
+}
+
 fn media_item_columns(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("PRAGMA table_info(media_items)")?;
     let columns = stmt
@@ -269,6 +314,9 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             media_type,
             original_filename,
             mime_type,
+            width_px,
+            height_px,
+            duration_ms,
             message_talker,
             message_sender,
             message_local_id,
@@ -277,6 +325,8 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             archive_path,
             sha256,
             size_bytes,
+            source_size_bytes,
+            source_modified_ms,
             extension,
             decrypt_status,
             verify_status,
@@ -284,17 +334,22 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             created_at_ms,
             updated_at_ms
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?24)
         ON CONFLICT(source_path)
         DO UPDATE SET
             archive_path = excluded.archive_path,
             sha256 = excluded.sha256,
             size_bytes = excluded.size_bytes,
+            source_size_bytes = excluded.source_size_bytes,
+            source_modified_ms = excluded.source_modified_ms,
             source_relative_path = excluded.source_relative_path,
             source_kind = excluded.source_kind,
             media_type = excluded.media_type,
             original_filename = excluded.original_filename,
             mime_type = excluded.mime_type,
+            width_px = excluded.width_px,
+            height_px = excluded.height_px,
+            duration_ms = excluded.duration_ms,
             message_talker = excluded.message_talker,
             message_sender = excluded.message_sender,
             message_local_id = excluded.message_local_id,
@@ -313,6 +368,9 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             record.media_type,
             record.original_filename,
             record.mime_type,
+            record.width_px,
+            record.height_px,
+            record.duration_ms,
             record.message_talker,
             record.message_sender,
             record.message_local_id,
@@ -321,6 +379,8 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             record.archive_path,
             record.sha256,
             record.size_bytes,
+            record.source_size_bytes,
+            record.source_modified_ms,
             record.extension,
             record.decrypt_status,
             record.verify_status,
@@ -329,6 +389,79 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
         ],
     )?;
     Ok(())
+}
+
+pub(crate) fn reusable_media_record(
+    conn: &Connection,
+    source_path: &str,
+    source_kind: &str,
+    media_type: &str,
+    extension: &str,
+    source_size_bytes: u64,
+    source_modified_ms: i64,
+) -> Result<Option<ReusableMediaRecord>> {
+    let record = conn
+        .query_row(
+            r#"
+            SELECT
+                archive_path,
+                sha256,
+                size_bytes,
+                width_px,
+                height_px,
+                duration_ms
+            FROM media_items
+            WHERE source_path = ?1
+              AND source_kind = ?2
+              AND media_type = ?3
+              AND extension = ?4
+              AND source_size_bytes = ?5
+              AND source_modified_ms = ?6
+              AND verify_status = 'ok'
+              AND archive_path IS NOT NULL
+              AND sha256 IS NOT NULL
+            LIMIT 1
+            "#,
+            params![
+                source_path,
+                source_kind,
+                media_type,
+                extension,
+                source_size_bytes,
+                source_modified_ms,
+            ],
+            |row| {
+                let size_bytes = row
+                    .get::<_, Option<i64>>(2)?
+                    .map(|value| value.max(0) as u64);
+                Ok(ReusableMediaRecord {
+                    archive_path: row.get(0)?,
+                    sha256: row.get(1)?,
+                    size_bytes,
+                    width_px: optional_u32(row, 3)?,
+                    height_px: optional_u32(row, 4)?,
+                    duration_ms: optional_u64(row, 5)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(record)
+}
+
+fn optional_u32(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u32>> {
+    Ok(row.get::<_, Option<i64>>(index)?.and_then(|value| {
+        if (0..=u32::MAX as i64).contains(&value) {
+            Some(value as u32)
+        } else {
+            None
+        }
+    }))
+}
+
+fn optional_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    Ok(row
+        .get::<_, Option<i64>>(index)?
+        .and_then(|value| (value >= 0).then_some(value as u64)))
 }
 
 #[cfg(test)]
@@ -354,7 +487,7 @@ mod tests {
     fn assert_current_migrations(conn: &Connection) {
         assert_eq!(
             migration_versions(conn),
-            vec![1, 2, 3, CURRENT_SCHEMA_VERSION]
+            (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<_>>()
         );
         assert_eq!(
             migration_count(conn),
@@ -390,6 +523,11 @@ mod tests {
                 "media_type",
                 "original_filename",
                 "mime_type",
+                "width_px",
+                "height_px",
+                "duration_ms",
+                "source_size_bytes",
+                "source_modified_ms",
                 "decoder",
                 "message_talker",
                 "message_sender",
@@ -404,7 +542,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(latest_migration_name, "add_file_metadata_columns");
+        assert_eq!(latest_migration_name, "add_source_fingerprint_columns");
     }
 
     #[test]
@@ -471,6 +609,11 @@ mod tests {
                 "message_create_time",
                 "original_filename",
                 "mime_type",
+                "width_px",
+                "height_px",
+                "duration_ms",
+                "source_size_bytes",
+                "source_modified_ms",
             ],
         );
 

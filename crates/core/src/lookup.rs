@@ -31,6 +31,9 @@ pub struct IndexLookupRecord {
     pub media_type: String,
     pub original_filename: Option<String>,
     pub mime_type: Option<String>,
+    pub width_px: Option<u32>,
+    pub height_px: Option<u32>,
+    pub duration_ms: Option<u64>,
     pub message_talker: Option<String>,
     pub message_sender: Option<String>,
     pub message_local_id: Option<i64>,
@@ -39,6 +42,8 @@ pub struct IndexLookupRecord {
     pub archive_path: Option<String>,
     pub sha256: Option<String>,
     pub size_bytes: Option<u64>,
+    pub source_size_bytes: Option<u64>,
+    pub source_modified_ms: Option<i64>,
     pub extension: Option<String>,
     pub decrypt_status: String,
     pub verify_status: String,
@@ -142,6 +147,9 @@ fn query_records_with_params(
             media_type,
             {original_filename},
             {mime_type},
+            {width_px},
+            {height_px},
+            {duration_ms},
             {message_talker},
             {message_sender},
             {message_local_id},
@@ -150,6 +158,8 @@ fn query_records_with_params(
             archive_path,
             sha256,
             size_bytes,
+            {source_size_bytes},
+            {source_modified_ms},
             extension,
             decrypt_status,
             verify_status,
@@ -162,6 +172,11 @@ fn query_records_with_params(
         "#,
         original_filename = column_or_null(&columns, "original_filename", "TEXT"),
         mime_type = column_or_null(&columns, "mime_type", "TEXT"),
+        width_px = column_or_null(&columns, "width_px", "INTEGER"),
+        height_px = column_or_null(&columns, "height_px", "INTEGER"),
+        duration_ms = column_or_null(&columns, "duration_ms", "INTEGER"),
+        source_size_bytes = column_or_null(&columns, "source_size_bytes", "INTEGER"),
+        source_modified_ms = column_or_null(&columns, "source_modified_ms", "INTEGER"),
         message_talker = column_or_null(&columns, "message_talker", "TEXT"),
         message_sender = column_or_null(&columns, "message_sender", "TEXT"),
         message_local_id = column_or_null(&columns, "message_local_id", "INTEGER"),
@@ -193,7 +208,10 @@ fn column_or_null(columns: &[String], column_name: &str, column_type: &str) -> S
 
 fn row_to_record(row: &Row<'_>) -> rusqlite::Result<IndexLookupRecord> {
     let size_bytes = row
-        .get::<_, Option<i64>>(14)?
+        .get::<_, Option<i64>>(17)?
+        .map(|value| value.max(0) as u64);
+    let source_size_bytes = row
+        .get::<_, Option<i64>>(18)?
         .map(|value| value.max(0) as u64);
     Ok(IndexLookupRecord {
         id: row.get(0)?,
@@ -203,21 +221,42 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<IndexLookupRecord> {
         media_type: row.get(4)?,
         original_filename: row.get(5)?,
         mime_type: row.get(6)?,
-        message_talker: row.get(7)?,
-        message_sender: row.get(8)?,
-        message_local_id: row.get(9)?,
-        message_create_time: row.get(10)?,
-        decoder: row.get(11)?,
-        archive_path: row.get(12)?,
-        sha256: row.get(13)?,
+        width_px: optional_u32(row, 7)?,
+        height_px: optional_u32(row, 8)?,
+        duration_ms: optional_u64(row, 9)?,
+        message_talker: row.get(10)?,
+        message_sender: row.get(11)?,
+        message_local_id: row.get(12)?,
+        message_create_time: row.get(13)?,
+        decoder: row.get(14)?,
+        archive_path: row.get(15)?,
+        sha256: row.get(16)?,
         size_bytes,
-        extension: row.get(15)?,
-        decrypt_status: row.get(16)?,
-        verify_status: row.get(17)?,
-        error: row.get(18)?,
-        created_at_ms: row.get(19)?,
-        updated_at_ms: row.get(20)?,
+        source_size_bytes,
+        source_modified_ms: row.get(19)?,
+        extension: row.get(20)?,
+        decrypt_status: row.get(21)?,
+        verify_status: row.get(22)?,
+        error: row.get(23)?,
+        created_at_ms: row.get(24)?,
+        updated_at_ms: row.get(25)?,
     })
+}
+
+fn optional_u32(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<u32>> {
+    Ok(row.get::<_, Option<i64>>(index)?.and_then(|value| {
+        if (0..=u32::MAX as i64).contains(&value) {
+            Some(value as u32)
+        } else {
+            None
+        }
+    }))
+}
+
+fn optional_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    Ok(row
+        .get::<_, Option<i64>>(index)?
+        .and_then(|value| (value >= 0).then_some(value as u64)))
 }
 
 #[cfg(test)]
@@ -239,6 +278,9 @@ mod tests {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string()),
             mime_type: Some("image/jpeg".to_string()),
+            width_px: Some(640),
+            height_px: Some(480),
+            duration_ms: None,
             message_talker: Some("chat_a".to_string()),
             message_sender: None,
             message_local_id: Some(42),
@@ -247,6 +289,8 @@ mod tests {
             archive_path: Some(format!("objects/sha256/ab/{sha256}.jpg")),
             sha256: Some(sha256.to_string()),
             size_bytes: Some(123),
+            source_size_bytes: Some(123),
+            source_modified_ms: Some(1_700_000_000_000),
             extension: Some("jpg".to_string()),
             decrypt_status: "decoded".to_string(),
             verify_status: "ok".to_string(),
@@ -275,6 +319,14 @@ mod tests {
             Some("a.jpg")
         );
         assert_eq!(lookup.records[0].mime_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(lookup.records[0].width_px, Some(640));
+        assert_eq!(lookup.records[0].height_px, Some(480));
+        assert_eq!(lookup.records[0].duration_ms, None);
+        assert_eq!(lookup.records[0].source_size_bytes, Some(123));
+        assert_eq!(
+            lookup.records[0].source_modified_ms,
+            Some(1_700_000_000_000)
+        );
         assert_eq!(lookup.records[0].message_talker.as_deref(), Some("chat_a"));
         assert_eq!(lookup.records[0].size_bytes, Some(123));
     }
@@ -394,6 +446,11 @@ mod tests {
         assert_eq!(lookup.matched_records, 1);
         assert_eq!(lookup.records[0].decoder, None);
         assert_eq!(lookup.records[0].message_talker, None);
+        assert_eq!(lookup.records[0].width_px, None);
+        assert_eq!(lookup.records[0].height_px, None);
+        assert_eq!(lookup.records[0].duration_ms, None);
+        assert_eq!(lookup.records[0].source_size_bytes, None);
+        assert_eq!(lookup.records[0].source_modified_ms, None);
 
         let conn = Connection::open(index_path(archive)).unwrap();
         let migrations_table_exists: i64 = conn

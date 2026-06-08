@@ -1,19 +1,29 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use walkdir::WalkDir;
 
 use crate::archive::{store_bytes, store_file, StoreOutcome};
+use crate::audio::{
+    audio_duration_supported_extension, detect_audio_metadata_from_file, AudioMetadata,
+};
 use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions};
-use crate::error::{ArchiverError, Result};
+use crate::error::{ArchiverError, IoContext, Result};
 use crate::hash::{sha256_bytes, sha256_file};
-use crate::image::{decode_dat, direct_image_extension, is_dat_file, validate_dat, DatDecode};
-use crate::index::{index_path, insert_record, open_index, MediaRecord};
+use crate::image::{
+    decode_dat, detect_image_dimensions, detect_image_dimensions_from_file, direct_image_extension,
+    is_dat_file, validate_dat, DatDecode, ImageDimensions,
+};
+use crate::index::{
+    index_path, insert_record, open_index, reusable_media_record, MediaRecord, ReusableMediaRecord,
+};
 use crate::manifest::ManifestWriter;
 use crate::media::{
     direct_file_extension, direct_video_extension, direct_voice_extension, mime_type_for_extension,
 };
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
+use crate::video::{detect_video_metadata_from_file, VideoMetadata};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MessageSource {
@@ -21,6 +31,29 @@ pub(crate) struct MessageSource {
     pub sender: Option<String>,
     pub local_id: Option<i64>,
     pub create_time: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MediaMetadata {
+    width_px: Option<u32>,
+    height_px: Option<u32>,
+    duration_ms: Option<u64>,
+}
+
+impl MediaMetadata {
+    fn merge_missing(self, fallback: Self) -> Self {
+        Self {
+            width_px: self.width_px.or(fallback.width_px),
+            height_px: self.height_px.or(fallback.height_px),
+            duration_ms: self.duration_ms.or(fallback.duration_ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceFingerprint {
+    size_bytes: u64,
+    modified_ms: Option<i64>,
 }
 
 pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
@@ -401,8 +434,70 @@ pub(crate) fn process_direct_media_with_message_source(
     message_source: Option<&MessageSource>,
 ) -> Result<ScanOutcome> {
     let rel = relative_path(path, source_root)?;
-    let (sha256, size_bytes) = sha256_file(path)?;
+    let source_fingerprint = source_fingerprint(path)?;
 
+    let reusable = if !dry_run {
+        if let (Some(conn), Some(modified_ms)) = (conn, source_fingerprint.modified_ms) {
+            let source_path = path.to_string_lossy().to_string();
+            reusable_media_record(
+                conn,
+                &source_path,
+                source_kind,
+                media_type,
+                extension,
+                source_fingerprint.size_bytes,
+                modified_ms,
+            )?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(existing) = reusable.as_ref() {
+        if safe_archive_path_exists(archive_root, &existing.archive_path)
+            && metadata_complete_for_reuse(media_type, existing)
+        {
+            let event = build_reused_direct_media_event(
+                run_id,
+                path,
+                &rel,
+                source_kind,
+                media_type,
+                message_source,
+                extension,
+                source_fingerprint,
+                metadata_from_reusable(existing),
+                existing,
+            );
+            persist(conn, manifest, &event)?;
+            return Ok(ScanOutcome::new(ScanAction::AlreadyArchived));
+        }
+    }
+
+    let metadata = direct_media_metadata(path, media_type);
+
+    if let Some(existing) = reusable.as_ref() {
+        if safe_archive_path_exists(archive_root, &existing.archive_path) {
+            let event = build_reused_direct_media_event(
+                run_id,
+                path,
+                &rel,
+                source_kind,
+                media_type,
+                message_source,
+                extension,
+                source_fingerprint,
+                metadata.merge_missing(metadata_from_reusable(existing)),
+                existing,
+            );
+            persist(conn, manifest, &event)?;
+            return Ok(ScanOutcome::new(ScanAction::AlreadyArchived));
+        }
+    }
+
+    let (sha256, size_bytes) = sha256_file(path)?;
     let (action, archive_path, verify_status) = if dry_run {
         (ScanAction::WouldArchive, None, "not_run".to_string())
     } else {
@@ -431,12 +526,48 @@ pub(crate) fn process_direct_media_with_message_source(
         Some(sha256),
         Some(size_bytes),
         Some(extension.to_string()),
+        Some(source_fingerprint),
+        metadata,
         "not_needed",
         &verify_status,
         None,
     );
     persist(conn, manifest, &event)?;
     Ok(ScanOutcome::new(action))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_reused_direct_media_event(
+    run_id: &str,
+    path: &Path,
+    rel: &str,
+    source_kind: &str,
+    media_type: &str,
+    message_source: Option<&MessageSource>,
+    extension: &str,
+    source_fingerprint: SourceFingerprint,
+    metadata: MediaMetadata,
+    existing: &ReusableMediaRecord,
+) -> ManifestEvent {
+    build_event(
+        run_id,
+        path,
+        rel,
+        source_kind,
+        media_type,
+        message_source,
+        None,
+        ScanAction::AlreadyArchived,
+        Some(existing.archive_path.clone()),
+        Some(existing.sha256.clone()),
+        existing.size_bytes,
+        Some(extension.to_string()),
+        Some(source_fingerprint),
+        metadata,
+        "not_needed",
+        "ok",
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -479,6 +610,7 @@ pub(crate) fn process_dat_image_with_message_source(
     message_source: Option<&MessageSource>,
 ) -> Result<ScanOutcome> {
     let rel = relative_path(path, source_root)?;
+    let source_fingerprint = source_fingerprint(path).ok();
 
     let decoded = if dry_run {
         validate_dat(path, dat_options)?
@@ -493,6 +625,7 @@ pub(crate) fn process_dat_image_with_message_source(
             decoder,
         } => {
             let (sha256, size_bytes) = sha256_bytes(&bytes);
+            let metadata = metadata_from_image_dimensions(detect_image_dimensions(&bytes));
             let (action, archive_path, verify_status) = if dry_run {
                 (ScanAction::WouldArchive, None, "not_run".to_string())
             } else {
@@ -521,6 +654,8 @@ pub(crate) fn process_dat_image_with_message_source(
                 Some(sha256),
                 Some(size_bytes),
                 Some(extension.to_string()),
+                source_fingerprint,
+                metadata,
                 "decoded",
                 &verify_status,
                 None,
@@ -542,6 +677,8 @@ pub(crate) fn process_dat_image_with_message_source(
                 None,
                 None,
                 Some(extension.to_string()),
+                source_fingerprint,
+                MediaMetadata::default(),
                 "validated",
                 "not_run",
                 None,
@@ -563,6 +700,8 @@ pub(crate) fn process_dat_image_with_message_source(
                 None,
                 None,
                 None,
+                source_fingerprint,
+                MediaMetadata::default(),
                 "unsupported",
                 "not_run",
                 Some(reason.to_string()),
@@ -587,6 +726,8 @@ fn build_event(
     sha256: Option<String>,
     size_bytes: Option<u64>,
     extension: Option<String>,
+    source_fingerprint: Option<SourceFingerprint>,
+    metadata: MediaMetadata,
     decrypt_status: &str,
     verify_status: &str,
     error: Option<String>,
@@ -605,6 +746,9 @@ fn build_event(
             .as_deref()
             .and_then(mime_type_for_extension)
             .map(str::to_string),
+        width_px: metadata.width_px,
+        height_px: metadata.height_px,
+        duration_ms: metadata.duration_ms,
         message_talker: message_source.talker,
         message_sender: message_source.sender,
         message_local_id: message_source.local_id,
@@ -614,6 +758,8 @@ fn build_event(
         archive_path,
         sha256,
         size_bytes,
+        source_size_bytes: source_fingerprint.map(|fingerprint| fingerprint.size_bytes),
+        source_modified_ms: source_fingerprint.and_then(|fingerprint| fingerprint.modified_ms),
         extension,
         decrypt_status: decrypt_status.to_string(),
         verify_status: verify_status.to_string(),
@@ -636,6 +782,9 @@ pub(crate) fn persist(
                 media_type: event.media_type.clone(),
                 original_filename: event.original_filename.clone(),
                 mime_type: event.mime_type.clone(),
+                width_px: event.width_px,
+                height_px: event.height_px,
+                duration_ms: event.duration_ms,
                 message_talker: event.message_talker.clone(),
                 message_sender: event.message_sender.clone(),
                 message_local_id: event.message_local_id,
@@ -644,6 +793,8 @@ pub(crate) fn persist(
                 archive_path: event.archive_path.clone(),
                 sha256: event.sha256.clone(),
                 size_bytes: event.size_bytes,
+                source_size_bytes: event.source_size_bytes,
+                source_modified_ms: event.source_modified_ms,
                 extension: event.extension.clone(),
                 decrypt_status: event.decrypt_status.clone(),
                 verify_status: event.verify_status.clone(),
@@ -658,6 +809,93 @@ pub(crate) fn persist(
     }
 
     Ok(())
+}
+
+fn metadata_from_image_dimensions(dimensions: Option<ImageDimensions>) -> MediaMetadata {
+    dimensions
+        .map(|dimensions| MediaMetadata {
+            width_px: Some(dimensions.width_px),
+            height_px: Some(dimensions.height_px),
+            duration_ms: None,
+        })
+        .unwrap_or_default()
+}
+
+fn metadata_from_video_metadata(metadata: Option<VideoMetadata>) -> MediaMetadata {
+    metadata
+        .map(|metadata| MediaMetadata {
+            width_px: metadata.width_px,
+            height_px: metadata.height_px,
+            duration_ms: metadata.duration_ms,
+        })
+        .unwrap_or_default()
+}
+
+fn metadata_from_audio_metadata(metadata: Option<AudioMetadata>) -> MediaMetadata {
+    metadata
+        .map(|metadata| MediaMetadata {
+            width_px: None,
+            height_px: None,
+            duration_ms: metadata.duration_ms,
+        })
+        .unwrap_or_default()
+}
+
+fn metadata_from_reusable(record: &ReusableMediaRecord) -> MediaMetadata {
+    MediaMetadata {
+        width_px: record.width_px,
+        height_px: record.height_px,
+        duration_ms: record.duration_ms,
+    }
+}
+
+fn metadata_complete_for_reuse(media_type: &str, record: &ReusableMediaRecord) -> bool {
+    match media_type {
+        "image" => record.width_px.is_some() && record.height_px.is_some(),
+        "video" => {
+            record.width_px.is_some() && record.height_px.is_some() && record.duration_ms.is_some()
+        }
+        "voice" => record.duration_ms.is_some(),
+        _ => true,
+    }
+}
+
+fn direct_media_metadata(path: &Path, media_type: &str) -> MediaMetadata {
+    match media_type {
+        "image" => metadata_from_image_dimensions(detect_image_dimensions_from_file(path)),
+        "video" => metadata_from_video_metadata(detect_video_metadata_from_file(path)),
+        "voice" => path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .filter(|extension| audio_duration_supported_extension(extension))
+            .and_then(|extension| detect_audio_metadata_from_file(path, extension))
+            .map(|metadata| metadata_from_audio_metadata(Some(metadata)))
+            .unwrap_or_default(),
+        _ => MediaMetadata::default(),
+    }
+}
+
+fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
+    let metadata = std::fs::metadata(path).with_path(path)?;
+    Ok(SourceFingerprint {
+        size_bytes: metadata.len(),
+        modified_ms: metadata.modified().ok().and_then(system_time_ms),
+    })
+}
+
+fn system_time_ms(time: SystemTime) -> Option<i64> {
+    let duration = time.duration_since(UNIX_EPOCH).ok()?;
+    let millis = duration.as_millis();
+    (millis <= i64::MAX as u128).then_some(millis as i64)
+}
+
+fn safe_archive_path_exists(archive_root: &Path, archive_path: &str) -> bool {
+    let path = Path::new(archive_path);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        && archive_root.join(path).is_file()
 }
 
 fn original_filename(path: &Path) -> Option<String> {
@@ -693,11 +931,11 @@ mod tests {
         std::fs::create_dir_all(source.join("attach/hash/2026-01/Img")).unwrap();
 
         let direct_path = source.join("image.jpg");
-        let direct_bytes = b"\xff\xd8\xffdirect\xff\xd9";
-        std::fs::write(&direct_path, direct_bytes).unwrap();
+        let direct_bytes = synthetic_jpeg(64, 32);
+        std::fs::write(&direct_path, &direct_bytes).unwrap();
 
         let dat_path = source.join("attach/hash/2026-01/Img/sample.dat");
-        let decoded = b"\x89PNG\r\nsynthetic-png";
+        let decoded = synthetic_png(16, 8);
         let encrypted: Vec<u8> = decoded.iter().map(|byte| byte ^ 0x88).collect();
         std::fs::write(&dat_path, encrypted.clone()).unwrap();
 
@@ -719,61 +957,18 @@ mod tests {
         assert!(summary.manifest_path.unwrap().exists());
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (original_filename, mime_type): (String, String) = conn
-            .query_row(
-                r#"
-                SELECT original_filename, mime_type
-                FROM media_items
-                WHERE source_relative_path = 'image.jpg'
-                "#,
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(original_filename, "image.jpg");
-        assert_eq!(mime_type, "image/jpeg");
-
-        let verify = verify_archive(&archive).unwrap();
-        assert_eq!(verify.checked, 2);
-        assert_eq!(verify.ok, 2);
-        assert_eq!(verify.missing, 0);
-        assert_eq!(verify.mismatched, 0);
-    }
-
-    #[test]
-    fn records_dat_source_kind_and_decoder_separately() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("wechat-source");
-        let archive = tmp.path().join("archive");
-        std::fs::create_dir_all(source.join("attach/hash/2026-01/Img")).unwrap();
-
-        let dat_path = source.join("attach/hash/2026-01/Img/sample.dat");
-        let decoded = b"\x89PNG\r\nsynthetic-png";
-        let encrypted: Vec<u8> = decoded.iter().map(|byte| byte ^ 0x88).collect();
-        std::fs::write(&dat_path, encrypted).unwrap();
-
-        let summary = extract_images(ArchiveConfig {
-            source_dir: source,
-            archive_dir: archive.clone(),
-            dry_run: false,
-            dat_options: DatDecodeOptions::default(),
-            explain_unsupported: false,
-        })
-        .unwrap();
-
-        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, decoder, extension, original_filename, mime_type): (
-            String,
-            Option<String>,
+        let (original_filename, mime_type, width_px, height_px, duration_ms): (
             String,
             String,
-            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
         ) = conn
             .query_row(
                 r#"
-                SELECT source_kind, decoder, extension, original_filename, mime_type
+                SELECT original_filename, mime_type, width_px, height_px, duration_ms
                 FROM media_items
-                WHERE source_relative_path = 'attach/hash/2026-01/Img/sample.dat'
+                WHERE source_relative_path = 'image.jpg'
                 "#,
                 [],
                 |row| {
@@ -787,11 +982,148 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(original_filename, "image.jpg");
+        assert_eq!(mime_type, "image/jpeg");
+        assert_eq!(width_px, Some(64));
+        assert_eq!(height_px, Some(32));
+        assert_eq!(duration_ms, None);
+
+        let verify = verify_archive(&archive).unwrap();
+        assert_eq!(verify.checked, 2);
+        assert_eq!(verify.ok, 2);
+        assert_eq!(verify.missing, 0);
+        assert_eq!(verify.mismatched, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_direct_media_reuses_index_without_reading_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let direct_path = source.join("image.jpg");
+        std::fs::write(&direct_path, synthetic_jpeg(64, 32)).unwrap();
+
+        let first = extract_images(ArchiveConfig {
+            source_dir: source.clone(),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+        assert_eq!(first.archived, 1);
+        assert_eq!(first.already_archived, 0);
+
+        let mut permissions = std::fs::metadata(&direct_path).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&direct_path, permissions).unwrap();
+
+        let second = extract_images(ArchiveConfig {
+            source_dir: source.clone(),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        let mut permissions = std::fs::metadata(&direct_path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&direct_path, permissions).unwrap();
+
+        assert_eq!(second.archived, 0);
+        assert_eq!(second.already_archived, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_size_bytes, source_modified_ms): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                r#"
+                SELECT source_size_bytes, source_modified_ms
+                FROM media_items
+                WHERE source_relative_path = 'image.jpg'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(source_size_bytes.is_some());
+        assert!(source_modified_ms.is_some());
+
+        let manifest_path = second.manifest_path.unwrap();
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
+        let event = manifest
+            .lines()
+            .map(|line| serde_json::from_str::<ManifestEvent>(line).unwrap())
+            .find(|event| event.source_relative_path == "image.jpg")
+            .unwrap();
+        assert_eq!(event.action, ScanAction::AlreadyArchived);
+        assert!(event.source_size_bytes.is_some());
+        assert!(event.source_modified_ms.is_some());
+    }
+
+    #[test]
+    fn records_dat_source_kind_and_decoder_separately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(source.join("attach/hash/2026-01/Img")).unwrap();
+
+        let dat_path = source.join("attach/hash/2026-01/Img/sample.dat");
+        let decoded = synthetic_png(16, 8);
+        let encrypted: Vec<u8> = decoded.iter().map(|byte| byte ^ 0x88).collect();
+        std::fs::write(&dat_path, encrypted).unwrap();
+
+        let summary = extract_images(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_kind, decoder, extension, original_filename, mime_type, width_px, height_px): (
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                r#"
+                SELECT source_kind, decoder, extension, original_filename, mime_type, width_px, height_px
+                FROM media_items
+                WHERE source_relative_path = 'attach/hash/2026-01/Img/sample.dat'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
         assert_eq!(source_kind, "dat_image");
         assert_eq!(decoder.as_deref(), Some("legacy_xor"));
         assert_eq!(extension, "png");
         assert_eq!(original_filename, "sample.dat");
         assert_eq!(mime_type, "image/png");
+        assert_eq!(width_px, Some(16));
+        assert_eq!(height_px, Some(8));
 
         let manifest_path = summary.manifest_path.unwrap();
         let manifest = std::fs::read_to_string(manifest_path).unwrap();
@@ -804,6 +1136,9 @@ mod tests {
         assert_eq!(event.decoder.as_deref(), Some("legacy_xor"));
         assert_eq!(event.original_filename.as_deref(), Some("sample.dat"));
         assert_eq!(event.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(event.width_px, Some(16));
+        assert_eq!(event.height_px, Some(8));
+        assert_eq!(event.duration_ms, None);
     }
 
     #[test]
@@ -836,8 +1171,8 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
 
         let video_path = source.join("clip.MP4");
-        let video_bytes = b"synthetic-video";
-        std::fs::write(&video_path, video_bytes).unwrap();
+        let video_bytes = synthetic_mp4(320, 180, 6_543);
+        std::fs::write(&video_path, &video_bytes).unwrap();
         std::fs::write(source.join("not-video.txt"), b"ignored").unwrap();
 
         let summary = extract_videos(ArchiveConfig {
@@ -855,16 +1190,30 @@ mod tests {
         assert_eq!(std::fs::read(&video_path).unwrap(), video_bytes);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, media_type, extension, original_filename, mime_type): (
+        type DirectVideoRow = (
             String,
             String,
             String,
             String,
             String,
-        ) = conn
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+
+        let (
+            source_kind,
+            media_type,
+            extension,
+            original_filename,
+            mime_type,
+            width_px,
+            height_px,
+            duration_ms,
+        ): DirectVideoRow = conn
             .query_row(
                 r#"
-                SELECT source_kind, media_type, extension, original_filename, mime_type
+                SELECT source_kind, media_type, extension, original_filename, mime_type, width_px, height_px, duration_ms
                 FROM media_items
                 WHERE source_relative_path = 'clip.MP4'
                 "#,
@@ -876,6 +1225,9 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
@@ -885,6 +1237,9 @@ mod tests {
         assert_eq!(extension, "mp4");
         assert_eq!(original_filename, "clip.MP4");
         assert_eq!(mime_type, "video/mp4");
+        assert_eq!(width_px, Some(320));
+        assert_eq!(height_px, Some(180));
+        assert_eq!(duration_ms, Some(6_543));
 
         let manifest_path = summary.manifest_path.unwrap();
         assert!(manifest_path
@@ -903,6 +1258,9 @@ mod tests {
         assert_eq!(event.extension.as_deref(), Some("mp4"));
         assert_eq!(event.original_filename.as_deref(), Some("clip.MP4"));
         assert_eq!(event.mime_type.as_deref(), Some("video/mp4"));
+        assert_eq!(event.width_px, Some(320));
+        assert_eq!(event.height_px, Some(180));
+        assert_eq!(event.duration_ms, Some(6_543));
 
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
@@ -1159,6 +1517,46 @@ mod tests {
     }
 
     #[test]
+    fn extracts_direct_wav_duration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("voice-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let voice_path = source.join("sample.wav");
+        let voice_bytes = synthetic_wav(8_000, 1, 16, 1_250);
+        std::fs::write(&voice_path, voice_bytes).unwrap();
+
+        let summary = extract_voices(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.archived, 1);
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (extension, mime_type, duration_ms): (String, String, Option<i64>) = conn
+            .query_row(
+                r#"
+                SELECT extension, mime_type, duration_ms
+                FROM media_items
+                WHERE source_relative_path = 'sample.wav'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(extension, "wav");
+        assert_eq!(mime_type, "audio/wav");
+        assert_eq!(duration_ms, Some(1_250));
+    }
+
+    #[test]
     fn voice_extract_from_attach_scans_sibling_msg_voice() {
         let tmp = tempfile::tempdir().unwrap();
         let account = tmp.path().join("xwechat_files").join("wxid");
@@ -1353,5 +1751,94 @@ mod tests {
                 && reason.count == 1
                 && reason.samples == ["missing-key.dat"]
         }));
+    }
+
+    fn synthetic_png(width: u32, height: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        data.extend_from_slice(&13u32.to_be_bytes());
+        data.extend_from_slice(b"IHDR");
+        data.extend_from_slice(&width.to_be_bytes());
+        data.extend_from_slice(&height.to_be_bytes());
+        data
+    }
+
+    fn synthetic_jpeg(width: u16, height: u16) -> Vec<u8> {
+        vec![
+            0xff,
+            0xd8,
+            0xff,
+            0xe0,
+            0x00,
+            0x04,
+            0x00,
+            0x00,
+            0xff,
+            0xc0,
+            0x00,
+            0x0b,
+            0x08,
+            (height >> 8) as u8,
+            height as u8,
+            (width >> 8) as u8,
+            width as u8,
+            0x01,
+            0x01,
+            0x11,
+            0x00,
+        ]
+    }
+
+    fn synthetic_mp4(width: u32, height: u32, duration_ms: u32) -> Vec<u8> {
+        let mut mvhd = Vec::new();
+        mvhd.extend_from_slice(&[0, 0, 0, 0]);
+        mvhd.extend_from_slice(&0u32.to_be_bytes());
+        mvhd.extend_from_slice(&0u32.to_be_bytes());
+        mvhd.extend_from_slice(&1000u32.to_be_bytes());
+        mvhd.extend_from_slice(&duration_ms.to_be_bytes());
+
+        let mut tkhd = vec![0u8; 84];
+        tkhd[1..4].copy_from_slice(&[0, 0, 7]);
+        tkhd[76..80].copy_from_slice(&(width << 16).to_be_bytes());
+        tkhd[80..84].copy_from_slice(&(height << 16).to_be_bytes());
+
+        let trak = mp4_box(*b"trak", &mp4_box(*b"tkhd", &tkhd));
+        let moov_payload = [mp4_box(*b"mvhd", &mvhd), trak].concat();
+        [mp4_box(*b"ftyp", b"isom"), mp4_box(*b"moov", &moov_payload)].concat()
+    }
+
+    fn mp4_box(name: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = 8 + payload.len() as u32;
+        let mut data = Vec::new();
+        data.extend_from_slice(&size.to_be_bytes());
+        data.extend_from_slice(&name);
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn synthetic_wav(
+        sample_rate: u32,
+        channels: u16,
+        bits_per_sample: u16,
+        duration_ms: u32,
+    ) -> Vec<u8> {
+        let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
+        let data_size = byte_rate * duration_ms / 1000;
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RIFF");
+        data.extend_from_slice(&(36 + data_size).to_le_bytes());
+        data.extend_from_slice(b"WAVE");
+        data.extend_from_slice(b"fmt ");
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&channels.to_le_bytes());
+        data.extend_from_slice(&sample_rate.to_le_bytes());
+        data.extend_from_slice(&byte_rate.to_le_bytes());
+        data.extend_from_slice(&(channels * bits_per_sample / 8).to_le_bytes());
+        data.extend_from_slice(&bits_per_sample.to_le_bytes());
+        data.extend_from_slice(b"data");
+        data.extend_from_slice(&data_size.to_le_bytes());
+        data.resize(data.len() + data_size as usize, 0);
+        data
     }
 }

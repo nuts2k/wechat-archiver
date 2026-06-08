@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
 use crate::archive::{store_bytes, StoreOutcome};
+use crate::audio::detect_audio_metadata;
 use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions};
 use crate::error::{ArchiverError, IoContext, Result};
 use crate::hash::sha256_bytes;
@@ -1522,6 +1523,9 @@ fn record_missing_dat(
         media_type: "image".to_string(),
         original_filename: Some(format!("{}.dat", resource.file_md5)),
         mime_type: None,
+        width_px: None,
+        height_px: None,
+        duration_ms: None,
         message_talker: message_source.talker.clone(),
         message_sender: message_source.sender.clone(),
         message_local_id: message_source.local_id,
@@ -1531,6 +1535,8 @@ fn record_missing_dat(
         archive_path: None,
         sha256: None,
         size_bytes: None,
+        source_size_bytes: None,
+        source_modified_ms: None,
         extension: None,
         decrypt_status: "source_missing".to_string(),
         verify_status: "failed".to_string(),
@@ -1566,6 +1572,9 @@ fn record_missing_video(
         media_type: "video".to_string(),
         original_filename: Some(format!("{}.mp4", resource.file_md5)),
         mime_type: Some("video/mp4".to_string()),
+        width_px: None,
+        height_px: None,
+        duration_ms: None,
         message_talker: message_source.talker.clone(),
         message_sender: message_source.sender.clone(),
         message_local_id: message_source.local_id,
@@ -1575,6 +1584,8 @@ fn record_missing_video(
         archive_path: None,
         sha256: None,
         size_bytes: None,
+        source_size_bytes: None,
+        source_modified_ms: None,
         extension: Some("mp4".to_string()),
         decrypt_status: "source_missing".to_string(),
         verify_status: "failed".to_string(),
@@ -1614,6 +1625,9 @@ fn record_missing_file(
             .as_deref()
             .and_then(mime_type_for_extension)
             .map(str::to_string),
+        width_px: None,
+        height_px: None,
+        duration_ms: None,
         message_talker: message_source.talker.clone(),
         message_sender: message_source.sender.clone(),
         message_local_id: message_source.local_id,
@@ -1623,6 +1637,8 @@ fn record_missing_file(
         archive_path: None,
         sha256: None,
         size_bytes: None,
+        source_size_bytes: None,
+        source_modified_ms: None,
         extension,
         decrypt_status: "source_missing".to_string(),
         verify_status: "failed".to_string(),
@@ -1658,6 +1674,9 @@ fn record_missing_voice(
         media_type: "voice".to_string(),
         original_filename: None,
         mime_type: Some("audio/silk".to_string()),
+        width_px: None,
+        height_px: None,
+        duration_ms: None,
         message_talker: message_source.talker.clone(),
         message_sender: message_source.sender.clone(),
         message_local_id: message_source.local_id,
@@ -1667,6 +1686,8 @@ fn record_missing_voice(
         archive_path: None,
         sha256: None,
         size_bytes: None,
+        source_size_bytes: None,
+        source_modified_ms: None,
         extension: Some("silk".to_string()),
         decrypt_status: "source_missing".to_string(),
         verify_status: "failed".to_string(),
@@ -1688,6 +1709,7 @@ fn process_voice_resource(
     message_source: &MessageSource,
 ) -> Result<ScanOutcome> {
     let extension = voice_extension_for_data(&resource.data).to_string();
+    let audio_metadata = detect_audio_metadata(&resource.data, &extension);
     let (sha256, size_bytes) = sha256_bytes(&resource.data);
     let (action, archive_path, verify_status) = if dry_run {
         (ScanAction::WouldArchive, None, "not_run".to_string())
@@ -1722,6 +1744,9 @@ fn process_voice_resource(
         media_type: "voice".to_string(),
         original_filename: None,
         mime_type: mime_type_for_extension(&extension).map(str::to_string),
+        width_px: None,
+        height_px: None,
+        duration_ms: audio_metadata.and_then(|metadata| metadata.duration_ms),
         message_talker: message_source.talker.clone(),
         message_sender: message_source.sender.clone(),
         message_local_id: message_source.local_id,
@@ -1731,6 +1756,8 @@ fn process_voice_resource(
         archive_path,
         sha256: Some(sha256),
         size_bytes: Some(size_bytes),
+        source_size_bytes: Some(size_bytes),
+        source_modified_ms: None,
         extension: Some(extension),
         decrypt_status: "not_needed".to_string(),
         verify_status,
@@ -2178,6 +2205,12 @@ fn voice_extension_for_data(data: &[u8]) -> &'static str {
     if data.starts_with(b"ID3") || data.starts_with(&[0xff, 0xfb]) {
         return "mp3";
     }
+    if data.len() >= 7 && data[0] == 0xff && data[1] & 0xf0 == 0xf0 {
+        return "aac";
+    }
+    if data.len() >= 12 && data.get(4..8) == Some(b"ftyp") {
+        return "m4a";
+    }
     if data.starts_with(b"OggS") {
         return "ogg";
     }
@@ -2445,6 +2478,19 @@ mod tests {
         assert_eq!(sha256_file(&db_path).unwrap(), db_hash_before);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        type MessageDbVideoRow = (
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+
         let (
             source_kind,
             media_type,
@@ -2453,7 +2499,10 @@ mod tests {
             message_create_time,
             original_filename,
             mime_type,
-        ): (String, String, String, i64, i64, String, String) = conn
+            width_px,
+            height_px,
+            duration_ms,
+        ): MessageDbVideoRow = conn
             .query_row(
                 r#"
                 SELECT source_kind,
@@ -2462,7 +2511,10 @@ mod tests {
                        message_local_id,
                        message_create_time,
                        original_filename,
-                       mime_type
+                       mime_type,
+                       width_px,
+                       height_px,
+                       duration_ms
                 FROM media_items
                 WHERE source_kind = 'message_db_video'
                 "#,
@@ -2476,6 +2528,9 @@ mod tests {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
@@ -2487,6 +2542,9 @@ mod tests {
         assert_eq!(message_create_time, create_time);
         assert_eq!(original_filename, format!("{file_md5}.mp4"));
         assert_eq!(mime_type, "video/mp4");
+        assert_eq!(width_px, Some(640));
+        assert_eq!(height_px, Some(360));
+        assert_eq!(duration_ms, Some(7_890));
 
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
@@ -2726,8 +2784,8 @@ mod tests {
         let talker = "room@example";
         let local_id = 35;
         let create_time = 1_779_472_800;
-        let voice_data = b"\x02synthetic-silk-voice";
-        create_voice_fixture_account(&account, talker, local_id, create_time, Some(voice_data));
+        let voice_data = synthetic_wav(8_000, 1, 16, 1_250);
+        create_voice_fixture_account(&account, talker, local_id, create_time, Some(&voice_data));
 
         let media_db_path = account
             .join("db_storage")
@@ -2757,6 +2815,19 @@ mod tests {
         assert_eq!(sha256_file(&message_db_path).unwrap(), message_hash_before);
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        type MessageDbVoiceRow = (
+            String,
+            String,
+            String,
+            u64,
+            String,
+            i64,
+            i64,
+            Option<String>,
+            String,
+            Option<i64>,
+        );
+
         let (
             source_kind,
             media_type,
@@ -2767,17 +2838,8 @@ mod tests {
             message_create_time,
             original_filename,
             mime_type,
-        ): (
-            String,
-            String,
-            String,
-            u64,
-            String,
-            i64,
-            i64,
-            Option<String>,
-            String,
-        ) = conn
+            duration_ms,
+        ): MessageDbVoiceRow = conn
             .query_row(
                 r#"
                 SELECT source_kind,
@@ -2788,7 +2850,8 @@ mod tests {
                        message_local_id,
                        message_create_time,
                        original_filename,
-                       mime_type
+                       mime_type,
+                       duration_ms
                 FROM media_items
                 WHERE source_kind = 'message_db_voice'
                 "#,
@@ -2804,19 +2867,21 @@ mod tests {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
             .unwrap();
         assert_eq!(source_kind, "message_db_voice");
         assert_eq!(media_type, "voice");
-        assert_eq!(extension, "silk");
+        assert_eq!(extension, "wav");
         assert_eq!(size_bytes, voice_data.len() as u64);
         assert_eq!(message_talker, talker);
         assert_eq!(message_local_id, local_id);
         assert_eq!(message_create_time, create_time);
         assert_eq!(original_filename, None);
-        assert_eq!(mime_type, "audio/silk");
+        assert_eq!(mime_type, "audio/wav");
+        assert_eq!(duration_ms, Some(1_250));
 
         let manifest_path = summary.manifest_path.clone().unwrap();
         let manifest = fs::read_to_string(manifest_path).unwrap();
@@ -2830,7 +2895,8 @@ mod tests {
         assert_eq!(event.message_create_time, Some(create_time));
         assert_eq!(event.size_bytes, Some(voice_data.len() as u64));
         assert_eq!(event.original_filename, None);
-        assert_eq!(event.mime_type.as_deref(), Some("audio/silk"));
+        assert_eq!(event.mime_type.as_deref(), Some("audio/wav"));
+        assert_eq!(event.duration_ms, Some(1_250));
 
         let verify = verify_archive(&archive).unwrap();
         assert_eq!(verify.checked, 1);
@@ -3426,7 +3492,7 @@ mod tests {
         if create_video {
             fs::write(
                 video_dir.join(format!("{file_md5}.mp4")),
-                b"synthetic-video",
+                synthetic_mp4(640, 360, 7_890),
             )
             .unwrap();
         }
@@ -3818,6 +3884,59 @@ mod tests {
             params![103, 0, packed_file_name("统计报告.pdf")],
         )
         .unwrap();
+    }
+
+    fn synthetic_mp4(width: u32, height: u32, duration_ms: u32) -> Vec<u8> {
+        let mut mvhd = Vec::new();
+        mvhd.extend_from_slice(&[0, 0, 0, 0]);
+        mvhd.extend_from_slice(&0u32.to_be_bytes());
+        mvhd.extend_from_slice(&0u32.to_be_bytes());
+        mvhd.extend_from_slice(&1000u32.to_be_bytes());
+        mvhd.extend_from_slice(&duration_ms.to_be_bytes());
+
+        let mut tkhd = vec![0u8; 84];
+        tkhd[1..4].copy_from_slice(&[0, 0, 7]);
+        tkhd[76..80].copy_from_slice(&(width << 16).to_be_bytes());
+        tkhd[80..84].copy_from_slice(&(height << 16).to_be_bytes());
+
+        let trak = mp4_box(*b"trak", &mp4_box(*b"tkhd", &tkhd));
+        let moov_payload = [mp4_box(*b"mvhd", &mvhd), trak].concat();
+        [mp4_box(*b"ftyp", b"isom"), mp4_box(*b"moov", &moov_payload)].concat()
+    }
+
+    fn mp4_box(name: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = 8 + payload.len() as u32;
+        let mut data = Vec::new();
+        data.extend_from_slice(&size.to_be_bytes());
+        data.extend_from_slice(&name);
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn synthetic_wav(
+        sample_rate: u32,
+        channels: u16,
+        bits_per_sample: u16,
+        duration_ms: u32,
+    ) -> Vec<u8> {
+        let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
+        let data_size = byte_rate * duration_ms / 1000;
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RIFF");
+        data.extend_from_slice(&(36 + data_size).to_le_bytes());
+        data.extend_from_slice(b"WAVE");
+        data.extend_from_slice(b"fmt ");
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&channels.to_le_bytes());
+        data.extend_from_slice(&sample_rate.to_le_bytes());
+        data.extend_from_slice(&byte_rate.to_le_bytes());
+        data.extend_from_slice(&(channels * bits_per_sample / 8).to_le_bytes());
+        data.extend_from_slice(&bits_per_sample.to_le_bytes());
+        data.extend_from_slice(b"data");
+        data.extend_from_slice(&data_size.to_le_bytes());
+        data.resize(data.len() + data_size as usize, 0);
+        data
     }
 
     fn copy_dir(from: &Path, to: &Path) {

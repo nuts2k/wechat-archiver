@@ -24,7 +24,7 @@
 - 支持统一媒体抽取入口 `extract --type image`、`extract --type video`、`extract --type file` 和 `extract --type voice`；视频、文件和语音支持直接文件扫描，视频、文件和语音也已有消息库枚举入口。
 - 对未知 `.dat`、缺少 V2 key 或无法识别文件记录为 `unsupported`，不会写出不可信的垃圾文件；对消息库中存在但本地 `.dat` 缺失的资源记录为 `failed`。
 - 归档文件写入独立 archive 目录，使用内容寻址路径 `objects/sha256/<prefix>/<sha256>.<ext>`。
-- 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind`、独立 `decoder`、原始文件名、MIME 类型和可用的消息来源字段；索引库通过 `schema_migrations` 记录显式 schema 版本迁移。
+- 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind`、独立 `decoder`、原始文件名、MIME 类型、图片/视频宽高、部分媒体时长、源文件指纹和可用的消息来源字段；索引库通过 `schema_migrations` 记录显式 schema 版本迁移。
 - 支持 `status` 查看索引统计，支持 `lookup` 按 `sha256` 或源路径反查索引记录，支持 `report` 导出 JSON/CSV 索引报告，支持 `views` 生成归档目录内的可浏览派生视图，支持 `verify` 重新计算归档对象 hash。
 
 当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`count-db-media`、`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；图片、视频和文件附件仍只从 `--account` 下的 `msg/*` 读取，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。
@@ -147,7 +147,7 @@ cargo run -p wechat-archiver -- extract --type video \
   --archive "/path/to/wechat-archive"
 ```
 
-当前视频归档会复制 `mp4`、`mov`、`m4v` 到内容寻址归档库，记录 `source_kind=direct_video`、`media_type=video`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，会自动扫描同账号的 `msg/video`；其他目录则只扫描传入目录本身。暂不提取时长和分辨率。
+当前视频归档会复制 `mp4`、`mov`、`m4v` 到内容寻址归档库，记录 `source_kind=direct_video`、`media_type=video`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，会自动扫描同账号的 `msg/video`；其他目录则只扫描传入目录本身。对 MP4/MOV/M4V 会 best-effort 解析 `duration_ms`、`width_px` 和 `height_px`。
 
 归档直接文件附件：
 
@@ -167,7 +167,7 @@ cargo run -p wechat-archiver -- extract --type voice \
   --archive "/path/to/wechat-archive"
 ```
 
-当前直接语音归档会复制 `silk`、`slk`、`amr`、`mp3`、`m4a`、`aac`、`wav`、`ogg`、`opus` 到内容寻址归档库，记录 `source_kind=direct_voice`、`media_type=voice`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，只会在同账号存在 `msg/voice` 或 `msg/audio` 专用目录时扫描这些目录；其他目录则只扫描传入目录本身。消息库语音请使用 `extract-db-voices`；当前不做 SILK 转码或语音转写。
+当前直接语音归档会复制 `silk`、`slk`、`amr`、`mp3`、`m4a`、`aac`、`wav`、`ogg`、`opus` 到内容寻址归档库，记录 `source_kind=direct_voice`、`media_type=voice`。如果 `--source` 是微信账号目录或该账号的 `msg/attach`，只会在同账号存在 `msg/voice` 或 `msg/audio` 专用目录时扫描这些目录；其他目录则只扫描传入目录本身。对 `wav`、`mp3`、`m4a`、`aac` 会 best-effort 解析 `duration_ms`。消息库语音请使用 `extract-db-voices`；当前不做 SILK 转码或语音转写。
 
 按消息库枚举并归档图片：
 
@@ -198,7 +198,7 @@ cargo run -p wechat-archiver -- extract-db-videos \
   --archive "/path/to/wechat-archive"
 ```
 
-该命令会读取 `<account>/db_storage/message/message_*.db` 和 `message_resource.db`，基于 `MessageResourceInfo` / `MessageResourceDetail` 的资源 md5 定位 `<account>/msg/video/<YYYY-MM>/<md5>.mp4`，并复制可读视频到归档库，记录 `source_kind=message_db_video`、`media_type=video` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。它不会解密 SQLCipher 数据库，不会写入微信源目录；暂不提取时长和分辨率。
+该命令会读取 `<account>/db_storage/message/message_*.db` 和 `message_resource.db`，基于 `MessageResourceInfo` / `MessageResourceDetail` 的资源 md5 定位 `<account>/msg/video/<YYYY-MM>/<md5>.mp4`，并复制可读视频到归档库，记录 `source_kind=message_db_video`、`media_type=video`、可用的 `message_talker`、`message_local_id`、`message_create_time`，以及 best-effort 解析得到的 `duration_ms`、`width_px` 和 `height_px`。它不会解密 SQLCipher 数据库，不会写入微信源目录。
 
 按消息库枚举并归档文件附件：
 
@@ -218,7 +218,7 @@ cargo run -p wechat-archiver -- extract-db-voices \
   --archive "/path/to/wechat-archive"
 ```
 
-该命令会读取 `<account>/db_storage/message/message_*.db`、`message_resource.db` 和 `media_*.db`，基于 `Msg_<md5(talker)>` 的 `local_type=34` 与 `VoiceInfo` 的 `talker/local_id/create_time` 匹配语音 BLOB，并将 `voice_data` 原始字节归档到内容寻址库。归档成功后记录 `source_kind=message_db_voice`、`media_type=voice` 和可用的 `message_talker`、`message_local_id`、`message_create_time`。它不会解密 SQLCipher 数据库，不会写入微信源目录；当前不做 SILK 转码、语音转写或发送人猜测。
+该命令会读取 `<account>/db_storage/message/message_*.db`、`message_resource.db` 和 `media_*.db`，基于 `Msg_<md5(talker)>` 的 `local_type=34` 与 `VoiceInfo` 的 `talker/local_id/create_time` 匹配语音 BLOB，并将 `voice_data` 原始字节归档到内容寻址库。归档成功后记录 `source_kind=message_db_voice`、`media_type=voice`、可用的 `message_talker`、`message_local_id`、`message_create_time`，以及对可识别 `wav`、`mp3`、`aac` BLOB best-effort 解析得到的 `duration_ms`。它不会解密 SQLCipher 数据库，不会写入微信源目录；当前不做 SILK 转码、语音转写或发送人猜测。
 
 如果使用已解密消息库副本，`extract-db-voices` 也支持 `--message-db-dir`。语音 BLOB 会从该目录下的 `media_*.db/VoiceInfo` 只读读取：
 
@@ -304,7 +304,7 @@ cargo run -p wechat-archiver -- report \
   --format csv > wechat-archive-report.csv
 ```
 
-`report` 只读打开 `index.sqlite`，导出媒体记录、原始文件名、MIME 类型、来源字段、hash、归档路径、解密状态、校验状态和错误信息；JSON 输出包含汇总计数，CSV 输出适合表格工具和后续审计处理。
+`report` 只读打开 `index.sqlite`，导出媒体记录、原始文件名、MIME 类型、图片/视频宽高、部分媒体时长、源文件大小和修改时间、来源字段、hash、归档路径、解密状态、校验状态和错误信息；JSON 输出包含汇总计数，CSV 输出适合表格工具和后续审计处理。
 
 生成可浏览视图：
 
@@ -346,7 +346,7 @@ wechat-archive/
   views/
 ```
 
-`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`views/` 是由索引再生成的相对软链接视图，可删除后重建。`index.sqlite` 通过 `schema_migrations` 记录已应用的 schema 版本，便于后续安全升级旧归档库。`lookup` 会只读打开索引，可按 `sha256` 反查所有来源，也可按 `source_path` 查询单个源文件的当前归档状态；`report` 会只读导出全量索引报告。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`，并记录 `original_filename` 与基于扩展名保守推断的 `mime_type`。通过消息库归档的图片、视频、文件附件和语音还会记录可用的消息来源字段：`message_talker`、`message_local_id`、`message_create_time`；`message_sender` 已预留但当前不猜测不同微信版本的发送人列。
+`objects` 是真实内容存储，`index.sqlite` 是当前索引，`manifests` 是每次运行的审计记录。`views/` 是由索引再生成的相对软链接视图，可删除后重建。`index.sqlite` 通过 `schema_migrations` 记录已应用的 schema 版本，便于后续安全升级旧归档库。`lookup` 会只读打开索引，可按 `sha256` 反查所有来源，也可按 `source_path` 查询单个源文件的当前归档状态；`report` 会只读导出全量索引报告。`index.sqlite` 和 manifest 会区分来源类型 `source_kind` 与解码路径 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`，并记录 `original_filename`、基于扩展名保守推断的 `mime_type`、图片/视频 `width_px`/`height_px`、视频和部分音频 `duration_ms`、`source_size_bytes` 和 `source_modified_ms`。直接媒体复跑时，如果源文件指纹未变且既有索引记录已校验通过，会复用索引记录并跳过重新 hash/复制；`.dat` 图片仍会按当前 key 和 `wxgf` 参数重新验证或解码。通过消息库归档的图片、视频、文件附件和语音还会记录可用的消息来源字段：`message_talker`、`message_local_id`、`message_create_time`；`message_sender` 已预留但当前不猜测不同微信版本的发送人列。
 
 ## 外部项目参考
 

@@ -1060,9 +1060,20 @@ fn print_index_lookup(lookup: &IndexLookup, json: bool) -> Result<()> {
             optional_string(&record.original_filename)
         );
         println!("  mime_type: {}", optional_string(&record.mime_type));
+        println!("  width_px: {}", optional_u32(record.width_px));
+        println!("  height_px: {}", optional_u32(record.height_px));
+        println!("  duration_ms: {}", optional_u64(record.duration_ms));
         println!("  archive_path: {}", optional_string(&record.archive_path));
         println!("  sha256: {}", optional_string(&record.sha256));
         println!("  size_bytes: {}", optional_u64(record.size_bytes));
+        println!(
+            "  source_size_bytes: {}",
+            optional_u64(record.source_size_bytes)
+        );
+        println!(
+            "  source_modified_ms: {}",
+            optional_i64(record.source_modified_ms)
+        );
         println!("  extension: {}", optional_string(&record.extension));
         println!("  decoder: {}", optional_string(&record.decoder));
         println!("  decrypt_status: {}", record.decrypt_status);
@@ -1109,6 +1120,9 @@ fn print_archive_report_csv(report: &ArchiveReport) {
         "media_type",
         "original_filename",
         "mime_type",
+        "width_px",
+        "height_px",
+        "duration_ms",
         "message_talker",
         "message_sender",
         "message_local_id",
@@ -1117,6 +1131,8 @@ fn print_archive_report_csv(report: &ArchiveReport) {
         "archive_path",
         "sha256",
         "size_bytes",
+        "source_size_bytes",
+        "source_modified_ms",
         "extension",
         "decrypt_status",
         "verify_status",
@@ -1128,7 +1144,12 @@ fn print_archive_report_csv(report: &ArchiveReport) {
         let id = record.id.to_string();
         let message_local_id = optional_i64_csv(record.message_local_id);
         let message_create_time = optional_i64_csv(record.message_create_time);
+        let width_px = optional_u32_csv(record.width_px);
+        let height_px = optional_u32_csv(record.height_px);
+        let duration_ms = optional_u64_csv(record.duration_ms);
         let size_bytes = optional_u64_csv(record.size_bytes);
+        let source_size_bytes = optional_u64_csv(record.source_size_bytes);
+        let source_modified_ms = optional_i64_csv(record.source_modified_ms);
         let created_at_ms = record.created_at_ms.to_string();
         let updated_at_ms = record.updated_at_ms.to_string();
         print_csv_row(&[
@@ -1139,6 +1160,9 @@ fn print_archive_report_csv(report: &ArchiveReport) {
             &record.media_type,
             optional_string_csv(&record.original_filename),
             optional_string_csv(&record.mime_type),
+            &width_px,
+            &height_px,
+            &duration_ms,
             optional_string_csv(&record.message_talker),
             optional_string_csv(&record.message_sender),
             &message_local_id,
@@ -1147,6 +1171,8 @@ fn print_archive_report_csv(report: &ArchiveReport) {
             optional_string_csv(&record.archive_path),
             optional_string_csv(&record.sha256),
             &size_bytes,
+            &source_size_bytes,
+            &source_modified_ms,
             optional_string_csv(&record.extension),
             &record.decrypt_status,
             &record.verify_status,
@@ -1179,6 +1205,10 @@ fn optional_string_csv(value: &Option<String>) -> &str {
 }
 
 fn optional_u64_csv(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn optional_u32_csv(value: Option<u32>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 
@@ -1227,6 +1257,12 @@ fn optional_string(value: &Option<String>) -> &str {
 }
 
 fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn optional_u32(value: Option<u32>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string())

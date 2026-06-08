@@ -350,6 +350,9 @@ mod tests {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string()),
             mime_type: Some("image/jpeg".to_string()),
+            width_px: Some(640),
+            height_px: Some(480),
+            duration_ms: None,
             message_talker: message_talker.map(str::to_string),
             message_sender: None,
             message_local_id: Some(42),
@@ -358,6 +361,8 @@ mod tests {
             archive_path,
             sha256,
             size_bytes: Some(4),
+            source_size_bytes: Some(4),
+            source_modified_ms: Some(1_700_000_000_000),
             extension: Some("jpg".to_string()),
             decrypt_status: "not_needed".to_string(),
             verify_status: "ok".to_string(),

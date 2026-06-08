@@ -146,6 +146,9 @@ mod tests {
                 .filter(|name| !name.is_empty())
                 .map(str::to_string),
             mime_type: Some("image/jpeg".to_string()),
+            width_px: Some(640),
+            height_px: Some(480),
+            duration_ms: None,
             message_talker: None,
             message_sender: None,
             message_local_id: None,
@@ -154,6 +157,8 @@ mod tests {
             archive_path: Some(format!("objects/sha256/ab/{source_path}.jpg")),
             sha256: Some(source_path.to_string()),
             size_bytes: Some(10),
+            source_size_bytes: Some(10),
+            source_modified_ms: Some(1),
             extension: Some("jpg".to_string()),
             decrypt_status: "not_needed".to_string(),
             verify_status: "ok".to_string(),

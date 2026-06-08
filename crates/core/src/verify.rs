@@ -236,6 +236,9 @@ mod tests {
                 .filter(|name| !name.is_empty())
                 .map(str::to_string),
             mime_type: None,
+            width_px: None,
+            height_px: None,
+            duration_ms: None,
             message_talker: None,
             message_sender: None,
             message_local_id: None,
@@ -244,6 +247,8 @@ mod tests {
             archive_path,
             sha256,
             size_bytes: Some(4),
+            source_size_bytes: Some(4),
+            source_modified_ms: Some(1),
             extension: Some("bin".to_string()),
             decrypt_status: "not_needed".to_string(),
             verify_status: "ok".to_string(),
