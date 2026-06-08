@@ -153,6 +153,7 @@ wechat-archive/
 - 索引和 manifest 会记录 `original_filename`、`mime_type`、`width_px`、`height_px`、`duration_ms`、`source_size_bytes`、`source_modified_ms`、`decode_fingerprint`；MIME 当前基于归档扩展名保守推断，不做内容嗅探，图片宽高、视频宽高/时长和部分音频时长当前 best-effort 写入。直接媒体复跑时可基于未变源文件指纹复用已校验记录，`.dat` 图片可基于未变源文件指纹、解码参数指纹和已校验对象复用旧记录；`decode_fingerprint` 只保存参数哈希，不保存原始 key。
 - 抽取 summary 会输出旧索引复用、实际 `.dat` 解码、元数据补写、新对象写入和已有对象命中计数，便于判断每次运行的真实工作量。
 - core 提供任务级 `TaskEvent`、`TaskProgress`、`TaskReporter`、`CancelToken`、`TaskRunner` 和 `TaskHandle`；CLI 抽取类命令可用 `--jsonl-progress` 输出 JSONL 进度事件，未来 Tauri 可直接复用同一套结构化事件、后台任务状态和取消信号。
+- 任务队列持久化和重启恢复边界见 `docs/task-persistence-and-recovery.md`；当前设计不自动续跑重启前的 running 任务。
 - 消息库图片、视频、文件附件和语音归档会在索引和 manifest 中记录可用的 `message_talker`、`message_sender`、`message_local_id`、`message_create_time`；`message_sender` 当前仅在 `Msg_*` 表存在 `real_sender_id` 且同库 `Name2Id` 可映射时写入稳定 `user_name`。
 - 支持 `status` 查看索引总量、唯一对象、唯一字节数，并按媒体类型、来源类型、解密状态和校验状态分组。
 - 支持 `report` 只读导出 JSON/CSV 索引报告，供人工审计、备份流程和后续 AI 分类使用。
