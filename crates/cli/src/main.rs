@@ -2894,6 +2894,169 @@ mod tests {
     }
 
     #[test]
+    fn tasks_retry_records_new_completed_message_db_tasks() {
+        let cases = [
+            (
+                MediaType::Image,
+                "extract_db_images",
+                "retry: 消息库抽取图片",
+                "image",
+            ),
+            (
+                MediaType::Video,
+                "extract_db_videos",
+                "retry: 消息库抽取视频",
+                "video",
+            ),
+            (
+                MediaType::File,
+                "extract_db_files",
+                "retry: 消息库抽取文件",
+                "file",
+            ),
+            (
+                MediaType::Voice,
+                "extract_db_voices",
+                "retry: 消息库抽取语音",
+                "voice",
+            ),
+        ];
+
+        for (media_type, task_kind, retry_task_name, media_name) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let app_db = tmp.path().join("app.sqlite");
+            SqliteTaskStore::open(&app_db).unwrap();
+            let account_dir = tmp.path().join("wxid_cli");
+            let message_db_dir = tmp.path().join("decrypted-message");
+            let archive_dir = tmp.path().join("archive");
+            create_cli_message_db_fixture(&account_dir, &message_db_dir, media_type);
+
+            run_message_db_extract(
+                media_type,
+                Some(&app_db),
+                false,
+                MessageDbExtractConfig {
+                    account_dir: account_dir.clone(),
+                    message_db_dir: Some(message_db_dir.clone()),
+                    archive_dir: archive_dir.clone(),
+                    dry_run: true,
+                    dat_options: DatDecodeOptions::default(),
+                    explain_unsupported: false,
+                },
+            )
+            .unwrap();
+            let store = SqliteTaskStore::open_readonly(&app_db).unwrap();
+            let original = store
+                .list_tasks(&TaskListQuery::default())
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("original task record");
+            assert_eq!(original.task_kind, task_kind);
+            if media_type == MediaType::Image {
+                assert_eq!(
+                    original.params_summary_json["image_aes_key_provided"],
+                    false
+                );
+            }
+            drop(store);
+
+            run_tasks(TasksArgs {
+                command: TaskCommands::Retry(TasksRetryArgs {
+                    app_db: app_db.clone(),
+                    task_id: original.task_id.clone(),
+                    json: true,
+                }),
+            })
+            .unwrap();
+
+            let store = SqliteTaskStore::open_readonly(&app_db).unwrap();
+            let records = store.list_tasks(&TaskListQuery::default()).unwrap();
+            assert_eq!(records.len(), 2);
+            let retry = records
+                .iter()
+                .find(|record| record.task_id != original.task_id)
+                .expect("retry task record");
+            assert_eq!(retry.status, PersistentTaskStatus::Completed);
+            assert_eq!(retry.task_name, retry_task_name);
+            assert_eq!(retry.task_kind, task_kind);
+            assert_eq!(retry.source_dir.as_deref(), Some(account_dir.as_path()));
+            assert_eq!(retry.archive_dir.as_deref(), Some(archive_dir.as_path()));
+            assert!(retry.dry_run);
+            assert_eq!(
+                retry.params_summary_json["retry_source_task_id"],
+                original.task_id
+            );
+            assert_eq!(retry.params_summary_json["task_kind"], task_kind);
+            assert_eq!(retry.params_summary_json["media_types"][0], media_name);
+            assert_eq!(
+                retry.params_summary_json["message_db_dir"].as_str(),
+                Some(message_db_dir.to_string_lossy().as_ref())
+            );
+            assert_eq!(retry.progress.scanned_files, 1);
+            assert_eq!(retry.progress.candidates, 1);
+            assert_eq!(retry.result_summary.as_ref().unwrap().would_archive, 1);
+            assert!(!archive_dir.exists());
+        }
+    }
+
+    #[test]
+    fn tasks_retry_rejects_message_db_image_tasks_that_need_aes_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("app.sqlite");
+        SqliteTaskStore::open(&app_db).unwrap();
+        let account_dir = tmp.path().join("wxid_cli");
+        let message_db_dir = tmp.path().join("decrypted-message");
+        let archive_dir = tmp.path().join("archive");
+        create_cli_message_db_fixture(&account_dir, &message_db_dir, MediaType::Image);
+
+        run_message_db_extract(
+            MediaType::Image,
+            Some(&app_db),
+            false,
+            MessageDbExtractConfig {
+                account_dir,
+                message_db_dir: Some(message_db_dir),
+                archive_dir: archive_dir.clone(),
+                dry_run: true,
+                dat_options: DatDecodeOptions {
+                    image_aes_key: Some(b"plain-message-db-aes-key".to_vec()),
+                    image_xor_key: 0x88,
+                    wxgf_mode: CoreWxgfMode::Off,
+                    wxgf_ffmpeg_path: None,
+                },
+                explain_unsupported: false,
+            },
+        )
+        .unwrap();
+
+        let store = SqliteTaskStore::open_readonly(&app_db).unwrap();
+        let original = store
+            .list_tasks(&TaskListQuery::default())
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("original task record");
+        assert_eq!(original.task_kind, "extract_db_images");
+        assert_eq!(original.params_summary_json["image_aes_key_provided"], true);
+        drop(store);
+
+        let result = run_tasks(TasksArgs {
+            command: TaskCommands::Retry(TasksRetryArgs {
+                app_db: app_db.clone(),
+                task_id: original.task_id,
+                json: true,
+            }),
+        });
+
+        assert!(result.is_err());
+        let store = SqliteTaskStore::open_readonly(&app_db).unwrap();
+        let records = store.list_tasks(&TaskListQuery::default()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(!archive_dir.exists());
+    }
+
+    #[test]
     fn extract_with_app_db_records_completed_task() {
         let tmp = tempfile::tempdir().unwrap();
         let app_db = tmp.path().join("app.sqlite");
