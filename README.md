@@ -26,6 +26,7 @@
 - 归档文件写入独立 archive 目录，使用内容寻址路径 `objects/sha256/<prefix>/<sha256>.<ext>`。
 - 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind`、独立 `decoder`、`.dat` 解码参数指纹、原始文件名、MIME 类型、图片/视频宽高、部分媒体时长、源文件指纹和可用的消息来源字段；索引库通过 `schema_migrations` 记录显式 schema 版本迁移。
 - 抽取 summary 会区分本轮新写对象、命中已有对象、复用旧索引记录、实际 `.dat` 解码次数和元数据补写次数，便于判断复跑是否真的减少了 hash、复制或解码工作。
+- core 暴露任务级 `TaskEvent`、`TaskProgress`、`TaskReporter` 和 `CancelToken`；CLI 抽取类命令支持 `--jsonl-progress` 将结构化进度事件输出到 stderr，供未来 Tauri 或脚本消费。
 - 支持 `status` 查看索引统计，支持 `lookup` 按 `sha256` 或源路径反查索引记录，支持 `report` 导出 JSON/CSV 索引报告，支持 `views` 生成归档目录内的可浏览派生视图，支持 `verify` 重新计算归档对象 hash。
 
 当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`count-db-media`、`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；图片、视频和文件附件仍只从 `--account` 下的 `msg/*` 读取，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。
@@ -139,6 +140,8 @@ cargo run -p wechat-archiver -- extract --type image,video,file,voice \
 ```
 
 多类型聚合复用各单类型抽取器；总计中的 `candidates`、`scanned_files`、`reused_records`、`decoded_dat`、`metadata_backfilled`、`new_objects`、`existing_objects` 等字段是各类型结果相加，不代表跨类型去重后的唯一文件数。
+
+抽取类命令可增加 `--jsonl-progress`，将 `started`、`scan_source_started`、`file_scanned`、`candidate_found`、`item_finished`、`completed` 或 `cancelled` 事件按 JSONL 输出到 stderr；最终 summary 仍输出到 stdout。
 
 归档直接视频文件：
 

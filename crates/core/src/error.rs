@@ -45,6 +45,9 @@ pub enum ArchiverError {
         actual: String,
     },
 
+    #[error("task cancelled: {task_name}")]
+    TaskCancelled { task_name: String },
+
     #[error("{0}")]
     Other(String),
 }

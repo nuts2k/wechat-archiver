@@ -15,9 +15,10 @@ use crate::index::{index_path, open_index};
 use crate::manifest::ManifestWriter;
 use crate::media::{direct_file_extension, direct_video_extension, mime_type_for_extension};
 use crate::scanner::{
-    apply_result, outcome_with_object_stat, persist, process_dat_image_with_message_source,
+    apply_outcome, outcome_with_object_stat, persist, process_dat_image_with_message_source,
     process_direct_media_with_message_source, MessageSource, ObjectWriteStat, ScanOutcome,
 };
+use crate::task::{task_event, TaskEventKind, TaskOptions, TaskProgress};
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 
 #[derive(Debug, Clone)]
@@ -163,6 +164,13 @@ struct VoiceResource {
 }
 
 pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
+    extract_message_db_images_with_task(config, TaskOptions::default())
+}
+
+pub fn extract_message_db_images_with_task(
+    config: MessageDbExtractConfig,
+    task_options: TaskOptions,
+) -> Result<ExtractSummary> {
     let resolved = ArchiveConfig {
         source_dir: config.account_dir.clone(),
         archive_dir: config.archive_dir,
@@ -186,6 +194,7 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
     let message_dbs = message_db_paths(&db_source.message_dir)?;
     let (image_messages, scanned_rows) = query_image_message_sources(&message_dbs, &resources)?;
 
+    let task_name = "extract-db-images";
     let run_id = format!("{}", now_epoch_ms());
     let mut summary = ExtractSummary::new(
         run_id.clone(),
@@ -197,6 +206,17 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
     if resolved.explain_unsupported {
         summary.enable_unsupported_explanation();
     }
+    emit_task_event(
+        &task_options,
+        &run_id,
+        task_name,
+        TaskEventKind::Started,
+        &summary,
+        None,
+        None,
+        None,
+    );
+    check_task_cancelled(&task_options, &run_id, task_name, &summary)?;
 
     let mut conn = None;
     let mut manifest = None;
@@ -204,37 +224,52 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
         create_archive_dirs(&resolved.archive_dir)?;
         let opened = open_index(&resolved.archive_dir)?;
         summary.index_path = Some(index_path(&resolved.archive_dir));
-        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, "extract-db-images")?;
+        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, task_name)?;
         summary.manifest_path = Some(writer.path().to_path_buf());
         conn = Some(opened);
         manifest = Some(writer);
     }
 
     for resource in resources {
+        check_task_cancelled(&task_options, &run_id, task_name, &summary)?;
         if !image_messages.contains_key(&resource.key) {
             continue;
         }
 
         summary.candidates += 1;
+        emit_task_event(
+            &task_options,
+            &run_id,
+            task_name,
+            TaskEventKind::CandidateFound,
+            &summary,
+            None,
+            None,
+            Some(resource.file_md5.clone()),
+        );
         let message_source = message_source_from_map(&image_messages, &resource.key);
+        let mut source_path = None;
         let result = match find_dat_file(
             &attach_root,
             &resource.key.talker,
             &resource.file_md5,
             resource.key.create_time,
         ) {
-            Some(dat_path) => process_dat_image_with_message_source(
-                &dat_path,
-                &resolved.source_dir,
-                &resolved.archive_dir,
-                &run_id,
-                "message_db_image",
-                resolved.dry_run,
-                &resolved.dat_options,
-                conn.as_ref(),
-                manifest.as_mut(),
-                Some(&message_source),
-            ),
+            Some(dat_path) => {
+                source_path = Some(dat_path.clone());
+                process_dat_image_with_message_source(
+                    &dat_path,
+                    &resolved.source_dir,
+                    &resolved.archive_dir,
+                    &run_id,
+                    "message_db_image",
+                    resolved.dry_run,
+                    &resolved.dat_options,
+                    conn.as_ref(),
+                    manifest.as_mut(),
+                    Some(&message_source),
+                )
+            }
             None => record_missing_dat(
                 &resource,
                 &resolved.source_dir,
@@ -244,18 +279,42 @@ pub fn extract_message_db_images(config: MessageDbExtractConfig) -> Result<Extra
                 &message_source,
             ),
         };
-        apply_result(&mut summary, result)?;
+        apply_task_result(
+            &task_options,
+            &run_id,
+            task_name,
+            &mut summary,
+            source_path.as_deref(),
+            result,
+        )?;
     }
 
     if let Some(writer) = manifest.as_mut() {
         writer.flush()?;
     }
     summary.finish_unsupported_explanation();
+    emit_task_event(
+        &task_options,
+        &run_id,
+        task_name,
+        TaskEventKind::Completed,
+        &summary,
+        None,
+        None,
+        None,
+    );
 
     Ok(summary)
 }
 
 pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
+    extract_message_db_videos_with_task(config, TaskOptions::default())
+}
+
+pub fn extract_message_db_videos_with_task(
+    config: MessageDbExtractConfig,
+    task_options: TaskOptions,
+) -> Result<ExtractSummary> {
     let resolved = ArchiveConfig {
         source_dir: config.account_dir.clone(),
         archive_dir: config.archive_dir,
@@ -277,6 +336,7 @@ pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<Extra
     let (video_messages, scanned_rows) =
         query_message_sources_for_type(&message_dbs, &resource_keys, 43)?;
 
+    let task_name = "extract-db-videos";
     let run_id = format!("{}", now_epoch_ms());
     let mut summary = ExtractSummary::new(
         run_id.clone(),
@@ -288,6 +348,17 @@ pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<Extra
     if resolved.explain_unsupported {
         summary.enable_unsupported_explanation();
     }
+    emit_task_event(
+        &task_options,
+        &run_id,
+        task_name,
+        TaskEventKind::Started,
+        &summary,
+        None,
+        None,
+        None,
+    );
+    check_task_cancelled(&task_options, &run_id, task_name, &summary)?;
 
     let mut conn = None;
     let mut manifest = None;
@@ -295,22 +366,35 @@ pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<Extra
         create_archive_dirs(&resolved.archive_dir)?;
         let opened = open_index(&resolved.archive_dir)?;
         summary.index_path = Some(index_path(&resolved.archive_dir));
-        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, "extract-db-videos")?;
+        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, task_name)?;
         summary.manifest_path = Some(writer.path().to_path_buf());
         conn = Some(opened);
         manifest = Some(writer);
     }
 
     for resource in resources {
+        check_task_cancelled(&task_options, &run_id, task_name, &summary)?;
         if !video_messages.contains_key(&resource.key) {
             continue;
         }
 
         summary.candidates += 1;
+        emit_task_event(
+            &task_options,
+            &run_id,
+            task_name,
+            TaskEventKind::CandidateFound,
+            &summary,
+            None,
+            None,
+            Some(resource.file_md5.clone()),
+        );
         let message_source = message_source_from_map(&video_messages, &resource.key);
+        let mut source_path = None;
         let result =
             match find_video_file(&video_root, &resource.file_md5, resource.key.create_time) {
                 Some(video_path) => {
+                    source_path = Some(video_path.clone());
                     let extension = direct_video_extension(&video_path).unwrap_or("mp4");
                     process_direct_media_with_message_source(
                         &video_path,
@@ -335,18 +419,42 @@ pub fn extract_message_db_videos(config: MessageDbExtractConfig) -> Result<Extra
                     &message_source,
                 ),
             };
-        apply_result(&mut summary, result)?;
+        apply_task_result(
+            &task_options,
+            &run_id,
+            task_name,
+            &mut summary,
+            source_path.as_deref(),
+            result,
+        )?;
     }
 
     if let Some(writer) = manifest.as_mut() {
         writer.flush()?;
     }
     summary.finish_unsupported_explanation();
+    emit_task_event(
+        &task_options,
+        &run_id,
+        task_name,
+        TaskEventKind::Completed,
+        &summary,
+        None,
+        None,
+        None,
+    );
 
     Ok(summary)
 }
 
 pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
+    extract_message_db_files_with_task(config, TaskOptions::default())
+}
+
+pub fn extract_message_db_files_with_task(
+    config: MessageDbExtractConfig,
+    task_options: TaskOptions,
+) -> Result<ExtractSummary> {
     let resolved = ArchiveConfig {
         source_dir: config.account_dir.clone(),
         archive_dir: config.archive_dir,
@@ -368,6 +476,7 @@ pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<Extrac
     let (file_messages, scanned_rows) =
         query_message_sources_for_type(&message_dbs, &resource_keys, 49)?;
 
+    let task_name = "extract-db-files";
     let run_id = format!("{}", now_epoch_ms());
     let mut summary = ExtractSummary::new(
         run_id.clone(),
@@ -379,6 +488,17 @@ pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<Extrac
     if resolved.explain_unsupported {
         summary.enable_unsupported_explanation();
     }
+    emit_task_event(
+        &task_options,
+        &run_id,
+        task_name,
+        TaskEventKind::Started,
+        &summary,
+        None,
+        None,
+        None,
+    );
+    check_task_cancelled(&task_options, &run_id, task_name, &summary)?;
 
     let mut conn = None;
     let mut manifest = None;
@@ -386,22 +506,35 @@ pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<Extrac
         create_archive_dirs(&resolved.archive_dir)?;
         let opened = open_index(&resolved.archive_dir)?;
         summary.index_path = Some(index_path(&resolved.archive_dir));
-        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, "extract-db-files")?;
+        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, task_name)?;
         summary.manifest_path = Some(writer.path().to_path_buf());
         conn = Some(opened);
         manifest = Some(writer);
     }
 
     for resource in resources {
+        check_task_cancelled(&task_options, &run_id, task_name, &summary)?;
         if !file_messages.contains_key(&resource.key) {
             continue;
         }
 
         summary.candidates += 1;
+        emit_task_event(
+            &task_options,
+            &run_id,
+            task_name,
+            TaskEventKind::CandidateFound,
+            &summary,
+            None,
+            None,
+            Some(resource.file_name.clone()),
+        );
         let message_source = message_source_from_map(&file_messages, &resource.key);
+        let mut source_path = None;
         let result =
             match find_file_attachment(&file_root, &resource.file_name, resource.key.create_time) {
                 Some(file_path) => {
+                    source_path = Some(file_path.clone());
                     let Some(extension) = direct_file_extension(&file_path) else {
                         continue;
                     };
@@ -428,18 +561,42 @@ pub fn extract_message_db_files(config: MessageDbExtractConfig) -> Result<Extrac
                     &message_source,
                 ),
             };
-        apply_result(&mut summary, result)?;
+        apply_task_result(
+            &task_options,
+            &run_id,
+            task_name,
+            &mut summary,
+            source_path.as_deref(),
+            result,
+        )?;
     }
 
     if let Some(writer) = manifest.as_mut() {
         writer.flush()?;
     }
     summary.finish_unsupported_explanation();
+    emit_task_event(
+        &task_options,
+        &run_id,
+        task_name,
+        TaskEventKind::Completed,
+        &summary,
+        None,
+        None,
+        None,
+    );
 
     Ok(summary)
 }
 
 pub fn extract_message_db_voices(config: MessageDbExtractConfig) -> Result<ExtractSummary> {
+    extract_message_db_voices_with_task(config, TaskOptions::default())
+}
+
+pub fn extract_message_db_voices_with_task(
+    config: MessageDbExtractConfig,
+    task_options: TaskOptions,
+) -> Result<ExtractSummary> {
     let resolved = ArchiveConfig {
         source_dir: config.account_dir.clone(),
         archive_dir: config.archive_dir,
@@ -457,6 +614,7 @@ pub fn extract_message_db_voices(config: MessageDbExtractConfig) -> Result<Extra
     let (voice_messages, scanned_rows) =
         query_message_sources_for_talkers(&message_dbs, &talkers, 34)?;
 
+    let task_name = "extract-db-voices";
     let run_id = format!("{}", now_epoch_ms());
     let mut summary = ExtractSummary::new(
         run_id.clone(),
@@ -468,6 +626,17 @@ pub fn extract_message_db_voices(config: MessageDbExtractConfig) -> Result<Extra
     if resolved.explain_unsupported {
         summary.enable_unsupported_explanation();
     }
+    emit_task_event(
+        &task_options,
+        &run_id,
+        task_name,
+        TaskEventKind::Started,
+        &summary,
+        None,
+        None,
+        None,
+    );
+    check_task_cancelled(&task_options, &run_id, task_name, &summary)?;
 
     let mut conn = None;
     let mut manifest = None;
@@ -475,14 +644,28 @@ pub fn extract_message_db_voices(config: MessageDbExtractConfig) -> Result<Extra
         create_archive_dirs(&resolved.archive_dir)?;
         let opened = open_index(&resolved.archive_dir)?;
         summary.index_path = Some(index_path(&resolved.archive_dir));
-        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, "extract-db-voices")?;
+        let writer = ManifestWriter::create(&resolved.archive_dir, &run_id, task_name)?;
         summary.manifest_path = Some(writer.path().to_path_buf());
         conn = Some(opened);
         manifest = Some(writer);
     }
 
     for (key, message_source) in voice_messages {
+        check_task_cancelled(&task_options, &run_id, task_name, &summary)?;
         summary.candidates += 1;
+        emit_task_event(
+            &task_options,
+            &run_id,
+            task_name,
+            TaskEventKind::CandidateFound,
+            &summary,
+            None,
+            None,
+            Some(format!(
+                "{}:{}:{}",
+                key.talker, key.local_id, key.create_time
+            )),
+        );
         let result = match find_voice_resource(&db_source.message_dir, &key)? {
             Some(resource) => process_voice_resource(
                 &resource,
@@ -503,15 +686,87 @@ pub fn extract_message_db_voices(config: MessageDbExtractConfig) -> Result<Extra
                 &message_source,
             ),
         };
-        apply_result(&mut summary, result)?;
+        apply_task_result(
+            &task_options,
+            &run_id,
+            task_name,
+            &mut summary,
+            None,
+            result,
+        )?;
     }
 
     if let Some(writer) = manifest.as_mut() {
         writer.flush()?;
     }
     summary.finish_unsupported_explanation();
+    emit_task_event(
+        &task_options,
+        &run_id,
+        task_name,
+        TaskEventKind::Completed,
+        &summary,
+        None,
+        None,
+        None,
+    );
 
     Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_task_event(
+    task_options: &TaskOptions,
+    run_id: &str,
+    task_name: &str,
+    kind: TaskEventKind,
+    summary: &ExtractSummary,
+    source_path: Option<&Path>,
+    action: Option<ScanAction>,
+    message: Option<String>,
+) {
+    task_options.emit(task_event(
+        run_id,
+        task_name,
+        kind,
+        summary,
+        source_path,
+        action,
+        message,
+    ));
+}
+
+fn check_task_cancelled(
+    task_options: &TaskOptions,
+    run_id: &str,
+    task_name: &str,
+    summary: &ExtractSummary,
+) -> Result<()> {
+    task_options.check_cancelled(run_id, task_name, TaskProgress::from(summary))
+}
+
+fn apply_task_result(
+    task_options: &TaskOptions,
+    run_id: &str,
+    task_name: &str,
+    summary: &mut ExtractSummary,
+    source_path: Option<&Path>,
+    result: Result<ScanOutcome>,
+) -> Result<()> {
+    let outcome = result?;
+    let action = outcome.action.clone();
+    apply_outcome(summary, outcome);
+    emit_task_event(
+        task_options,
+        run_id,
+        task_name,
+        TaskEventKind::ItemFinished,
+        summary,
+        source_path,
+        Some(action),
+        None,
+    );
+    Ok(())
 }
 
 pub fn inspect_message_db(config: MessageDbInspectConfig) -> Result<MessageDbInspection> {

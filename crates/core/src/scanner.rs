@@ -23,6 +23,7 @@ use crate::manifest::ManifestWriter;
 use crate::media::{
     direct_file_extension, direct_video_extension, direct_voice_extension, mime_type_for_extension,
 };
+use crate::task::{task_event, TaskEventKind, TaskOptions, TaskProgress};
 use crate::types::{now_epoch_ms, ExtractSummary, ManifestEvent, ScanAction};
 use crate::video::{detect_video_metadata_from_file, VideoMetadata};
 
@@ -64,19 +65,28 @@ pub(crate) enum ObjectWriteStat {
 }
 
 pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
+    extract_images_with_task(config, TaskOptions::default())
+}
+
+pub fn extract_images_with_task(
+    config: ArchiveConfig,
+    task_options: TaskOptions,
+) -> Result<ExtractSummary> {
     let resolved = config.resolve()?;
-    let mut run = ScanRun::new(&resolved, "extract-images")?;
+    let mut run = ScanRun::new(&resolved, "extract-images", task_options)?;
+    run.emit_scan_source_started(&resolved.source_dir);
 
     for entry in WalkDir::new(&resolved.source_dir).follow_links(false) {
+        run.check_cancelled()?;
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
-        run.summary.scanned_files += 1;
 
         let path = entry.path();
+        run.record_file_scanned(path);
         if let Some(extension) = direct_image_extension(path) {
-            run.summary.candidates += 1;
+            run.record_candidate(path);
             let result = process_direct_media(
                 path,
                 extension,
@@ -89,9 +99,9 @@ pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
                 "direct_image",
                 "image",
             );
-            apply_result(&mut run.summary, result)?;
+            run.apply_result(Some(path), result)?;
         } else if is_dat_file(path) {
-            run.summary.candidates += 1;
+            run.record_candidate(path);
             let result = process_dat_image(
                 path,
                 &resolved.source_dir,
@@ -103,7 +113,7 @@ pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
                 run.conn.as_ref(),
                 run.manifest.as_mut(),
             );
-            apply_result(&mut run.summary, result)?;
+            run.apply_result(Some(path), result)?;
         }
     }
 
@@ -111,21 +121,31 @@ pub fn extract_images(config: ArchiveConfig) -> Result<ExtractSummary> {
 }
 
 pub fn extract_videos(config: ArchiveConfig) -> Result<ExtractSummary> {
+    extract_videos_with_task(config, TaskOptions::default())
+}
+
+pub fn extract_videos_with_task(
+    config: ArchiveConfig,
+    task_options: TaskOptions,
+) -> Result<ExtractSummary> {
     let resolved = config.resolve()?;
-    let mut run = ScanRun::new(&resolved, "extract-videos")?;
+    let mut run = ScanRun::new(&resolved, "extract-videos", task_options)?;
     let video_sources = account_media_scan_sources(&resolved.source_dir, "video");
 
     for source in video_sources {
+        run.check_cancelled()?;
+        run.emit_scan_source_started(&source.scan_dir);
         for entry in WalkDir::new(&source.scan_dir).follow_links(false) {
+            run.check_cancelled()?;
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
             }
-            run.summary.scanned_files += 1;
 
             let path = entry.path();
+            run.record_file_scanned(path);
             if let Some(extension) = direct_video_extension(path) {
-                run.summary.candidates += 1;
+                run.record_candidate(path);
                 let result = process_direct_media(
                     path,
                     extension,
@@ -138,7 +158,7 @@ pub fn extract_videos(config: ArchiveConfig) -> Result<ExtractSummary> {
                     "direct_video",
                     "video",
                 );
-                apply_result(&mut run.summary, result)?;
+                run.apply_result(Some(path), result)?;
             }
         }
     }
@@ -153,21 +173,31 @@ struct AccountMediaScanSource {
 }
 
 pub fn extract_voices(config: ArchiveConfig) -> Result<ExtractSummary> {
+    extract_voices_with_task(config, TaskOptions::default())
+}
+
+pub fn extract_voices_with_task(
+    config: ArchiveConfig,
+    task_options: TaskOptions,
+) -> Result<ExtractSummary> {
     let resolved = config.resolve()?;
-    let mut run = ScanRun::new(&resolved, "extract-voices")?;
+    let mut run = ScanRun::new(&resolved, "extract-voices", task_options)?;
     let voice_sources = voice_scan_sources(&resolved.source_dir);
 
     for source in voice_sources {
+        run.check_cancelled()?;
+        run.emit_scan_source_started(&source.scan_dir);
         for entry in WalkDir::new(&source.scan_dir).follow_links(false) {
+            run.check_cancelled()?;
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
             }
-            run.summary.scanned_files += 1;
 
             let path = entry.path();
+            run.record_file_scanned(path);
             if let Some(extension) = direct_voice_extension(path) {
-                run.summary.candidates += 1;
+                run.record_candidate(path);
                 let result = process_direct_media(
                     path,
                     extension,
@@ -180,7 +210,7 @@ pub fn extract_voices(config: ArchiveConfig) -> Result<ExtractSummary> {
                     "direct_voice",
                     "voice",
                 );
-                apply_result(&mut run.summary, result)?;
+                run.apply_result(Some(path), result)?;
             }
         }
     }
@@ -189,21 +219,31 @@ pub fn extract_voices(config: ArchiveConfig) -> Result<ExtractSummary> {
 }
 
 pub fn extract_files(config: ArchiveConfig) -> Result<ExtractSummary> {
+    extract_files_with_task(config, TaskOptions::default())
+}
+
+pub fn extract_files_with_task(
+    config: ArchiveConfig,
+    task_options: TaskOptions,
+) -> Result<ExtractSummary> {
     let resolved = config.resolve()?;
-    let mut run = ScanRun::new(&resolved, "extract-files")?;
+    let mut run = ScanRun::new(&resolved, "extract-files", task_options)?;
     let file_sources = account_media_scan_sources(&resolved.source_dir, "file");
 
     for source in file_sources {
+        run.check_cancelled()?;
+        run.emit_scan_source_started(&source.scan_dir);
         for entry in WalkDir::new(&source.scan_dir).follow_links(false) {
+            run.check_cancelled()?;
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
             }
-            run.summary.scanned_files += 1;
 
             let path = entry.path();
+            run.record_file_scanned(path);
             if let Some(extension) = direct_file_extension(path) {
-                run.summary.candidates += 1;
+                run.record_candidate(path);
                 let result = process_direct_media(
                     path,
                     &extension,
@@ -216,7 +256,7 @@ pub fn extract_files(config: ArchiveConfig) -> Result<ExtractSummary> {
                     "direct_file",
                     "file",
                 );
-                apply_result(&mut run.summary, result)?;
+                run.apply_result(Some(path), result)?;
             }
         }
     }
@@ -306,13 +346,19 @@ fn account_dir_from_attach_dir(source_dir: &Path) -> Option<PathBuf> {
 
 struct ScanRun {
     run_id: String,
+    task_name: String,
     summary: ExtractSummary,
     conn: Option<Connection>,
     manifest: Option<ManifestWriter>,
+    task_options: TaskOptions,
 }
 
 impl ScanRun {
-    fn new(resolved: &crate::config::ResolvedConfig, manifest_label: &str) -> Result<Self> {
+    fn new(
+        resolved: &crate::config::ResolvedConfig,
+        manifest_label: &str,
+        task_options: TaskOptions,
+    ) -> Result<Self> {
         let run_id = format!("{}", now_epoch_ms());
         let mut summary = ExtractSummary::new(
             run_id.clone(),
@@ -323,6 +369,17 @@ impl ScanRun {
         if resolved.explain_unsupported {
             summary.enable_unsupported_explanation();
         }
+
+        task_options.emit(task_event(
+            &run_id,
+            manifest_label,
+            TaskEventKind::Started,
+            &summary,
+            None,
+            None,
+            None,
+        ));
+        task_options.check_cancelled(&run_id, manifest_label, TaskProgress::from(&summary))?;
 
         let mut conn = None;
         let mut manifest = None;
@@ -338,10 +395,65 @@ impl ScanRun {
 
         Ok(Self {
             run_id,
+            task_name: manifest_label.to_string(),
             summary,
             conn,
             manifest,
+            task_options,
         })
+    }
+
+    fn progress(&self) -> TaskProgress {
+        TaskProgress::from(&self.summary)
+    }
+
+    fn emit(
+        &self,
+        kind: TaskEventKind,
+        source_path: Option<&Path>,
+        action: Option<ScanAction>,
+        message: Option<String>,
+    ) {
+        self.task_options.emit(task_event(
+            &self.run_id,
+            &self.task_name,
+            kind,
+            &self.summary,
+            source_path,
+            action,
+            message,
+        ));
+    }
+
+    fn emit_scan_source_started(&self, path: &Path) {
+        self.emit(TaskEventKind::ScanSourceStarted, Some(path), None, None);
+    }
+
+    fn record_file_scanned(&mut self, path: &Path) {
+        self.summary.scanned_files += 1;
+        self.emit(TaskEventKind::FileScanned, Some(path), None, None);
+    }
+
+    fn record_candidate(&mut self, path: &Path) {
+        self.summary.candidates += 1;
+        self.emit(TaskEventKind::CandidateFound, Some(path), None, None);
+    }
+
+    fn apply_result(
+        &mut self,
+        source_path: Option<&Path>,
+        result: Result<ScanOutcome>,
+    ) -> Result<()> {
+        let outcome = result?;
+        let action = outcome.action.clone();
+        apply_outcome(&mut self.summary, outcome);
+        self.emit(TaskEventKind::ItemFinished, source_path, Some(action), None);
+        Ok(())
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        self.task_options
+            .check_cancelled(&self.run_id, &self.task_name, self.progress())
     }
 
     fn finish(mut self) -> Result<ExtractSummary> {
@@ -349,6 +461,7 @@ impl ScanRun {
             writer.flush()?;
         }
         self.summary.finish_unsupported_explanation();
+        self.emit(TaskEventKind::Completed, None, None, None);
         Ok(self.summary)
     }
 }
@@ -418,11 +531,7 @@ impl ScanOutcome {
     }
 }
 
-pub(crate) fn apply_result(
-    summary: &mut ExtractSummary,
-    result: Result<ScanOutcome>,
-) -> Result<()> {
-    let result = result?;
+pub(crate) fn apply_outcome(summary: &mut ExtractSummary, result: ScanOutcome) {
     match result.action {
         ScanAction::Archived => summary.archived += 1,
         ScanAction::AlreadyArchived => summary.already_archived += 1,
@@ -440,7 +549,6 @@ pub(crate) fn apply_result(
     summary.metadata_backfilled += result.metadata_backfilled;
     summary.new_objects += result.new_objects;
     summary.existing_objects += result.existing_objects;
-    Ok(())
 }
 
 pub(crate) fn outcome_with_object_stat(
@@ -1130,9 +1238,12 @@ fn relative_path(path: &Path, source_root: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::config::ArchiveConfig;
+    use crate::error::ArchiverError;
     use crate::status::archive_status;
+    use crate::task::{CancelToken, TaskEvent, TaskEventKind, TaskOptions, TaskReporter};
     use crate::verify::verify_archive;
     use rusqlite::Connection;
+    use std::sync::{Arc, Mutex};
 
     type DatIndexMetadataRow = (
         String,
@@ -1144,6 +1255,103 @@ mod tests {
         Option<i64>,
         Option<i64>,
     );
+
+    #[test]
+    fn image_extract_with_task_emits_progress_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("image.jpg"), synthetic_jpeg(64, 32)).unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::<TaskEvent>::new()));
+        let reporter = TaskReporter::new({
+            let events = Arc::clone(&events);
+            move |event| events.lock().unwrap().push(event)
+        });
+
+        let summary = extract_images_with_task(
+            ArchiveConfig {
+                source_dir: source,
+                archive_dir: archive,
+                dry_run: false,
+                dat_options: DatDecodeOptions::default(),
+                explain_unsupported: false,
+            },
+            TaskOptions::new().with_reporter(reporter),
+        )
+        .unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.first().unwrap().kind, TaskEventKind::Started);
+        assert!(events
+            .iter()
+            .any(|event| event.kind == TaskEventKind::ScanSourceStarted));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == TaskEventKind::FileScanned));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == TaskEventKind::CandidateFound));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == TaskEventKind::ItemFinished
+                && event.action == Some(ScanAction::Archived)));
+        let completed = events
+            .iter()
+            .find(|event| event.kind == TaskEventKind::Completed)
+            .unwrap();
+        assert_eq!(completed.run_id, summary.run_id);
+        assert_eq!(completed.task_name, "extract-images");
+        assert_eq!(completed.progress.scanned_files, 1);
+        assert_eq!(completed.progress.candidates, 1);
+        assert_eq!(completed.progress.archived, 1);
+        assert_eq!(completed.progress.new_objects, 1);
+    }
+
+    #[test]
+    fn pre_cancelled_task_stops_before_archive_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("image.jpg"), synthetic_jpeg(64, 32)).unwrap();
+
+        let cancel_token = CancelToken::new();
+        cancel_token.cancel();
+        let events = Arc::new(Mutex::new(Vec::<TaskEvent>::new()));
+        let reporter = TaskReporter::new({
+            let events = Arc::clone(&events);
+            move |event| events.lock().unwrap().push(event)
+        });
+
+        let error = extract_images_with_task(
+            ArchiveConfig {
+                source_dir: source,
+                archive_dir: archive.clone(),
+                dry_run: false,
+                dat_options: DatDecodeOptions::default(),
+                explain_unsupported: false,
+            },
+            TaskOptions::new()
+                .with_cancel_token(cancel_token)
+                .with_reporter(reporter),
+        )
+        .unwrap_err();
+
+        match error {
+            ArchiverError::TaskCancelled { task_name } => {
+                assert_eq!(task_name, "extract-images");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(!archive.exists());
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, TaskEventKind::Started);
+        assert_eq!(events[1].kind, TaskEventKind::Cancelled);
+    }
 
     #[test]
     fn extracts_direct_and_xor_images_without_touching_source() {

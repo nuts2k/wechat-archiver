@@ -6,14 +6,15 @@ use serde::Serialize;
 use wechat_archiver_core::WxgfMode as CoreWxgfMode;
 use wechat_archiver_core::{
     archive_report, archive_status, count_message_db_media, derive_image_key, discover_wechat,
-    extract_files, extract_images, extract_message_db_files, extract_message_db_images,
-    extract_message_db_videos, extract_message_db_voices, extract_videos, extract_voices,
+    extract_files_with_task, extract_images_with_task, extract_message_db_files_with_task,
+    extract_message_db_images_with_task, extract_message_db_videos_with_task,
+    extract_message_db_voices_with_task, extract_videos_with_task, extract_voices_with_task,
     generate_views, inspect_message_db, lookup_index, verify_archive, ArchiveConfig, ArchiveReport,
     ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions, ExtractSummary,
     ImageKeyDerivation, ImageKeyMethod, IndexLookup, IndexLookupQuery, MessageDbExtractConfig,
     MessageDbInspectConfig, MessageDbInspection, MessageDbMediaCountConfig,
-    MessageDbMediaCountSummary, MessageDbMediaTypeCount, VerifySummary, ViewsConfig, ViewsSummary,
-    WechatDiscovery,
+    MessageDbMediaCountSummary, MessageDbMediaTypeCount, TaskOptions, TaskReporter, VerifySummary,
+    ViewsConfig, ViewsSummary, WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -111,6 +112,10 @@ enum Commands {
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
+
+        /// 将任务进度事件以 JSONL 输出到 stderr。
+        #[arg(long)]
+        jsonl_progress: bool,
     },
 
     /// 统一媒体抽取入口；当前已接入 image、video、file、voice。
@@ -166,6 +171,10 @@ enum Commands {
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
+
+        /// 将任务进度事件以 JSONL 输出到 stderr。
+        #[arg(long)]
+        jsonl_progress: bool,
     },
 
     /// 从已解密/普通 SQLite 微信消息库枚举视频消息并归档。
@@ -189,6 +198,10 @@ enum Commands {
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
+
+        /// 将任务进度事件以 JSONL 输出到 stderr。
+        #[arg(long)]
+        jsonl_progress: bool,
     },
 
     /// 从已解密/普通 SQLite 微信消息库枚举文件附件并归档。
@@ -212,6 +225,10 @@ enum Commands {
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
+
+        /// 将任务进度事件以 JSONL 输出到 stderr。
+        #[arg(long)]
+        jsonl_progress: bool,
     },
 
     /// 从已解密/普通 SQLite 微信消息库枚举语音 BLOB 并归档。
@@ -235,6 +252,10 @@ enum Commands {
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
+
+        /// 将任务进度事件以 JSONL 输出到 stderr。
+        #[arg(long)]
+        jsonl_progress: bool,
     },
 
     /// 查看归档索引统计。
@@ -358,6 +379,10 @@ struct ImageExtractArgs {
     /// 输出 JSON。
     #[arg(long)]
     json: bool,
+
+    /// 将任务进度事件以 JSONL 输出到 stderr。
+    #[arg(long)]
+    jsonl_progress: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -438,19 +463,23 @@ fn main() -> Result<()> {
             wxgf_ffmpeg_path,
             explain_unsupported,
             json,
+            jsonl_progress,
         } => {
-            let summary = extract_images(ArchiveConfig {
-                source_dir: source,
-                archive_dir: archive,
-                dry_run: true,
-                dat_options: parse_dat_options(
-                    image_aes_key,
-                    &image_xor_key,
-                    wxgf_mode,
-                    wxgf_ffmpeg_path,
-                )?,
-                explain_unsupported,
-            })?;
+            let summary = extract_images_with_task(
+                ArchiveConfig {
+                    source_dir: source,
+                    archive_dir: archive,
+                    dry_run: true,
+                    dat_options: parse_dat_options(
+                        image_aes_key,
+                        &image_xor_key,
+                        wxgf_mode,
+                        wxgf_ffmpeg_path,
+                    )?,
+                    explain_unsupported,
+                },
+                task_options(jsonl_progress),
+            )?;
             print_extract_summary(&summary, json)?;
         }
         Commands::Extract { media_types, args } => {
@@ -479,20 +508,24 @@ fn main() -> Result<()> {
             wxgf_mode,
             wxgf_ffmpeg_path,
             json,
+            jsonl_progress,
         } => {
-            let summary = extract_message_db_images(MessageDbExtractConfig {
-                account_dir: account,
-                message_db_dir,
-                archive_dir: archive,
-                dry_run,
-                dat_options: parse_dat_options(
-                    image_aes_key,
-                    &image_xor_key,
-                    wxgf_mode,
-                    wxgf_ffmpeg_path,
-                )?,
-                explain_unsupported: false,
-            })?;
+            let summary = extract_message_db_images_with_task(
+                MessageDbExtractConfig {
+                    account_dir: account,
+                    message_db_dir,
+                    archive_dir: archive,
+                    dry_run,
+                    dat_options: parse_dat_options(
+                        image_aes_key,
+                        &image_xor_key,
+                        wxgf_mode,
+                        wxgf_ffmpeg_path,
+                    )?,
+                    explain_unsupported: false,
+                },
+                task_options(jsonl_progress),
+            )?;
             print_extract_summary(&summary, json)?;
         }
         Commands::ExtractDbVideos {
@@ -501,15 +534,19 @@ fn main() -> Result<()> {
             archive,
             dry_run,
             json,
+            jsonl_progress,
         } => {
-            let summary = extract_message_db_videos(MessageDbExtractConfig {
-                account_dir: account,
-                message_db_dir,
-                archive_dir: archive,
-                dry_run,
-                dat_options: DatDecodeOptions::default(),
-                explain_unsupported: false,
-            })?;
+            let summary = extract_message_db_videos_with_task(
+                MessageDbExtractConfig {
+                    account_dir: account,
+                    message_db_dir,
+                    archive_dir: archive,
+                    dry_run,
+                    dat_options: DatDecodeOptions::default(),
+                    explain_unsupported: false,
+                },
+                task_options(jsonl_progress),
+            )?;
             print_extract_summary(&summary, json)?;
         }
         Commands::ExtractDbFiles {
@@ -518,15 +555,19 @@ fn main() -> Result<()> {
             archive,
             dry_run,
             json,
+            jsonl_progress,
         } => {
-            let summary = extract_message_db_files(MessageDbExtractConfig {
-                account_dir: account,
-                message_db_dir,
-                archive_dir: archive,
-                dry_run,
-                dat_options: DatDecodeOptions::default(),
-                explain_unsupported: false,
-            })?;
+            let summary = extract_message_db_files_with_task(
+                MessageDbExtractConfig {
+                    account_dir: account,
+                    message_db_dir,
+                    archive_dir: archive,
+                    dry_run,
+                    dat_options: DatDecodeOptions::default(),
+                    explain_unsupported: false,
+                },
+                task_options(jsonl_progress),
+            )?;
             print_extract_summary(&summary, json)?;
         }
         Commands::ExtractDbVoices {
@@ -535,15 +576,19 @@ fn main() -> Result<()> {
             archive,
             dry_run,
             json,
+            jsonl_progress,
         } => {
-            let summary = extract_message_db_voices(MessageDbExtractConfig {
-                account_dir: account,
-                message_db_dir,
-                archive_dir: archive,
-                dry_run,
-                dat_options: DatDecodeOptions::default(),
-                explain_unsupported: false,
-            })?;
+            let summary = extract_message_db_voices_with_task(
+                MessageDbExtractConfig {
+                    account_dir: account,
+                    message_db_dir,
+                    archive_dir: archive,
+                    dry_run,
+                    dat_options: DatDecodeOptions::default(),
+                    explain_unsupported: false,
+                },
+                task_options(jsonl_progress),
+            )?;
             print_extract_summary(&summary, json)?;
         }
         Commands::Status { archive, json } => {
@@ -631,15 +676,29 @@ fn media_type_name(media_type: MediaType) -> &'static str {
 }
 
 fn run_image_extract(args: ImageExtractArgs) -> Result<ExtractSummary> {
-    Ok(extract_images(image_archive_config_from_args(args)?)?)
+    let jsonl_progress = args.jsonl_progress;
+    Ok(extract_images_with_task(
+        image_archive_config_from_args(args)?,
+        task_options(jsonl_progress),
+    )?)
 }
 
 fn run_extract(media_type: MediaType, args: ImageExtractArgs) -> Result<ExtractSummary> {
+    let jsonl_progress = args.jsonl_progress;
     match media_type {
         MediaType::Image => run_image_extract(args),
-        MediaType::Video => Ok(extract_videos(direct_media_archive_config_from_args(args))?),
-        MediaType::File => Ok(extract_files(direct_media_archive_config_from_args(args))?),
-        MediaType::Voice => Ok(extract_voices(direct_media_archive_config_from_args(args))?),
+        MediaType::Video => Ok(extract_videos_with_task(
+            direct_media_archive_config_from_args(args),
+            task_options(jsonl_progress),
+        )?),
+        MediaType::File => Ok(extract_files_with_task(
+            direct_media_archive_config_from_args(args),
+            task_options(jsonl_progress),
+        )?),
+        MediaType::Voice => Ok(extract_voices_with_task(
+            direct_media_archive_config_from_args(args),
+            task_options(jsonl_progress),
+        )?),
     }
 }
 
@@ -681,6 +740,22 @@ fn image_archive_config_from_args(args: ImageExtractArgs) -> Result<ArchiveConfi
         )?,
         explain_unsupported: false,
     })
+}
+
+fn task_options(jsonl_progress: bool) -> TaskOptions {
+    if !jsonl_progress {
+        return TaskOptions::default();
+    }
+
+    TaskOptions::new().with_reporter(TaskReporter::new(|event| {
+        match serde_json::to_string(&event) {
+            Ok(line) => eprintln!("{line}"),
+            Err(error) => eprintln!(
+                "{{\"kind\":\"progress_serialization_failed\",\"error\":{}}}",
+                serde_json::to_string(&error.to_string()).unwrap_or_else(|_| "\"unknown\"".into())
+            ),
+        }
+    }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1374,6 +1449,7 @@ mod tests {
             "/tmp/wechat-archive",
             "--dry-run",
             "--json",
+            "--jsonl-progress",
         ])
         .unwrap();
 
@@ -1384,6 +1460,7 @@ mod tests {
                 assert_eq!(args.archive, PathBuf::from("/tmp/wechat-archive"));
                 assert!(args.dry_run);
                 assert!(args.json);
+                assert!(args.jsonl_progress);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1619,6 +1696,7 @@ mod tests {
             "/tmp/wechat-archive",
             "--dry-run",
             "--json",
+            "--jsonl-progress",
         ])
         .unwrap();
 
@@ -1629,6 +1707,7 @@ mod tests {
                 archive,
                 dry_run,
                 json,
+                jsonl_progress,
             } => {
                 assert_eq!(account, PathBuf::from("/tmp/xwechat_files/wxid"));
                 assert_eq!(
@@ -1638,6 +1717,7 @@ mod tests {
                 assert_eq!(archive, PathBuf::from("/tmp/wechat-archive"));
                 assert!(dry_run);
                 assert!(json);
+                assert!(jsonl_progress);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1664,12 +1744,14 @@ mod tests {
                 archive,
                 dry_run,
                 json,
+                jsonl_progress,
             } => {
                 assert_eq!(account, PathBuf::from("/tmp/xwechat_files/wxid"));
                 assert_eq!(message_db_dir, None);
                 assert_eq!(archive, PathBuf::from("/tmp/wechat-archive"));
                 assert!(dry_run);
                 assert!(json);
+                assert!(!jsonl_progress);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1698,6 +1780,7 @@ mod tests {
                 archive,
                 dry_run,
                 json,
+                jsonl_progress,
             } => {
                 assert_eq!(account, PathBuf::from("/tmp/xwechat_files/wxid"));
                 assert_eq!(
@@ -1707,6 +1790,7 @@ mod tests {
                 assert_eq!(archive, PathBuf::from("/tmp/wechat-archive"));
                 assert!(dry_run);
                 assert!(json);
+                assert!(!jsonl_progress);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1759,6 +1843,7 @@ mod tests {
                 wxgf_mode: WxgfMode::Jpg,
                 wxgf_ffmpeg_path: None,
                 json: true,
+                jsonl_progress: false,
             },
         )
         .unwrap();
