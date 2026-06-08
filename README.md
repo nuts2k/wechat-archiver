@@ -27,7 +27,7 @@
 - 每次非 dry-run 运行写入 `index.sqlite` 和 `manifests/*.jsonl`，并记录 `source_kind`、独立 `decoder`、`.dat` 解码参数指纹、原始文件名、MIME 类型、图片/视频宽高、部分媒体时长、源文件指纹和可用的消息来源字段；索引库通过 `schema_migrations` 记录显式 schema 版本迁移。
 - 抽取 summary 会区分本轮新写对象、命中已有对象、复用旧索引记录、实际 `.dat` 解码次数和元数据补写次数，便于判断复跑是否真的减少了 hash、复制或解码工作。
 - core 暴露任务级 `TaskEvent`、`TaskProgress`、`TaskReporter`、`CancelToken`、`TaskRunner` 和 `TaskHandle`；CLI 抽取类命令支持 `--jsonl-progress` 将结构化进度事件输出到 stderr，供未来 Tauri 或脚本消费。
-- core 暴露 `TaskStore`、`TaskListQuery`、`TaskRetryCandidate` 和 `SqliteTaskStore`，`TaskRunner` 可显式接入 store 来记录、查询任务历史并生成不自动执行的安全 retry 候选；持久化和重启恢复边界见 [docs/task-persistence-and-recovery.md](docs/task-persistence-and-recovery.md)。
+- core 暴露 `TaskStore`、`TaskListQuery`、`TaskRetryCandidate` 和 `SqliteTaskStore`，`TaskRunner` 可显式接入 store 来记录、查询任务历史并生成不自动执行的安全 retry 候选；CLI 提供 `tasks list/show/retry-candidate --app-db <path>` 只读查看任务历史，持久化和重启恢复边界见 [docs/task-persistence-and-recovery.md](docs/task-persistence-and-recovery.md)。
 - 支持 `status` 查看索引统计，支持 `lookup` 按 `sha256` 或源路径反查索引记录，支持 `report` 导出 JSON/CSV 索引报告，支持 `views` 生成归档目录内的可浏览派生视图，支持 `verify` 重新计算归档对象 hash。
 
 当前 MVP 不会解密微信加密数据库，也不会提取微信进程密钥、重签微信、修改微信或写入微信源目录。`count-db-media`、`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 只支持已经可被 SQLite 直接读取的消息库，例如测试 fixture、用户自行准备的已解密副本，或本机上已经是普通 SQLite 的目录。若消息库副本不在账号目录内，可以通过 `--message-db-dir` 显式指定；图片、视频和文件附件仍只从 `--account` 下的 `msg/*` 读取，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。

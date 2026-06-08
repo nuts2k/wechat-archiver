@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -13,8 +13,9 @@ use wechat_archiver_core::{
     ArchiveStatus, DatDecodeOptions, DeriveImageKeyOptions, DiscoverOptions, ExtractSummary,
     ImageKeyDerivation, ImageKeyMethod, IndexLookup, IndexLookupQuery, MessageDbExtractConfig,
     MessageDbInspectConfig, MessageDbInspection, MessageDbMediaCountConfig,
-    MessageDbMediaCountSummary, MessageDbMediaTypeCount, TaskOptions, TaskReporter, VerifySummary,
-    ViewsConfig, ViewsSummary, WechatDiscovery,
+    MessageDbMediaCountSummary, MessageDbMediaTypeCount, PersistentTaskStatus, SqliteTaskStore,
+    TaskListQuery, TaskOptions, TaskRecord, TaskReporter, TaskRetryCandidate, TaskStore,
+    VerifySummary, ViewsConfig, ViewsSummary, WechatDiscovery,
 };
 
 #[derive(Debug, Parser)]
@@ -296,6 +297,9 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// 只读查看显式 app SQLite 中的任务历史。
+    Tasks(TasksArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -340,6 +344,83 @@ struct ViewsArgs {
     /// 写入 archive/views 下的相对软链接视图。
     #[arg(long)]
     write: bool,
+
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TasksArgs {
+    #[command(subcommand)]
+    command: TaskCommands,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum TaskCommands {
+    /// 列出最近任务历史；只读打开 --app-db。
+    List(TasksListArgs),
+
+    /// 查看单个任务记录；只读打开 --app-db。
+    Show(TasksShowArgs),
+
+    /// 生成不自动执行的 retry 候选；只读打开 --app-db。
+    RetryCandidate(TasksRetryCandidateArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct TasksListArgs {
+    /// 显式 app SQLite 路径；不会默认创建。
+    #[arg(long)]
+    app_db: PathBuf,
+
+    /// 按持久化任务状态过滤，支持逗号分隔。
+    #[arg(long, value_enum, value_delimiter = ',')]
+    status: Vec<TaskStatusFilter>,
+
+    /// 按任务类型过滤，例如 extract_images。
+    #[arg(long)]
+    task_kind: Option<String>,
+
+    /// created_at_ms 下界，含边界。
+    #[arg(long)]
+    created_at_from_ms: Option<i64>,
+
+    /// created_at_ms 上界，含边界。
+    #[arg(long)]
+    created_at_to_ms: Option<i64>,
+
+    /// 最多返回多少条记录。
+    #[arg(long)]
+    limit: Option<usize>,
+
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TasksShowArgs {
+    /// 显式 app SQLite 路径；不会默认创建。
+    #[arg(long)]
+    app_db: PathBuf,
+
+    /// 任务 ID。
+    task_id: String,
+
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TasksRetryCandidateArgs {
+    /// 显式 app SQLite 路径；不会默认创建。
+    #[arg(long)]
+    app_db: PathBuf,
+
+    /// 历史任务 ID。
+    task_id: String,
 
     /// 输出 JSON。
     #[arg(long)]
@@ -405,6 +486,29 @@ enum WxgfMode {
 enum ReportFormat {
     Json,
     Csv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TaskStatusFilter {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl From<TaskStatusFilter> for PersistentTaskStatus {
+    fn from(value: TaskStatusFilter) -> Self {
+        match value {
+            TaskStatusFilter::Queued => Self::Queued,
+            TaskStatusFilter::Running => Self::Running,
+            TaskStatusFilter::Completed => Self::Completed,
+            TaskStatusFilter::Failed => Self::Failed,
+            TaskStatusFilter::Cancelled => Self::Cancelled,
+            TaskStatusFilter::Interrupted => Self::Interrupted,
+        }
+    }
 }
 
 impl From<WxgfMode> for CoreWxgfMode {
@@ -626,9 +730,50 @@ fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        Commands::Tasks(args) => run_tasks(args)?,
     }
 
     Ok(())
+}
+
+fn run_tasks(args: TasksArgs) -> Result<()> {
+    match args.command {
+        TaskCommands::List(args) => {
+            let store = open_task_store_readonly(&args.app_db)?;
+            let records = store.list_tasks(&TaskListQuery {
+                statuses: args.status.into_iter().map(Into::into).collect(),
+                task_kind: args.task_kind,
+                created_at_from_ms: args.created_at_from_ms,
+                created_at_to_ms: args.created_at_to_ms,
+                limit: args.limit,
+            })?;
+            print_task_records(&records, args.json)?;
+        }
+        TaskCommands::Show(args) => {
+            let store = open_task_store_readonly(&args.app_db)?;
+            let record = store
+                .get_task(&args.task_id)?
+                .with_context(|| format!("task not found: {}", args.task_id))?;
+            print_task_record(&record, args.json)?;
+        }
+        TaskCommands::RetryCandidate(args) => {
+            let store = open_task_store_readonly(&args.app_db)?;
+            let candidate = store
+                .retry_candidate(&args.task_id)?
+                .with_context(|| format!("task not found: {}", args.task_id))?;
+            print_task_retry_candidate(&candidate, args.json)?;
+        }
+    }
+    Ok(())
+}
+
+fn open_task_store_readonly(app_db: &Path) -> Result<SqliteTaskStore> {
+    anyhow::ensure!(
+        app_db.is_file(),
+        "app db does not exist or is not a file: {}",
+        app_db.display()
+    );
+    Ok(SqliteTaskStore::open_readonly(app_db)?)
 }
 
 fn run_lookup(args: LookupArgs) -> Result<IndexLookup> {
@@ -1154,6 +1299,103 @@ fn print_status_counts(label: &str, counts: &[wechat_archiver_core::StatusCount]
     }
 }
 
+fn print_task_records(records: &[TaskRecord], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(records)?);
+        return Ok(());
+    }
+
+    println!("tasks: {}", records.len());
+    for record in records {
+        println!(
+            "task: {} status={} kind={} name={}",
+            record.task_id,
+            record.status.as_str(),
+            record.task_kind,
+            record.task_name
+        );
+        println!("  created_at_ms: {}", record.created_at_ms);
+        println!("  started_at_ms: {}", optional_i64(record.started_at_ms));
+        println!("  finished_at_ms: {}", optional_i64(record.finished_at_ms));
+        println!("  dry_run: {}", record.dry_run);
+        println!("  source_dir: {}", optional_path(&record.source_dir));
+        println!("  archive_dir: {}", optional_path(&record.archive_dir));
+        println!(
+            "  progress: scanned={} candidates={} archived={} failed={}",
+            record.progress.scanned_files,
+            record.progress.candidates,
+            record.progress.archived,
+            record.progress.failed
+        );
+        println!("  error: {}", optional_string(&record.error));
+    }
+    Ok(())
+}
+
+fn print_task_record(record: &TaskRecord, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(record)?);
+        return Ok(());
+    }
+
+    println!("task_id: {}", record.task_id);
+    println!("task_name: {}", record.task_name);
+    println!("task_kind: {}", record.task_kind);
+    println!("status: {}", record.status.as_str());
+    println!("created_at_ms: {}", record.created_at_ms);
+    println!("started_at_ms: {}", optional_i64(record.started_at_ms));
+    println!("finished_at_ms: {}", optional_i64(record.finished_at_ms));
+    println!("dry_run: {}", record.dry_run);
+    println!("source_dir: {}", optional_path(&record.source_dir));
+    println!("archive_dir: {}", optional_path(&record.archive_dir));
+    println!("progress: {}", serde_json::to_string(&record.progress)?);
+    println!(
+        "last_event: {}",
+        optional_json_value(record.last_event.as_ref())?
+    );
+    println!(
+        "result_summary: {}",
+        optional_json_value(record.result_summary.as_ref())?
+    );
+    println!("params_summary_json: {}", record.params_summary_json);
+    println!("error: {}", optional_string(&record.error));
+    Ok(())
+}
+
+fn print_task_retry_candidate(candidate: &TaskRetryCandidate, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(candidate)?);
+        return Ok(());
+    }
+
+    println!("source_task_id: {}", candidate.source_task_id);
+    println!("source_status: {}", candidate.source_status.as_str());
+    println!("task_name: {}", candidate.task_name);
+    println!("task_kind: {}", candidate.task_kind);
+    println!("retryable: {}", candidate.retryable);
+    println!("dry_run: {}", candidate.dry_run);
+    println!("source_dir: {}", optional_path(&candidate.source_dir));
+    println!("archive_dir: {}", optional_path(&candidate.archive_dir));
+    if candidate.reasons.is_empty() {
+        println!("reasons: -");
+    } else {
+        println!("reasons:");
+        for reason in &candidate.reasons {
+            println!("  {reason}");
+        }
+    }
+    println!(
+        "params_summary_json: {}",
+        candidate
+            .params_summary_json
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("note: retry-candidate 只生成候选参数，不会执行任务。");
+    Ok(())
+}
+
 fn print_index_lookup(lookup: &IndexLookup, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(lookup)?);
@@ -1396,6 +1638,21 @@ fn optional_i64(value: Option<i64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn optional_path(value: &Option<PathBuf>) -> String {
+    value
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn optional_json_value(value: Option<&impl Serialize>) -> Result<String> {
+    value
+        .map(serde_json::to_string)
+        .transpose()
+        .map(|value| value.unwrap_or_else(|| "-".to_string()))
+        .map_err(Into::into)
 }
 
 fn print_verify_summary(summary: &VerifySummary, json: bool) -> Result<()> {
@@ -1681,6 +1938,182 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_tasks_list_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "tasks",
+            "list",
+            "--app-db",
+            "/tmp/app.sqlite",
+            "--status",
+            "failed,interrupted",
+            "--task-kind",
+            "extract_images",
+            "--created-at-from-ms",
+            "1000",
+            "--created-at-to-ms",
+            "2000",
+            "--limit",
+            "20",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Tasks(TasksArgs {
+                command: TaskCommands::List(args),
+            }) => {
+                assert_eq!(args.app_db, PathBuf::from("/tmp/app.sqlite"));
+                assert_eq!(
+                    args.status,
+                    vec![TaskStatusFilter::Failed, TaskStatusFilter::Interrupted]
+                );
+                assert_eq!(args.task_kind.as_deref(), Some("extract_images"));
+                assert_eq!(args.created_at_from_ms, Some(1000));
+                assert_eq!(args.created_at_to_ms, Some(2000));
+                assert_eq!(args.limit, Some(20));
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tasks_show_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "tasks",
+            "show",
+            "--app-db",
+            "/tmp/app.sqlite",
+            "task-1",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Tasks(TasksArgs {
+                command: TaskCommands::Show(args),
+            }) => {
+                assert_eq!(args.app_db, PathBuf::from("/tmp/app.sqlite"));
+                assert_eq!(args.task_id, "task-1");
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tasks_retry_candidate_command() {
+        let cli = Cli::try_parse_from([
+            "wechat-archiver",
+            "tasks",
+            "retry-candidate",
+            "--app-db",
+            "/tmp/app.sqlite",
+            "task-1",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Tasks(TasksArgs {
+                command: TaskCommands::RetryCandidate(args),
+            }) => {
+                assert_eq!(args.app_db, PathBuf::from("/tmp/app.sqlite"));
+                assert_eq!(args.task_id, "task-1");
+                assert!(!args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_tasks_without_explicit_app_db() {
+        let result = Cli::try_parse_from(["wechat-archiver", "tasks", "list"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tasks_readonly_open_does_not_create_missing_app_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("missing.sqlite");
+
+        let result = run_tasks(TasksArgs {
+            command: TaskCommands::List(TasksListArgs {
+                app_db: app_db.clone(),
+                status: Vec::new(),
+                task_kind: None,
+                created_at_from_ms: None,
+                created_at_to_ms: None,
+                limit: None,
+                json: true,
+            }),
+        });
+
+        assert!(result.is_err());
+        assert!(!app_db.exists());
+    }
+
+    #[test]
+    fn tasks_commands_read_existing_app_db_without_touching_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("app.sqlite");
+        let source_dir = tmp.path().join("wechat-source");
+        let archive_dir = tmp.path().join("archive");
+        let store = SqliteTaskStore::open(&app_db).unwrap();
+        store
+            .create_task(&wechat_archiver_core::TaskCreate {
+                task_id: "task-1".to_string(),
+                task_name: "抽取图片".to_string(),
+                task_kind: "extract_images".to_string(),
+                archive_dir: Some(archive_dir.clone()),
+                source_dir: Some(source_dir.clone()),
+                dry_run: true,
+                params_summary_json: serde_json::json!({
+                    "task_kind": "extract_images",
+                    "image_aes_key_provided": false
+                }),
+            })
+            .unwrap();
+        store.mark_failed("task-1", "失败").unwrap();
+        drop(store);
+        assert!(!source_dir.exists());
+        assert!(!archive_dir.exists());
+
+        run_tasks(TasksArgs {
+            command: TaskCommands::List(TasksListArgs {
+                app_db: app_db.clone(),
+                status: vec![TaskStatusFilter::Failed],
+                task_kind: Some("extract_images".to_string()),
+                created_at_from_ms: None,
+                created_at_to_ms: None,
+                limit: Some(10),
+                json: true,
+            }),
+        })
+        .unwrap();
+        run_tasks(TasksArgs {
+            command: TaskCommands::Show(TasksShowArgs {
+                app_db: app_db.clone(),
+                task_id: "task-1".to_string(),
+                json: true,
+            }),
+        })
+        .unwrap();
+        run_tasks(TasksArgs {
+            command: TaskCommands::RetryCandidate(TasksRetryCandidateArgs {
+                app_db,
+                task_id: "task-1".to_string(),
+                json: true,
+            }),
+        })
+        .unwrap();
+
+        assert!(!source_dir.exists());
+        assert!(!archive_dir.exists());
     }
 
     #[test]
