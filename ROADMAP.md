@@ -166,11 +166,11 @@ wechat-archive/
 - `objects` 按内容 hash 存储真实文件。
 - `index.sqlite` 保存当前索引状态。
 - `manifests/*.jsonl` 保存每次运行审计记录。
-- `index.sqlite` 使用 `schema_migrations` 记录已应用的 schema 版本，当前会显式迁移基础表、`decoder` 字段、消息来源字段、文件元数据字段、媒体元数据字段和源文件指纹字段。
+- `index.sqlite` 使用 `schema_migrations` 记录已应用的 schema 版本，当前会显式迁移基础表、`decoder` 字段、消息来源字段、文件元数据字段、媒体元数据字段、源文件指纹字段和 `.dat` 解码参数指纹字段。
 - `index.sqlite` 和 manifest 独立记录 `source_kind` 与 `decoder`，例如 `source_kind=dat_image`、`decoder=legacy_xor`。
 - `index.sqlite` 和 manifest 支持 `original_filename` 与 `mime_type`；MIME 当前基于归档扩展名保守推断，不做内容嗅探。
 - `index.sqlite` 和 manifest 支持 `width_px`、`height_px`、`duration_ms`；当前直接图片和解码后的图片会 best-effort 写入宽高，视频会 best-effort 写入宽高和时长，部分音频会 best-effort 写入时长。
-- `index.sqlite` 和 manifest 支持 `source_size_bytes` 与 `source_modified_ms`；直接媒体复跑时可用源文件指纹复用已校验记录，减少重复 hash/复制，`.dat` 图片仍按当前解码参数重新处理。
+- `index.sqlite` 和 manifest 支持 `source_size_bytes`、`source_modified_ms` 与 `decode_fingerprint`；直接媒体复跑时可用源文件指纹复用已校验记录，`.dat` 图片可在源文件指纹、解码参数指纹和已校验对象都匹配时跳过重解码。
 - `index.sqlite` 和 manifest 支持可空消息来源字段：`message_talker`、`message_sender`、`message_local_id`、`message_create_time`；当前消息库图片、视频、文件附件和语音归档会写入 `talker/local_id/create_time`，并在 `Msg_*` 表存在 `real_sender_id` 且同库 `Name2Id` 可映射时写入稳定 sender `user_name`。
 - 支持 `status` 查看索引统计，并按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组。
 - 支持 `lookup` 只读按 `sha256` 反查所有来源，或按 `source_path` 查询单个源文件归档状态。
@@ -289,13 +289,13 @@ wechat-archiver extract --type voice
 - 支持 `views/` 生成可浏览派生视图，默认 dry-run，显式 `--write` 才写入。
 - 支持 `original_filename` 和 `mime_type` 字段，并在 `lookup`、JSON/CSV `report`、SQLite 索引和 manifest 中输出。
 - 支持 `width_px`、`height_px`、`duration_ms` 字段，并在 `lookup`、JSON/CSV `report`、SQLite 索引和 manifest 中输出；当前图片宽高、视频宽高/时长和部分音频时长 best-effort 解析。
-- 支持 `source_size_bytes` 和 `source_modified_ms` 字段，并在 `lookup`、JSON/CSV `report`、SQLite 索引和 manifest 中输出；直接媒体可基于未变源文件指纹复用已校验记录。
+- 支持 `source_size_bytes`、`source_modified_ms` 和 `decode_fingerprint` 字段，并在 `lookup`、JSON/CSV `report`、SQLite 索引和 manifest 中输出；直接媒体可基于未变源文件指纹复用已校验记录，`.dat` 图片可基于未变源文件指纹和解码参数指纹复用已校验记录。
 - 支持直接媒体的最小增量复跑：同一源路径、同一媒体类型、同一源大小和修改时间、且既有记录 `verify_status=ok` 时跳过重新 hash/复制。
 
 计划：
 
 - 继续丰富 `media_items` 字段：会话 ID、发送人显示名、更多音频格式时长和更多视频容器元数据。
-- 继续扩展增量扫描状态：任务级扫描游标、`.dat` 解码参数指纹和更完整的变更统计。
+- 继续扩展增量扫描状态：任务级扫描游标和更完整的变更统计。
 
 验收标准：
 

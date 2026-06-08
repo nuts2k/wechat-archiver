@@ -150,7 +150,7 @@ wechat-archive/
 - 计算 `sha256`。
 - 复制到归档目录。
 - 写入 SQLite 索引，并保持 schema 迁移可追踪、可幂等复跑。
-- 索引和 manifest 会记录 `original_filename`、`mime_type`、`width_px`、`height_px`、`duration_ms`、`source_size_bytes`、`source_modified_ms`；MIME 当前基于归档扩展名保守推断，不做内容嗅探，图片宽高、视频宽高/时长和部分音频时长当前 best-effort 写入。直接媒体复跑时可基于未变源文件指纹复用已校验记录，`.dat` 图片仍按当前解码参数重新处理。
+- 索引和 manifest 会记录 `original_filename`、`mime_type`、`width_px`、`height_px`、`duration_ms`、`source_size_bytes`、`source_modified_ms`、`decode_fingerprint`；MIME 当前基于归档扩展名保守推断，不做内容嗅探，图片宽高、视频宽高/时长和部分音频时长当前 best-effort 写入。直接媒体复跑时可基于未变源文件指纹复用已校验记录，`.dat` 图片可基于未变源文件指纹、解码参数指纹和已校验对象复用旧记录；`decode_fingerprint` 只保存参数哈希，不保存原始 key。
 - 消息库图片、视频、文件附件和语音归档会在索引和 manifest 中记录可用的 `message_talker`、`message_sender`、`message_local_id`、`message_create_time`；`message_sender` 当前仅在 `Msg_*` 表存在 `real_sender_id` 且同库 `Name2Id` 可映射时写入稳定 `user_name`。
 - 支持 `status` 查看索引总量、唯一对象、唯一字节数，并按媒体类型、来源类型、解密状态和校验状态分组。
 - 支持 `report` 只读导出 JSON/CSV 索引报告，供人工审计、备份流程和后续 AI 分类使用。
@@ -187,7 +187,7 @@ wechat-archiver views
 wechat-archiver verify
 ```
 
-说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`count-db-media` 用于在已解密/普通 SQLite 消息库上估算 image/video/file/voice 候选量，不读取微信媒体目录、不写归档目录。`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定。图片、视频和文件仍从 `--account/msg` 定位，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。`lookup` 只读打开索引，支持按 `sha256` 反查来源或按 `source_path` 查归档状态，并输出原始文件名、MIME 类型、图片/视频宽高、部分媒体时长和源文件指纹。`status` 输出归档总量和按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组的索引健康统计。`report` 只读导出全量索引记录，支持包含原始文件名、MIME 类型、图片/视频宽高、部分媒体时长和源文件指纹的 JSON/CSV。`views` 默认 dry-run 预览 `views/` 相对软链接计划，传 `--write` 才写入。`verify` 覆盖对象 hash 校验和索引引用完整性检查，异常时返回非零退出码。`extract-images` 保留用于兼容旧脚本。
+说明：`extract --type image` 复用图片归档流程。`extract --type video`、`extract --type file` 和 `extract --type voice` 当前扫描直接媒体文件；当 source 是账号目录或 `msg/attach` 时，会分别自动扫描同账号 `msg/video`、`msg/file`，以及存在时的 `msg/voice` 或 `msg/audio`。`inspect-db` 用于抽取前只读诊断消息库是否可读。`count-db-media` 用于在已解密/普通 SQLite 消息库上估算 image/video/file/voice 候选量，不读取微信媒体目录、不写归档目录。`extract-db-images`、`extract-db-videos`、`extract-db-files` 和 `extract-db-voices` 从已解密/普通 SQLite 消息库枚举对应资源并记录消息来源字段；如果已解密消息库不在账号目录内，可通过 `--message-db-dir` 指定。图片、视频和文件仍从 `--account/msg` 定位，语音 BLOB 从 `--message-db-dir` 指向的 `media_*.db/VoiceInfo` 只读读取。`lookup` 只读打开索引，支持按 `sha256` 反查来源或按 `source_path` 查归档状态，并输出原始文件名、MIME 类型、图片/视频宽高、部分媒体时长、源文件指纹和 `.dat` 解码参数指纹。`status` 输出归档总量和按 `media_type`、`source_kind`、`decrypt_status`、`verify_status` 分组的索引健康统计。`report` 只读导出全量索引记录，支持包含原始文件名、MIME 类型、图片/视频宽高、部分媒体时长、源文件指纹和 `.dat` 解码参数指纹的 JSON/CSV。`views` 默认 dry-run 预览 `views/` 相对软链接计划，传 `--write` 才写入。`verify` 覆盖对象 hash 校验和索引引用完整性检查，异常时返回非零退出码。`extract-images` 保留用于兼容旧脚本。
 
 注意事项：
 

@@ -358,6 +358,7 @@ mod tests {
             message_local_id: Some(42),
             message_create_time,
             decoder: None,
+            decode_fingerprint: None,
             archive_path,
             sha256,
             size_bytes: Some(4),

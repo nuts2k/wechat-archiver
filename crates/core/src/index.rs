@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::error::{ArchiverError, Result};
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 type MigrationFn = fn(&Connection) -> Result<()>;
 
@@ -45,6 +45,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_source_fingerprint_columns",
         apply: migration_6_add_source_fingerprint_columns,
     },
+    Migration {
+        version: 7,
+        name: "add_decode_fingerprint_column",
+        apply: migration_7_add_decode_fingerprint_column,
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -63,6 +68,7 @@ pub(crate) struct MediaRecord {
     pub message_local_id: Option<i64>,
     pub message_create_time: Option<i64>,
     pub decoder: Option<String>,
+    pub decode_fingerprint: Option<String>,
     pub archive_path: Option<String>,
     pub sha256: Option<String>,
     pub size_bytes: Option<u64>,
@@ -80,6 +86,8 @@ pub(crate) struct ReusableMediaRecord {
     pub archive_path: String,
     pub sha256: String,
     pub size_bytes: Option<u64>,
+    pub extension: Option<String>,
+    pub decoder: Option<String>,
     pub width_px: Option<u32>,
     pub height_px: Option<u32>,
     pub duration_ms: Option<u64>,
@@ -284,6 +292,18 @@ fn migration_6_add_source_fingerprint_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migration_7_add_decode_fingerprint_column(conn: &Connection) -> Result<()> {
+    ensure_column(conn, "decode_fingerprint", "TEXT")?;
+    conn.execute(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_media_items_decode_fingerprint
+            ON media_items(source_path, source_size_bytes, source_modified_ms, decode_fingerprint)
+        "#,
+        [],
+    )?;
+    Ok(())
+}
+
 fn media_item_columns(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("PRAGMA table_info(media_items)")?;
     let columns = stmt
@@ -322,6 +342,7 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             message_local_id,
             message_create_time,
             decoder,
+            decode_fingerprint,
             archive_path,
             sha256,
             size_bytes,
@@ -334,7 +355,7 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             created_at_ms,
             updated_at_ms
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?24)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?25)
         ON CONFLICT(source_path)
         DO UPDATE SET
             archive_path = excluded.archive_path,
@@ -355,6 +376,7 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             message_local_id = excluded.message_local_id,
             message_create_time = excluded.message_create_time,
             decoder = excluded.decoder,
+            decode_fingerprint = excluded.decode_fingerprint,
             extension = excluded.extension,
             decrypt_status = excluded.decrypt_status,
             verify_status = excluded.verify_status,
@@ -376,6 +398,7 @@ pub(crate) fn insert_record(conn: &Connection, record: &MediaRecord) -> Result<(
             record.message_local_id,
             record.message_create_time,
             record.decoder,
+            record.decode_fingerprint,
             record.archive_path,
             record.sha256,
             record.size_bytes,
@@ -407,6 +430,8 @@ pub(crate) fn reusable_media_record(
                 archive_path,
                 sha256,
                 size_bytes,
+                extension,
+                decoder,
                 width_px,
                 height_px,
                 duration_ms
@@ -438,9 +463,72 @@ pub(crate) fn reusable_media_record(
                     archive_path: row.get(0)?,
                     sha256: row.get(1)?,
                     size_bytes,
-                    width_px: optional_u32(row, 3)?,
-                    height_px: optional_u32(row, 4)?,
-                    duration_ms: optional_u64(row, 5)?,
+                    extension: row.get(3)?,
+                    decoder: row.get(4)?,
+                    width_px: optional_u32(row, 5)?,
+                    height_px: optional_u32(row, 6)?,
+                    duration_ms: optional_u64(row, 7)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(record)
+}
+
+pub(crate) fn reusable_decoded_media_record(
+    conn: &Connection,
+    source_path: &str,
+    source_kind: &str,
+    media_type: &str,
+    source_size_bytes: u64,
+    source_modified_ms: i64,
+    decode_fingerprint: &str,
+) -> Result<Option<ReusableMediaRecord>> {
+    let record = conn
+        .query_row(
+            r#"
+            SELECT
+                archive_path,
+                sha256,
+                size_bytes,
+                extension,
+                decoder,
+                width_px,
+                height_px,
+                duration_ms
+            FROM media_items
+            WHERE source_path = ?1
+              AND source_kind = ?2
+              AND media_type = ?3
+              AND source_size_bytes = ?4
+              AND source_modified_ms = ?5
+              AND decode_fingerprint = ?6
+              AND verify_status = 'ok'
+              AND archive_path IS NOT NULL
+              AND sha256 IS NOT NULL
+            LIMIT 1
+            "#,
+            params![
+                source_path,
+                source_kind,
+                media_type,
+                source_size_bytes,
+                source_modified_ms,
+                decode_fingerprint,
+            ],
+            |row| {
+                let size_bytes = row
+                    .get::<_, Option<i64>>(2)?
+                    .map(|value| value.max(0) as u64);
+                Ok(ReusableMediaRecord {
+                    archive_path: row.get(0)?,
+                    sha256: row.get(1)?,
+                    size_bytes,
+                    extension: row.get(3)?,
+                    decoder: row.get(4)?,
+                    width_px: optional_u32(row, 5)?,
+                    height_px: optional_u32(row, 6)?,
+                    duration_ms: optional_u64(row, 7)?,
                 })
             },
         )
@@ -528,6 +616,7 @@ mod tests {
                 "duration_ms",
                 "source_size_bytes",
                 "source_modified_ms",
+                "decode_fingerprint",
                 "decoder",
                 "message_talker",
                 "message_sender",
@@ -542,7 +631,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(latest_migration_name, "add_source_fingerprint_columns");
+        assert_eq!(latest_migration_name, "add_decode_fingerprint_column");
     }
 
     #[test]

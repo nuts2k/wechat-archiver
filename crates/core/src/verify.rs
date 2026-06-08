@@ -244,6 +244,7 @@ mod tests {
             message_local_id: None,
             message_create_time: None,
             decoder: None,
+            decode_fingerprint: None,
             archive_path,
             sha256,
             size_bytes: Some(4),

@@ -76,6 +76,7 @@ mod tests {
             message_local_id: Some(42),
             message_create_time: Some(1_700_000_000),
             decoder: None,
+            decode_fingerprint: None,
             archive_path: sha256.map(|sha256| format!("objects/sha256/ab/{sha256}.jpg")),
             sha256: sha256.map(str::to_string),
             size_bytes: Some(123),

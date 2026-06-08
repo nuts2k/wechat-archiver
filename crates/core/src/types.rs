@@ -31,6 +31,7 @@ pub struct ManifestEvent {
     pub message_local_id: Option<i64>,
     pub message_create_time: Option<i64>,
     pub decoder: Option<String>,
+    pub decode_fingerprint: Option<String>,
     pub action: ScanAction,
     pub archive_path: Option<String>,
     pub sha256: Option<String>,

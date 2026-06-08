@@ -154,6 +154,7 @@ mod tests {
             message_local_id: None,
             message_create_time: None,
             decoder: None,
+            decode_fingerprint: None,
             archive_path: Some(format!("objects/sha256/ab/{source_path}.jpg")),
             sha256: Some(source_path.to_string()),
             size_bytes: Some(10),

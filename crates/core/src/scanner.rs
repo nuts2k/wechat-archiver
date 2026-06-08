@@ -8,7 +8,7 @@ use crate::archive::{store_bytes, store_file, StoreOutcome};
 use crate::audio::{
     audio_duration_supported_extension, detect_audio_metadata_from_file, AudioMetadata,
 };
-use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions};
+use crate::config::{create_archive_dirs, ArchiveConfig, DatDecodeOptions, WxgfMode};
 use crate::error::{ArchiverError, IoContext, Result};
 use crate::hash::{sha256_bytes, sha256_file};
 use crate::image::{
@@ -16,7 +16,8 @@ use crate::image::{
     is_dat_file, validate_dat, DatDecode, ImageDimensions,
 };
 use crate::index::{
-    index_path, insert_record, open_index, reusable_media_record, MediaRecord, ReusableMediaRecord,
+    index_path, insert_record, open_index, reusable_decoded_media_record, reusable_media_record,
+    MediaRecord, ReusableMediaRecord,
 };
 use crate::manifest::ManifestWriter;
 use crate::media::{
@@ -521,6 +522,7 @@ pub(crate) fn process_direct_media_with_message_source(
         media_type,
         message_source,
         None,
+        None,
         action.clone(),
         archive_path,
         Some(sha256),
@@ -557,6 +559,7 @@ fn build_reused_direct_media_event(
         media_type,
         message_source,
         None,
+        None,
         ScanAction::AlreadyArchived,
         Some(existing.archive_path.clone()),
         Some(existing.sha256.clone()),
@@ -565,6 +568,41 @@ fn build_reused_direct_media_event(
         Some(source_fingerprint),
         metadata,
         "not_needed",
+        "ok",
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_reused_dat_image_event(
+    run_id: &str,
+    path: &Path,
+    rel: &str,
+    source_kind: &str,
+    message_source: Option<&MessageSource>,
+    extension: &str,
+    source_fingerprint: SourceFingerprint,
+    decode_fingerprint: &str,
+    metadata: MediaMetadata,
+    existing: &ReusableMediaRecord,
+) -> ManifestEvent {
+    build_event(
+        run_id,
+        path,
+        rel,
+        source_kind,
+        "image",
+        message_source,
+        existing.decoder.as_deref(),
+        Some(decode_fingerprint.to_string()),
+        ScanAction::AlreadyArchived,
+        Some(existing.archive_path.clone()),
+        Some(existing.sha256.clone()),
+        existing.size_bytes,
+        Some(extension.to_string()),
+        Some(source_fingerprint),
+        metadata,
+        "decoded",
         "ok",
         None,
     )
@@ -611,6 +649,53 @@ pub(crate) fn process_dat_image_with_message_source(
 ) -> Result<ScanOutcome> {
     let rel = relative_path(path, source_root)?;
     let source_fingerprint = source_fingerprint(path).ok();
+    let decode_fingerprint = dat_decode_fingerprint(dat_options);
+
+    let reusable = if !dry_run {
+        if let (Some(conn), Some(source_fingerprint), Some(modified_ms)) = (
+            conn,
+            source_fingerprint,
+            source_fingerprint.and_then(|value| value.modified_ms),
+        ) {
+            let source_path = path.to_string_lossy().to_string();
+            reusable_decoded_media_record(
+                conn,
+                &source_path,
+                source_kind,
+                "image",
+                source_fingerprint.size_bytes,
+                modified_ms,
+                &decode_fingerprint,
+            )?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let (Some(existing), Some(source_fingerprint)) = (reusable.as_ref(), source_fingerprint) {
+        if let Some(extension) = existing.extension.as_deref() {
+            if safe_archive_path_exists(archive_root, &existing.archive_path)
+                && metadata_complete_for_reuse("image", existing)
+            {
+                let event = build_reused_dat_image_event(
+                    run_id,
+                    path,
+                    &rel,
+                    source_kind,
+                    message_source,
+                    extension,
+                    source_fingerprint,
+                    &decode_fingerprint,
+                    metadata_from_reusable(existing),
+                    existing,
+                );
+                persist(conn, manifest, &event)?;
+                return Ok(ScanOutcome::new(ScanAction::AlreadyArchived));
+            }
+        }
+    }
 
     let decoded = if dry_run {
         validate_dat(path, dat_options)?
@@ -649,6 +734,7 @@ pub(crate) fn process_dat_image_with_message_source(
                 "image",
                 message_source,
                 Some(decoder),
+                Some(decode_fingerprint.clone()),
                 action.clone(),
                 archive_path,
                 Some(sha256),
@@ -672,6 +758,7 @@ pub(crate) fn process_dat_image_with_message_source(
                 "image",
                 message_source,
                 Some(decoder),
+                Some(decode_fingerprint.clone()),
                 ScanAction::WouldArchive,
                 None,
                 None,
@@ -695,6 +782,7 @@ pub(crate) fn process_dat_image_with_message_source(
                 "image",
                 message_source,
                 None,
+                Some(decode_fingerprint),
                 ScanAction::Unsupported,
                 None,
                 None,
@@ -721,6 +809,7 @@ fn build_event(
     media_type: &str,
     message_source: Option<&MessageSource>,
     decoder: Option<&str>,
+    decode_fingerprint: Option<String>,
     action: ScanAction,
     archive_path: Option<String>,
     sha256: Option<String>,
@@ -754,6 +843,7 @@ fn build_event(
         message_local_id: message_source.local_id,
         message_create_time: message_source.create_time,
         decoder: decoder.map(str::to_string),
+        decode_fingerprint,
         action,
         archive_path,
         sha256,
@@ -790,6 +880,7 @@ pub(crate) fn persist(
                 message_local_id: event.message_local_id,
                 message_create_time: event.message_create_time,
                 decoder: event.decoder.clone(),
+                decode_fingerprint: event.decode_fingerprint.clone(),
                 archive_path: event.archive_path.clone(),
                 sha256: event.sha256.clone(),
                 size_bytes: event.size_bytes,
@@ -875,6 +966,41 @@ fn direct_media_metadata(path: &Path, media_type: &str) -> MediaMetadata {
     }
 }
 
+fn dat_decode_fingerprint(options: &DatDecodeOptions) -> String {
+    let mut canonical = String::from("wechat-archiver:dat-decode:v1\n");
+    canonical.push_str("image_aes_key_sha256=");
+    if let Some(key) = options.image_aes_key.as_deref() {
+        let (key_hash, _) = sha256_bytes(key);
+        canonical.push_str(&key_hash);
+    } else {
+        canonical.push_str("none");
+    }
+    canonical.push('\n');
+    canonical.push_str(&format!("image_xor_key={:02x}\n", options.image_xor_key));
+    canonical.push_str("wxgf_mode=");
+    canonical.push_str(wxgf_mode_name(options.wxgf_mode));
+    canonical.push('\n');
+    canonical.push_str("wxgf_ffmpeg_path=");
+    if let Some(path) = &options.wxgf_ffmpeg_path {
+        canonical.push_str(&path.to_string_lossy());
+    } else {
+        canonical.push_str("default");
+    }
+    canonical.push('\n');
+
+    let (fingerprint, _) = sha256_bytes(canonical.as_bytes());
+    format!("dat-v1:{fingerprint}")
+}
+
+fn wxgf_mode_name(mode: WxgfMode) -> &'static str {
+    match mode {
+        WxgfMode::Off => "off",
+        WxgfMode::Raw => "raw",
+        WxgfMode::Jpg => "jpg",
+        WxgfMode::Mp4 => "mp4",
+    }
+}
+
 fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
     let metadata = std::fs::metadata(path).with_path(path)?;
     Ok(SourceFingerprint {
@@ -922,6 +1048,17 @@ mod tests {
     use crate::status::archive_status;
     use crate::verify::verify_archive;
     use rusqlite::Connection;
+
+    type DatIndexMetadataRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+    );
 
     #[test]
     fn extracts_direct_and_xor_images_without_touching_source() {
@@ -1066,6 +1203,69 @@ mod tests {
         assert!(event.source_modified_ms.is_some());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_dat_image_reuses_index_without_reading_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(source.join("attach/hash/2026-01/Img")).unwrap();
+
+        let dat_path = source.join("attach/hash/2026-01/Img/sample.dat");
+        write_legacy_xor_dat(&dat_path, 16, 8);
+
+        let first = extract_images(ArchiveConfig {
+            source_dir: source.clone(),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+        assert_eq!(first.archived, 1);
+        assert_eq!(first.already_archived, 0);
+
+        let mut permissions = std::fs::metadata(&dat_path).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&dat_path, permissions).unwrap();
+
+        let second = extract_images(ArchiveConfig {
+            source_dir: source.clone(),
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        let mut permissions = std::fs::metadata(&dat_path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&dat_path, permissions).unwrap();
+
+        assert_eq!(second.archived, 0);
+        assert_eq!(second.already_archived, 1);
+
+        let manifest_path = second.manifest_path.unwrap();
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
+        let event = manifest
+            .lines()
+            .map(|line| serde_json::from_str::<ManifestEvent>(line).unwrap())
+            .find(|event| event.source_relative_path == "attach/hash/2026-01/Img/sample.dat")
+            .unwrap();
+        assert_eq!(event.action, ScanAction::AlreadyArchived);
+        assert_eq!(event.decoder.as_deref(), Some("legacy_xor"));
+        assert_eq!(
+            event.decode_fingerprint.as_deref(),
+            Some(dat_decode_fingerprint(&DatDecodeOptions::default()).as_str())
+        );
+        assert_eq!(event.width_px, Some(16));
+        assert_eq!(event.height_px, Some(8));
+        assert!(event.source_size_bytes.is_some());
+        assert!(event.source_modified_ms.is_some());
+    }
+
     #[test]
     fn records_dat_source_kind_and_decoder_separately() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1088,18 +1288,19 @@ mod tests {
         .unwrap();
 
         let conn = Connection::open(archive.join("index.sqlite")).unwrap();
-        let (source_kind, decoder, extension, original_filename, mime_type, width_px, height_px): (
-            String,
-            Option<String>,
-            String,
-            String,
-            String,
-            Option<i64>,
-            Option<i64>,
-        ) = conn
+        let (
+            source_kind,
+            decoder,
+            decode_fingerprint,
+            extension,
+            original_filename,
+            mime_type,
+            width_px,
+            height_px,
+        ): DatIndexMetadataRow = conn
             .query_row(
                 r#"
-                SELECT source_kind, decoder, extension, original_filename, mime_type, width_px, height_px
+                SELECT source_kind, decoder, decode_fingerprint, extension, original_filename, mime_type, width_px, height_px
                 FROM media_items
                 WHERE source_relative_path = 'attach/hash/2026-01/Img/sample.dat'
                 "#,
@@ -1113,12 +1314,17 @@ mod tests {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
             .unwrap();
         assert_eq!(source_kind, "dat_image");
         assert_eq!(decoder.as_deref(), Some("legacy_xor"));
+        assert_eq!(
+            decode_fingerprint.as_deref(),
+            Some(dat_decode_fingerprint(&DatDecodeOptions::default()).as_str())
+        );
         assert_eq!(extension, "png");
         assert_eq!(original_filename, "sample.dat");
         assert_eq!(mime_type, "image/png");
@@ -1134,11 +1340,142 @@ mod tests {
             .unwrap();
         assert_eq!(event.source_kind, "dat_image");
         assert_eq!(event.decoder.as_deref(), Some("legacy_xor"));
+        assert_eq!(
+            event.decode_fingerprint.as_deref(),
+            Some(dat_decode_fingerprint(&DatDecodeOptions::default()).as_str())
+        );
         assert_eq!(event.original_filename.as_deref(), Some("sample.dat"));
         assert_eq!(event.mime_type.as_deref(), Some("image/png"));
         assert_eq!(event.width_px, Some(16));
         assert_eq!(event.height_px, Some(8));
         assert_eq!(event.duration_ms, None);
+    }
+
+    #[test]
+    fn dat_reuse_requires_matching_decode_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("wechat-source");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(source.join("attach/hash/2026-01/Img")).unwrap();
+
+        let dat_path = source.join("attach/hash/2026-01/Img/sample.dat");
+        write_legacy_xor_dat(&dat_path, 16, 8);
+
+        extract_images(ArchiveConfig {
+            source_dir: source,
+            archive_dir: archive.clone(),
+            dry_run: false,
+            dat_options: DatDecodeOptions::default(),
+            explain_unsupported: false,
+        })
+        .unwrap();
+
+        let conn = Connection::open(archive.join("index.sqlite")).unwrap();
+        let (source_path, source_size_bytes, source_modified_ms, decode_fingerprint): (
+            String,
+            i64,
+            i64,
+            String,
+        ) = conn
+            .query_row(
+                r#"
+                SELECT source_path, source_size_bytes, source_modified_ms, decode_fingerprint
+                FROM media_items
+                WHERE source_relative_path = 'attach/hash/2026-01/Img/sample.dat'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            decode_fingerprint,
+            dat_decode_fingerprint(&DatDecodeOptions::default())
+        );
+        let reusable = reusable_decoded_media_record(
+            &conn,
+            &source_path,
+            "dat_image",
+            "image",
+            source_size_bytes as u64,
+            source_modified_ms,
+            &decode_fingerprint,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reusable.extension.as_deref(), Some("png"));
+        assert_eq!(reusable.decoder.as_deref(), Some("legacy_xor"));
+
+        let changed_key = DatDecodeOptions {
+            image_aes_key: Some(vec![1; 16]),
+            ..DatDecodeOptions::default()
+        };
+        assert!(
+            reusable_decoded_media_record(
+                &conn,
+                &source_path,
+                "dat_image",
+                "image",
+                source_size_bytes as u64,
+                source_modified_ms,
+                &dat_decode_fingerprint(&changed_key),
+            )
+            .unwrap()
+            .is_none(),
+            "换 AES key 后不能复用旧 .dat 解码结果"
+        );
+
+        let changed_wxgf = DatDecodeOptions {
+            wxgf_mode: WxgfMode::Raw,
+            ..DatDecodeOptions::default()
+        };
+        assert!(
+            reusable_decoded_media_record(
+                &conn,
+                &source_path,
+                "dat_image",
+                "image",
+                source_size_bytes as u64,
+                source_modified_ms,
+                &dat_decode_fingerprint(&changed_wxgf),
+            )
+            .unwrap()
+            .is_none(),
+            "换 wxgf mode 后不能复用旧 .dat 解码结果"
+        );
+
+        conn.execute("UPDATE media_items SET decode_fingerprint = NULL", [])
+            .unwrap();
+        assert!(
+            reusable_decoded_media_record(
+                &conn,
+                &source_path,
+                "dat_image",
+                "image",
+                source_size_bytes as u64,
+                source_modified_ms,
+                &decode_fingerprint,
+            )
+            .unwrap()
+            .is_none(),
+            "旧索引没有 decode_fingerprint 时不能复用 .dat 解码结果"
+        );
+    }
+
+    #[test]
+    fn dat_decode_fingerprint_does_not_store_raw_key_material() {
+        let options = DatDecodeOptions {
+            image_aes_key: Some(b"very-secret-key".to_vec()),
+            ..DatDecodeOptions::default()
+        };
+
+        let fingerprint = dat_decode_fingerprint(&options);
+
+        assert!(fingerprint.starts_with("dat-v1:"));
+        assert!(!fingerprint.contains("very-secret-key"));
+        assert_ne!(
+            fingerprint,
+            dat_decode_fingerprint(&DatDecodeOptions::default())
+        );
     }
 
     #[test]
@@ -1761,6 +2098,12 @@ mod tests {
         data.extend_from_slice(&width.to_be_bytes());
         data.extend_from_slice(&height.to_be_bytes());
         data
+    }
+
+    fn write_legacy_xor_dat(path: &Path, width: u32, height: u32) {
+        let decoded = synthetic_png(width, height);
+        let encrypted: Vec<u8> = decoded.iter().map(|byte| byte ^ 0x88).collect();
+        std::fs::write(path, encrypted).unwrap();
     }
 
     fn synthetic_jpeg(width: u16, height: u16) -> Vec<u8> {

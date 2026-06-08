@@ -1076,6 +1076,10 @@ fn print_index_lookup(lookup: &IndexLookup, json: bool) -> Result<()> {
         );
         println!("  extension: {}", optional_string(&record.extension));
         println!("  decoder: {}", optional_string(&record.decoder));
+        println!(
+            "  decode_fingerprint: {}",
+            optional_string(&record.decode_fingerprint)
+        );
         println!("  decrypt_status: {}", record.decrypt_status);
         println!("  verify_status: {}", record.verify_status);
         println!(
@@ -1128,6 +1132,7 @@ fn print_archive_report_csv(report: &ArchiveReport) {
         "message_local_id",
         "message_create_time",
         "decoder",
+        "decode_fingerprint",
         "archive_path",
         "sha256",
         "size_bytes",
@@ -1168,6 +1173,7 @@ fn print_archive_report_csv(report: &ArchiveReport) {
             &message_local_id,
             &message_create_time,
             optional_string_csv(&record.decoder),
+            optional_string_csv(&record.decode_fingerprint),
             optional_string_csv(&record.archive_path),
             optional_string_csv(&record.sha256),
             &size_bytes,

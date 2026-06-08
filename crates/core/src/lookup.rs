@@ -39,6 +39,7 @@ pub struct IndexLookupRecord {
     pub message_local_id: Option<i64>,
     pub message_create_time: Option<i64>,
     pub decoder: Option<String>,
+    pub decode_fingerprint: Option<String>,
     pub archive_path: Option<String>,
     pub sha256: Option<String>,
     pub size_bytes: Option<u64>,
@@ -155,6 +156,7 @@ fn query_records_with_params(
             {message_local_id},
             {message_create_time},
             {decoder},
+            {decode_fingerprint},
             archive_path,
             sha256,
             size_bytes,
@@ -182,6 +184,7 @@ fn query_records_with_params(
         message_local_id = column_or_null(&columns, "message_local_id", "INTEGER"),
         message_create_time = column_or_null(&columns, "message_create_time", "INTEGER"),
         decoder = column_or_null(&columns, "decoder", "TEXT"),
+        decode_fingerprint = column_or_null(&columns, "decode_fingerprint", "TEXT"),
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -208,10 +211,10 @@ fn column_or_null(columns: &[String], column_name: &str, column_type: &str) -> S
 
 fn row_to_record(row: &Row<'_>) -> rusqlite::Result<IndexLookupRecord> {
     let size_bytes = row
-        .get::<_, Option<i64>>(17)?
+        .get::<_, Option<i64>>(18)?
         .map(|value| value.max(0) as u64);
     let source_size_bytes = row
-        .get::<_, Option<i64>>(18)?
+        .get::<_, Option<i64>>(19)?
         .map(|value| value.max(0) as u64);
     Ok(IndexLookupRecord {
         id: row.get(0)?,
@@ -229,17 +232,18 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<IndexLookupRecord> {
         message_local_id: row.get(12)?,
         message_create_time: row.get(13)?,
         decoder: row.get(14)?,
-        archive_path: row.get(15)?,
-        sha256: row.get(16)?,
+        decode_fingerprint: row.get(15)?,
+        archive_path: row.get(16)?,
+        sha256: row.get(17)?,
         size_bytes,
         source_size_bytes,
-        source_modified_ms: row.get(19)?,
-        extension: row.get(20)?,
-        decrypt_status: row.get(21)?,
-        verify_status: row.get(22)?,
-        error: row.get(23)?,
-        created_at_ms: row.get(24)?,
-        updated_at_ms: row.get(25)?,
+        source_modified_ms: row.get(20)?,
+        extension: row.get(21)?,
+        decrypt_status: row.get(22)?,
+        verify_status: row.get(23)?,
+        error: row.get(24)?,
+        created_at_ms: row.get(25)?,
+        updated_at_ms: row.get(26)?,
     })
 }
 
@@ -286,6 +290,7 @@ mod tests {
             message_local_id: Some(42),
             message_create_time: Some(1_700_000_000),
             decoder: None,
+            decode_fingerprint: None,
             archive_path: Some(format!("objects/sha256/ab/{sha256}.jpg")),
             sha256: Some(sha256.to_string()),
             size_bytes: Some(123),
@@ -451,6 +456,7 @@ mod tests {
         assert_eq!(lookup.records[0].duration_ms, None);
         assert_eq!(lookup.records[0].source_size_bytes, None);
         assert_eq!(lookup.records[0].source_modified_ms, None);
+        assert_eq!(lookup.records[0].decode_fingerprint, None);
 
         let conn = Connection::open(index_path(archive)).unwrap();
         let migrations_table_exists: i64 = conn
