@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::Value as JsonValue;
 
 use crate::error::{ArchiverError, Result};
 use crate::task::{TaskEvent, TaskProgress};
@@ -25,6 +26,24 @@ const MIGRATIONS: &[Migration] = &[Migration {
     apply: migration_1_create_task_runs,
 }];
 
+const TASK_RECORD_COLUMNS: &str = r#"
+    task_id,
+    task_name,
+    task_kind,
+    archive_dir,
+    source_dir,
+    status,
+    created_at_ms,
+    started_at_ms,
+    finished_at_ms,
+    dry_run,
+    params_summary_json,
+    progress_json,
+    last_event_json,
+    result_summary_json,
+    error
+"#;
+
 pub trait TaskStore: Send + Sync {
     fn create_task(&self, task: &TaskCreate) -> Result<TaskRecord>;
     fn mark_running(&self, task_id: &str) -> Result<()>;
@@ -43,6 +62,7 @@ pub trait TaskStore: Send + Sync {
     ) -> Result<()>;
     fn mark_unfinished_interrupted(&self, error: &str) -> Result<usize>;
     fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>>;
+    fn list_tasks(&self, query: &TaskListQuery) -> Result<Vec<TaskRecord>>;
 
     fn mark_completed(&self, task_id: &str, result_summary: &ExtractSummary) -> Result<()> {
         self.finish_task(
@@ -113,7 +133,7 @@ pub struct TaskCreate {
     pub archive_dir: Option<PathBuf>,
     pub source_dir: Option<PathBuf>,
     pub dry_run: bool,
-    pub params_summary_json: Value,
+    pub params_summary_json: JsonValue,
 }
 
 #[derive(Debug, Clone)]
@@ -128,11 +148,59 @@ pub struct TaskRecord {
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
     pub dry_run: bool,
-    pub params_summary_json: Value,
+    pub params_summary_json: JsonValue,
     pub progress: TaskProgress,
     pub last_event: Option<TaskEvent>,
     pub result_summary: Option<ExtractSummary>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TaskListQuery {
+    pub statuses: Vec<PersistentTaskStatus>,
+    pub task_kind: Option<String>,
+    pub created_at_from_ms: Option<i64>,
+    pub created_at_to_ms: Option<i64>,
+    pub limit: Option<usize>,
+}
+
+impl TaskListQuery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_status(mut self, status: PersistentTaskStatus) -> Self {
+        self.statuses.push(status);
+        self
+    }
+
+    pub fn with_statuses(
+        mut self,
+        statuses: impl IntoIterator<Item = PersistentTaskStatus>,
+    ) -> Self {
+        self.statuses.extend(statuses);
+        self
+    }
+
+    pub fn with_task_kind(mut self, task_kind: impl Into<String>) -> Self {
+        self.task_kind = Some(task_kind.into());
+        self
+    }
+
+    pub fn with_created_at_from_ms(mut self, created_at_from_ms: i64) -> Self {
+        self.created_at_from_ms = Some(created_at_from_ms);
+        self
+    }
+
+    pub fn with_created_at_to_ms(mut self, created_at_to_ms: i64) -> Self {
+        self.created_at_to_ms = Some(created_at_to_ms);
+        self
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -321,33 +389,29 @@ impl TaskStore for SqliteTaskStore {
 
     fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>> {
         let conn = self.connection()?;
-        conn.query_row(
+        let sql = format!(
             r#"
-            SELECT
-                task_id,
-                task_name,
-                task_kind,
-                archive_dir,
-                source_dir,
-                status,
-                created_at_ms,
-                started_at_ms,
-                finished_at_ms,
-                dry_run,
-                params_summary_json,
-                progress_json,
-                last_event_json,
-                result_summary_json,
-                error
+            SELECT {TASK_RECORD_COLUMNS}
             FROM task_runs
             WHERE task_id = ?1
-            "#,
-            params![task_id],
-            task_record_from_row,
-        )
-        .optional()
-        .map_err(ArchiverError::from)
-        .and_then(|record| record.transpose())
+            "#
+        );
+        conn.query_row(&sql, params![task_id], task_record_from_row)
+            .optional()
+            .map_err(ArchiverError::from)
+            .and_then(|record| record.transpose())
+    }
+
+    fn list_tasks(&self, query: &TaskListQuery) -> Result<Vec<TaskRecord>> {
+        let conn = self.connection()?;
+        let (sql, params) = build_list_tasks_query(query);
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(params), task_record_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(ArchiverError::from)??);
+        }
+        Ok(records)
     }
 }
 
@@ -504,6 +568,59 @@ fn task_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Task
     })())
 }
 
+fn build_list_tasks_query(query: &TaskListQuery) -> (String, Vec<SqlValue>) {
+    let mut sql = format!(
+        r#"
+        SELECT {TASK_RECORD_COLUMNS}
+        FROM task_runs
+        "#
+    );
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+
+    if !query.statuses.is_empty() {
+        let placeholders = (0..query.statuses.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("status IN ({placeholders})"));
+        params.extend(
+            query
+                .statuses
+                .iter()
+                .map(|status| SqlValue::Text(status.as_str().to_string())),
+        );
+    }
+
+    if let Some(task_kind) = &query.task_kind {
+        clauses.push("task_kind = ?".to_string());
+        params.push(SqlValue::Text(task_kind.clone()));
+    }
+
+    if let Some(created_at_from_ms) = query.created_at_from_ms {
+        clauses.push("created_at_ms >= ?".to_string());
+        params.push(SqlValue::Integer(created_at_from_ms));
+    }
+
+    if let Some(created_at_to_ms) = query.created_at_to_ms {
+        clauses.push("created_at_ms <= ?".to_string());
+        params.push(SqlValue::Integer(created_at_to_ms));
+    }
+
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+
+    sql.push_str(" ORDER BY created_at_ms DESC, task_id DESC");
+    if let Some(limit) = query.limit {
+        sql.push_str(" LIMIT ?");
+        params.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+    }
+
+    (sql, params)
+}
+
 fn ensure_task_updated(task_id: &str, updated: usize) -> Result<()> {
     if updated == 0 {
         return Err(ArchiverError::Other(format!("任务不存在: {task_id}")));
@@ -533,10 +650,14 @@ mod tests {
     use serde_json::json;
 
     fn task_create(task_id: &str) -> TaskCreate {
+        task_create_with_kind(task_id, "extract_images")
+    }
+
+    fn task_create_with_kind(task_id: &str, task_kind: &str) -> TaskCreate {
         TaskCreate {
             task_id: task_id.to_string(),
             task_name: "抽取图片".to_string(),
-            task_kind: "extract_images".to_string(),
+            task_kind: task_kind.to_string(),
             archive_dir: Some(PathBuf::from("/tmp/archive")),
             source_dir: Some(PathBuf::from("/tmp/source")),
             dry_run: false,
@@ -546,6 +667,27 @@ mod tests {
                 "image_aes_key_sha256": "cf20965eec1a6a1024eba8120c5b33a98a8e4e3b0f2a8218ecf7d70ac8a3f1bb"
             }),
         }
+    }
+
+    fn task_create_with_paths(
+        task_id: &str,
+        source_dir: PathBuf,
+        archive_dir: PathBuf,
+    ) -> TaskCreate {
+        TaskCreate {
+            source_dir: Some(source_dir),
+            archive_dir: Some(archive_dir),
+            ..task_create(task_id)
+        }
+    }
+
+    fn set_created_at_ms(store: &SqliteTaskStore, task_id: &str, created_at_ms: i64) {
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "UPDATE task_runs SET created_at_ms = ?2 WHERE task_id = ?1",
+            params![task_id, created_at_ms],
+        )
+        .unwrap();
     }
 
     fn summary(run_id: &str) -> ExtractSummary {
@@ -706,5 +848,117 @@ mod tests {
         assert!(stored_json.contains("image_aes_key_sha256"));
         assert!(!stored_json.contains("plain-secret-aes-key"));
         assert!(!stored_json.contains("image_aes_key\":\""));
+    }
+
+    #[test]
+    fn list_tasks_orders_recent_first_and_applies_limit() {
+        let store = SqliteTaskStore::open_in_memory().unwrap();
+        store.create_task(&task_create("old")).unwrap();
+        store.create_task(&task_create("newest")).unwrap();
+        store.create_task(&task_create("middle")).unwrap();
+        set_created_at_ms(&store, "old", 1_000);
+        set_created_at_ms(&store, "newest", 3_000);
+        set_created_at_ms(&store, "middle", 2_000);
+
+        let records = store
+            .list_tasks(&TaskListQuery::new().with_limit(2))
+            .unwrap();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest", "middle"]
+        );
+    }
+
+    #[test]
+    fn list_tasks_filters_by_status_and_task_kind() {
+        let store = SqliteTaskStore::open_in_memory().unwrap();
+        store
+            .create_task(&task_create_with_kind("image-ok", "extract_images"))
+            .unwrap();
+        store
+            .create_task(&task_create_with_kind("video-ok", "extract_videos"))
+            .unwrap();
+        store
+            .create_task(&task_create_with_kind("image-failed", "extract_images"))
+            .unwrap();
+        store
+            .mark_completed("image-ok", &summary("image-ok"))
+            .unwrap();
+        store
+            .mark_completed("video-ok", &summary("video-ok"))
+            .unwrap();
+        store.mark_failed("image-failed", "失败").unwrap();
+        set_created_at_ms(&store, "image-ok", 1_000);
+        set_created_at_ms(&store, "video-ok", 2_000);
+        set_created_at_ms(&store, "image-failed", 3_000);
+
+        let records = store
+            .list_tasks(
+                &TaskListQuery::new()
+                    .with_status(PersistentTaskStatus::Completed)
+                    .with_task_kind("extract_images"),
+            )
+            .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].task_id, "image-ok");
+    }
+
+    #[test]
+    fn list_tasks_filters_by_multiple_statuses_and_time_range() {
+        let store = SqliteTaskStore::open_in_memory().unwrap();
+        store.create_task(&task_create("queued")).unwrap();
+        store.create_task(&task_create("completed")).unwrap();
+        store.create_task(&task_create("failed")).unwrap();
+        store
+            .mark_completed("completed", &summary("completed"))
+            .unwrap();
+        store.mark_failed("failed", "失败").unwrap();
+        set_created_at_ms(&store, "queued", 1_000);
+        set_created_at_ms(&store, "completed", 2_000);
+        set_created_at_ms(&store, "failed", 3_000);
+
+        let records = store
+            .list_tasks(
+                &TaskListQuery::new()
+                    .with_statuses([
+                        PersistentTaskStatus::Completed,
+                        PersistentTaskStatus::Failed,
+                    ])
+                    .with_created_at_from_ms(1_500)
+                    .with_created_at_to_ms(2_500),
+            )
+            .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].task_id, "completed");
+    }
+
+    #[test]
+    fn list_tasks_does_not_write_source_or_archive_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("app.sqlite");
+        let source_dir = temp.path().join("wechat-source");
+        let archive_dir = temp.path().join("archive");
+        let store = SqliteTaskStore::open(&db_path).unwrap();
+        store
+            .create_task(&task_create_with_paths(
+                "task-1",
+                source_dir.clone(),
+                archive_dir.clone(),
+            ))
+            .unwrap();
+        assert!(!source_dir.exists());
+        assert!(!archive_dir.exists());
+
+        let records = store.list_tasks(&TaskListQuery::new()).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert!(!source_dir.exists());
+        assert!(!archive_dir.exists());
     }
 }

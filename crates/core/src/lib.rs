@@ -45,7 +45,9 @@ pub use task::{
     CancelToken, TaskEvent, TaskEventKind, TaskHandle, TaskMetadata, TaskOptions, TaskProgress,
     TaskReporter, TaskRunner, TaskSnapshot, TaskStatus,
 };
-pub use task_store::{PersistentTaskStatus, SqliteTaskStore, TaskCreate, TaskRecord, TaskStore};
+pub use task_store::{
+    PersistentTaskStatus, SqliteTaskStore, TaskCreate, TaskListQuery, TaskRecord, TaskStore,
+};
 pub use types::{
     ExtractSummary, ManifestEvent, ScanAction, UnsupportedExplanation, UnsupportedReasonSummary,
 };
