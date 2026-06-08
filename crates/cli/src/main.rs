@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -16,7 +17,7 @@ use wechat_archiver_core::{
     ImageKeyDerivation, ImageKeyMethod, IndexLookup, IndexLookupQuery, MessageDbExtractConfig,
     MessageDbInspectConfig, MessageDbInspection, MessageDbMediaCountConfig,
     MessageDbMediaCountSummary, MessageDbMediaTypeCount, PersistentTaskStatus, SqliteTaskStore,
-    TaskHandle, TaskListQuery, TaskMetadata, TaskOptions, TaskRecord, TaskReporter,
+    TaskEvent, TaskHandle, TaskListQuery, TaskMetadata, TaskOptions, TaskRecord, TaskReporter,
     TaskRetryCandidate, TaskRunner, TaskStatus, TaskStore, VerifySummary, ViewsConfig,
     ViewsSummary, WechatDiscovery,
 };
@@ -152,6 +153,10 @@ enum Commands {
         #[arg(long)]
         archive: PathBuf,
 
+        /// 显式 app SQLite 路径；传入时记录任务历史，必须已存在。
+        #[arg(long)]
+        app_db: Option<PathBuf>,
+
         /// 只读枚举和解码，不写入 archive。
         #[arg(long)]
         dry_run: bool,
@@ -195,6 +200,10 @@ enum Commands {
         #[arg(long)]
         archive: PathBuf,
 
+        /// 显式 app SQLite 路径；传入时记录任务历史，必须已存在。
+        #[arg(long)]
+        app_db: Option<PathBuf>,
+
         /// 只读枚举和定位，不写入 archive。
         #[arg(long)]
         dry_run: bool,
@@ -222,6 +231,10 @@ enum Commands {
         #[arg(long)]
         archive: PathBuf,
 
+        /// 显式 app SQLite 路径；传入时记录任务历史，必须已存在。
+        #[arg(long)]
+        app_db: Option<PathBuf>,
+
         /// 只读枚举和定位，不写入 archive。
         #[arg(long)]
         dry_run: bool,
@@ -248,6 +261,10 @@ enum Commands {
         /// 独立归档目录，不能位于 account 内部，也不能包含 account。
         #[arg(long)]
         archive: PathBuf,
+
+        /// 显式 app SQLite 路径；传入时记录任务历史，必须已存在。
+        #[arg(long)]
+        app_db: Option<PathBuf>,
 
         /// 只读枚举和 hash，不写入 archive。
         #[arg(long)]
@@ -457,6 +474,10 @@ struct ImageExtractArgs {
     #[arg(long)]
     archive: PathBuf,
 
+    /// 显式 app SQLite 路径；传入时记录任务历史，必须已存在。
+    #[arg(long)]
+    app_db: Option<PathBuf>,
+
     /// 只扫描和解码，不写入 archive。
     #[arg(long)]
     dry_run: bool,
@@ -626,6 +647,7 @@ fn main() -> Result<()> {
             account,
             message_db_dir,
             archive,
+            app_db,
             dry_run,
             image_aes_key,
             image_xor_key,
@@ -634,21 +656,24 @@ fn main() -> Result<()> {
             json,
             jsonl_progress,
         } => {
-            let summary = extract_message_db_images_with_task(
-                MessageDbExtractConfig {
-                    account_dir: account,
-                    message_db_dir,
-                    archive_dir: archive,
-                    dry_run,
-                    dat_options: parse_dat_options(
-                        image_aes_key,
-                        &image_xor_key,
-                        wxgf_mode,
-                        wxgf_ffmpeg_path,
-                    )?,
-                    explain_unsupported: false,
-                },
-                task_options(jsonl_progress),
+            let config = MessageDbExtractConfig {
+                account_dir: account,
+                message_db_dir,
+                archive_dir: archive,
+                dry_run,
+                dat_options: parse_dat_options(
+                    image_aes_key,
+                    &image_xor_key,
+                    wxgf_mode,
+                    wxgf_ffmpeg_path,
+                )?,
+                explain_unsupported: false,
+            };
+            let summary = run_message_db_extract(
+                MediaType::Image,
+                app_db.as_deref(),
+                jsonl_progress,
+                config,
             )?;
             print_extract_summary(&summary, json)?;
         }
@@ -656,20 +681,24 @@ fn main() -> Result<()> {
             account,
             message_db_dir,
             archive,
+            app_db,
             dry_run,
             json,
             jsonl_progress,
         } => {
-            let summary = extract_message_db_videos_with_task(
-                MessageDbExtractConfig {
-                    account_dir: account,
-                    message_db_dir,
-                    archive_dir: archive,
-                    dry_run,
-                    dat_options: DatDecodeOptions::default(),
-                    explain_unsupported: false,
-                },
-                task_options(jsonl_progress),
+            let config = MessageDbExtractConfig {
+                account_dir: account,
+                message_db_dir,
+                archive_dir: archive,
+                dry_run,
+                dat_options: DatDecodeOptions::default(),
+                explain_unsupported: false,
+            };
+            let summary = run_message_db_extract(
+                MediaType::Video,
+                app_db.as_deref(),
+                jsonl_progress,
+                config,
             )?;
             print_extract_summary(&summary, json)?;
         }
@@ -677,41 +706,45 @@ fn main() -> Result<()> {
             account,
             message_db_dir,
             archive,
+            app_db,
             dry_run,
             json,
             jsonl_progress,
         } => {
-            let summary = extract_message_db_files_with_task(
-                MessageDbExtractConfig {
-                    account_dir: account,
-                    message_db_dir,
-                    archive_dir: archive,
-                    dry_run,
-                    dat_options: DatDecodeOptions::default(),
-                    explain_unsupported: false,
-                },
-                task_options(jsonl_progress),
-            )?;
+            let config = MessageDbExtractConfig {
+                account_dir: account,
+                message_db_dir,
+                archive_dir: archive,
+                dry_run,
+                dat_options: DatDecodeOptions::default(),
+                explain_unsupported: false,
+            };
+            let summary =
+                run_message_db_extract(MediaType::File, app_db.as_deref(), jsonl_progress, config)?;
             print_extract_summary(&summary, json)?;
         }
         Commands::ExtractDbVoices {
             account,
             message_db_dir,
             archive,
+            app_db,
             dry_run,
             json,
             jsonl_progress,
         } => {
-            let summary = extract_message_db_voices_with_task(
-                MessageDbExtractConfig {
-                    account_dir: account,
-                    message_db_dir,
-                    archive_dir: archive,
-                    dry_run,
-                    dat_options: DatDecodeOptions::default(),
-                    explain_unsupported: false,
-                },
-                task_options(jsonl_progress),
+            let config = MessageDbExtractConfig {
+                account_dir: account,
+                message_db_dir,
+                archive_dir: archive,
+                dry_run,
+                dat_options: DatDecodeOptions::default(),
+                explain_unsupported: false,
+            };
+            let summary = run_message_db_extract(
+                MediaType::Voice,
+                app_db.as_deref(),
+                jsonl_progress,
+                config,
             )?;
             print_extract_summary(&summary, json)?;
         }
@@ -845,24 +878,15 @@ fn run_task_retry(args: TasksRetryArgs) -> Result<TaskRetryRun> {
     let runner = TaskRunner::with_store(Arc::clone(&store));
     let handle = spawn_retry_task(&runner, task_name, metadata, &candidate)?;
     let retry_task_id = handle.task_id().to_string();
-    let snapshot = handle.join();
+    let summary = wait_for_task_result(handle, false)?;
     let retry_run = TaskRetryRun {
         source_task_id: candidate.source_task_id,
         retry_task_id,
         task_kind: candidate.task_kind,
-        status: snapshot.status.clone(),
-        result_summary: snapshot.result,
-        error: snapshot.error,
+        status: TaskStatus::Completed,
+        result_summary: Some(summary),
+        error: None,
     };
-
-    if retry_run.status != TaskStatus::Completed {
-        anyhow::bail!(
-            "retry task {} ended with {:?}: {}",
-            retry_run.retry_task_id,
-            retry_run.status,
-            retry_run.error.as_deref().unwrap_or("unknown error")
-        );
-    }
 
     Ok(retry_run)
 }
@@ -915,6 +939,38 @@ fn spawn_retry_task(
                 }),
             )
         }
+        "extract_db_images" => {
+            let config = retry_message_db_image_config(candidate)?;
+            Ok(
+                runner.spawn_with_metadata(task_name, metadata, move |options| {
+                    extract_message_db_images_with_task(config, options)
+                }),
+            )
+        }
+        "extract_db_videos" => {
+            let config = retry_message_db_direct_config(candidate)?;
+            Ok(
+                runner.spawn_with_metadata(task_name, metadata, move |options| {
+                    extract_message_db_videos_with_task(config, options)
+                }),
+            )
+        }
+        "extract_db_files" => {
+            let config = retry_message_db_direct_config(candidate)?;
+            Ok(
+                runner.spawn_with_metadata(task_name, metadata, move |options| {
+                    extract_message_db_files_with_task(config, options)
+                }),
+            )
+        }
+        "extract_db_voices" => {
+            let config = retry_message_db_direct_config(candidate)?;
+            Ok(
+                runner.spawn_with_metadata(task_name, metadata, move |options| {
+                    extract_message_db_voices_with_task(config, options)
+                }),
+            )
+        }
         other => anyhow::bail!("unsupported retry task_kind: {other}"),
     }
 }
@@ -933,15 +989,6 @@ fn retry_direct_archive_config(candidate: &TaskRetryCandidate) -> Result<Archive
 
 fn retry_image_archive_config(candidate: &TaskRetryCandidate) -> Result<ArchiveConfig> {
     let (source_dir, archive_dir) = retry_dirs(candidate)?;
-    let params = retry_params_object(candidate)?;
-    let image_aes_key_provided = retry_required_bool_param(params, "image_aes_key_provided")?;
-    anyhow::ensure!(
-        !image_aes_key_provided,
-        "retry will not restore image AES key; rerun extract-images manually with --image-aes-key"
-    );
-    let image_xor_key = retry_required_u8_param(params, "image_xor_key")?;
-    let wxgf_mode = retry_required_wxgf_mode_param(params, "wxgf_mode")?;
-    let wxgf_ffmpeg_path = retry_optional_path_param(params, "wxgf_ffmpeg_path")?;
     let explain_unsupported =
         retry_optional_bool_param(candidate, "explain_unsupported")?.unwrap_or(false);
 
@@ -949,14 +996,57 @@ fn retry_image_archive_config(candidate: &TaskRetryCandidate) -> Result<ArchiveC
         source_dir,
         archive_dir,
         dry_run: candidate.dry_run,
-        dat_options: DatDecodeOptions {
-            image_aes_key: None,
-            image_xor_key,
-            wxgf_mode,
-            wxgf_ffmpeg_path,
-        },
+        dat_options: retry_dat_decode_options(candidate)?,
         explain_unsupported,
     })
+}
+
+fn retry_message_db_direct_config(
+    candidate: &TaskRetryCandidate,
+) -> Result<MessageDbExtractConfig> {
+    let (account_dir, archive_dir) = retry_dirs(candidate)?;
+    Ok(MessageDbExtractConfig {
+        account_dir,
+        message_db_dir: retry_message_db_dir(candidate)?,
+        archive_dir,
+        dry_run: candidate.dry_run,
+        dat_options: DatDecodeOptions::default(),
+        explain_unsupported: retry_optional_bool_param(candidate, "explain_unsupported")?
+            .unwrap_or(false),
+    })
+}
+
+fn retry_message_db_image_config(candidate: &TaskRetryCandidate) -> Result<MessageDbExtractConfig> {
+    let (account_dir, archive_dir) = retry_dirs(candidate)?;
+    Ok(MessageDbExtractConfig {
+        account_dir,
+        message_db_dir: retry_message_db_dir(candidate)?,
+        archive_dir,
+        dry_run: candidate.dry_run,
+        dat_options: retry_dat_decode_options(candidate)?,
+        explain_unsupported: retry_optional_bool_param(candidate, "explain_unsupported")?
+            .unwrap_or(false),
+    })
+}
+
+fn retry_dat_decode_options(candidate: &TaskRetryCandidate) -> Result<DatDecodeOptions> {
+    let params = retry_params_object(candidate)?;
+    let image_aes_key_provided = retry_required_bool_param(params, "image_aes_key_provided")?;
+    anyhow::ensure!(
+        !image_aes_key_provided,
+        "retry will not restore image AES key; rerun the extract command manually with --image-aes-key"
+    );
+    Ok(DatDecodeOptions {
+        image_aes_key: None,
+        image_xor_key: retry_required_u8_param(params, "image_xor_key")?,
+        wxgf_mode: retry_required_wxgf_mode_param(params, "wxgf_mode")?,
+        wxgf_ffmpeg_path: retry_optional_path_param(params, "wxgf_ffmpeg_path")?,
+    })
+}
+
+fn retry_message_db_dir(candidate: &TaskRetryCandidate) -> Result<Option<PathBuf>> {
+    let params = retry_params_object(candidate)?;
+    retry_optional_path_param(params, "message_db_dir")
 }
 
 fn retry_dirs(candidate: &TaskRetryCandidate) -> Result<(PathBuf, PathBuf)> {
@@ -1097,30 +1187,275 @@ fn media_type_name(media_type: MediaType) -> &'static str {
     }
 }
 
+fn direct_task_kind(media_type: MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "extract_images",
+        MediaType::Video => "extract_videos",
+        MediaType::File => "extract_files",
+        MediaType::Voice => "extract_voices",
+    }
+}
+
+fn message_db_task_kind(media_type: MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "extract_db_images",
+        MediaType::Video => "extract_db_videos",
+        MediaType::File => "extract_db_files",
+        MediaType::Voice => "extract_db_voices",
+    }
+}
+
+fn direct_task_name(media_type: MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "抽取图片",
+        MediaType::Video => "抽取视频",
+        MediaType::File => "抽取文件",
+        MediaType::Voice => "抽取语音",
+    }
+}
+
+fn message_db_task_name(media_type: MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "消息库抽取图片",
+        MediaType::Video => "消息库抽取视频",
+        MediaType::File => "消息库抽取文件",
+        MediaType::Voice => "消息库抽取语音",
+    }
+}
+
+fn run_archive_extract(
+    media_type: MediaType,
+    app_db: Option<&Path>,
+    jsonl_progress: bool,
+    config: ArchiveConfig,
+) -> Result<ExtractSummary> {
+    let metadata = archive_extract_metadata(media_type, &config);
+    run_extract_with_optional_store(
+        app_db,
+        direct_task_name(media_type),
+        metadata,
+        jsonl_progress,
+        move |options| match media_type {
+            MediaType::Image => extract_images_with_task(config, options),
+            MediaType::Video => extract_videos_with_task(config, options),
+            MediaType::File => extract_files_with_task(config, options),
+            MediaType::Voice => extract_voices_with_task(config, options),
+        },
+    )
+}
+
+fn run_message_db_extract(
+    media_type: MediaType,
+    app_db: Option<&Path>,
+    jsonl_progress: bool,
+    config: MessageDbExtractConfig,
+) -> Result<ExtractSummary> {
+    let metadata = message_db_extract_metadata(media_type, &config);
+    run_extract_with_optional_store(
+        app_db,
+        message_db_task_name(media_type),
+        metadata,
+        jsonl_progress,
+        move |options| match media_type {
+            MediaType::Image => extract_message_db_images_with_task(config, options),
+            MediaType::Video => extract_message_db_videos_with_task(config, options),
+            MediaType::File => extract_message_db_files_with_task(config, options),
+            MediaType::Voice => extract_message_db_voices_with_task(config, options),
+        },
+    )
+}
+
+fn run_extract_with_optional_store(
+    app_db: Option<&Path>,
+    task_name: &str,
+    metadata: TaskMetadata,
+    jsonl_progress: bool,
+    job: impl FnOnce(TaskOptions) -> wechat_archiver_core::Result<ExtractSummary> + Send + 'static,
+) -> Result<ExtractSummary> {
+    let Some(app_db) = app_db else {
+        return Ok(job(task_options(jsonl_progress))?);
+    };
+
+    let store = Arc::new(open_task_store_writable(app_db)?);
+    let runner = TaskRunner::with_store(store);
+    let handle = runner.spawn_with_metadata(task_name.to_string(), metadata, job);
+    wait_for_task_result(handle, jsonl_progress)
+}
+
+fn wait_for_task_result(handle: TaskHandle, jsonl_progress: bool) -> Result<ExtractSummary> {
+    loop {
+        drain_task_events(&handle, jsonl_progress);
+        let snapshot = handle.snapshot();
+        if snapshot.status.is_terminal() {
+            drain_task_events(&handle, jsonl_progress);
+            return match snapshot.status {
+                TaskStatus::Completed => snapshot
+                    .result
+                    .context("completed task missing result summary"),
+                TaskStatus::Failed | TaskStatus::Cancelled => {
+                    anyhow::bail!(
+                        "task {} ended with {:?}: {}",
+                        snapshot.task_id,
+                        snapshot.status,
+                        snapshot.error.as_deref().unwrap_or("unknown error")
+                    )
+                }
+                TaskStatus::Queued | TaskStatus::Running => unreachable!("terminal status checked"),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn drain_task_events(handle: &TaskHandle, jsonl_progress: bool) {
+    for event in handle.drain_events() {
+        if jsonl_progress {
+            emit_jsonl_progress_event(&event);
+        }
+    }
+}
+
+fn archive_extract_metadata(media_type: MediaType, config: &ArchiveConfig) -> TaskMetadata {
+    let task_kind = direct_task_kind(media_type);
+    TaskMetadata::new(task_kind)
+        .with_source_dir(config.source_dir.clone())
+        .with_archive_dir(config.archive_dir.clone())
+        .with_dry_run(config.dry_run)
+        .with_params_summary_json(archive_extract_params(task_kind, media_type, config))
+}
+
+fn message_db_extract_metadata(
+    media_type: MediaType,
+    config: &MessageDbExtractConfig,
+) -> TaskMetadata {
+    let task_kind = message_db_task_kind(media_type);
+    TaskMetadata::new(task_kind)
+        .with_source_dir(config.account_dir.clone())
+        .with_archive_dir(config.archive_dir.clone())
+        .with_dry_run(config.dry_run)
+        .with_params_summary_json(message_db_extract_params(task_kind, media_type, config))
+}
+
+fn archive_extract_params(
+    task_kind: &str,
+    media_type: MediaType,
+    config: &ArchiveConfig,
+) -> JsonValue {
+    let mut params = common_extract_params(task_kind, media_type, config.dry_run);
+    params.insert(
+        "explain_unsupported".to_string(),
+        JsonValue::Bool(config.explain_unsupported),
+    );
+    if media_type == MediaType::Image {
+        insert_dat_decode_params(&mut params, &config.dat_options);
+    }
+    JsonValue::Object(params)
+}
+
+fn message_db_extract_params(
+    task_kind: &str,
+    media_type: MediaType,
+    config: &MessageDbExtractConfig,
+) -> JsonValue {
+    let mut params = common_extract_params(task_kind, media_type, config.dry_run);
+    params.insert(
+        "message_db_dir".to_string(),
+        optional_path_json(config.message_db_dir.as_ref()),
+    );
+    params.insert(
+        "explain_unsupported".to_string(),
+        JsonValue::Bool(config.explain_unsupported),
+    );
+    if media_type == MediaType::Image {
+        insert_dat_decode_params(&mut params, &config.dat_options);
+    }
+    JsonValue::Object(params)
+}
+
+fn common_extract_params(
+    task_kind: &str,
+    media_type: MediaType,
+    dry_run: bool,
+) -> JsonMap<String, JsonValue> {
+    let mut params = JsonMap::new();
+    params.insert(
+        "task_kind".to_string(),
+        JsonValue::String(task_kind.to_string()),
+    );
+    params.insert(
+        "media_types".to_string(),
+        JsonValue::Array(vec![JsonValue::String(
+            media_type_name(media_type).to_string(),
+        )]),
+    );
+    params.insert("dry_run".to_string(), JsonValue::Bool(dry_run));
+    params
+}
+
+fn insert_dat_decode_params(params: &mut JsonMap<String, JsonValue>, options: &DatDecodeOptions) {
+    params.insert(
+        "image_aes_key_provided".to_string(),
+        JsonValue::Bool(options.image_aes_key.is_some()),
+    );
+    params.insert(
+        "image_xor_key".to_string(),
+        JsonValue::Number(serde_json::Number::from(options.image_xor_key)),
+    );
+    params.insert(
+        "wxgf_mode".to_string(),
+        JsonValue::String(core_wxgf_mode_name(options.wxgf_mode).to_string()),
+    );
+    params.insert(
+        "wxgf_ffmpeg_path".to_string(),
+        optional_path_json(options.wxgf_ffmpeg_path.as_ref()),
+    );
+}
+
+fn optional_path_json(path: Option<&PathBuf>) -> JsonValue {
+    path.map(|path| JsonValue::String(path.to_string_lossy().to_string()))
+        .unwrap_or(JsonValue::Null)
+}
+
+fn core_wxgf_mode_name(mode: CoreWxgfMode) -> &'static str {
+    match mode {
+        CoreWxgfMode::Off => "off",
+        CoreWxgfMode::Raw => "raw",
+        CoreWxgfMode::Jpg => "jpg",
+        CoreWxgfMode::Mp4 => "mp4",
+    }
+}
+
 fn run_image_extract(args: ImageExtractArgs) -> Result<ExtractSummary> {
+    let app_db = args.app_db.clone();
     let jsonl_progress = args.jsonl_progress;
-    Ok(extract_images_with_task(
-        image_archive_config_from_args(args)?,
-        task_options(jsonl_progress),
-    )?)
+    let config = image_archive_config_from_args(args)?;
+    run_archive_extract(MediaType::Image, app_db.as_deref(), jsonl_progress, config)
 }
 
 fn run_extract(media_type: MediaType, args: ImageExtractArgs) -> Result<ExtractSummary> {
+    let app_db = args.app_db.clone();
     let jsonl_progress = args.jsonl_progress;
+    let app_db = app_db.as_deref();
     match media_type {
         MediaType::Image => run_image_extract(args),
-        MediaType::Video => Ok(extract_videos_with_task(
+        MediaType::Video => run_archive_extract(
+            MediaType::Video,
+            app_db,
+            jsonl_progress,
             direct_media_archive_config_from_args(args),
-            task_options(jsonl_progress),
-        )?),
-        MediaType::File => Ok(extract_files_with_task(
+        ),
+        MediaType::File => run_archive_extract(
+            MediaType::File,
+            app_db,
+            jsonl_progress,
             direct_media_archive_config_from_args(args),
-            task_options(jsonl_progress),
-        )?),
-        MediaType::Voice => Ok(extract_voices_with_task(
+        ),
+        MediaType::Voice => run_archive_extract(
+            MediaType::Voice,
+            app_db,
+            jsonl_progress,
             direct_media_archive_config_from_args(args),
-            task_options(jsonl_progress),
-        )?),
+        ),
     }
 }
 
@@ -1170,14 +1505,18 @@ fn task_options(jsonl_progress: bool) -> TaskOptions {
     }
 
     TaskOptions::new().with_reporter(TaskReporter::new(|event| {
-        match serde_json::to_string(&event) {
-            Ok(line) => eprintln!("{line}"),
-            Err(error) => eprintln!(
-                "{{\"kind\":\"progress_serialization_failed\",\"error\":{}}}",
-                serde_json::to_string(&error.to_string()).unwrap_or_else(|_| "\"unknown\"".into())
-            ),
-        }
+        emit_jsonl_progress_event(&event);
     }))
+}
+
+fn emit_jsonl_progress_event(event: &TaskEvent) {
+    match serde_json::to_string(event) {
+        Ok(line) => eprintln!("{line}"),
+        Err(error) => eprintln!(
+            "{{\"kind\":\"progress_serialization_failed\",\"error\":{}}}",
+            serde_json::to_string(&error.to_string()).unwrap_or_else(|_| "\"unknown\"".into())
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1999,6 +2338,8 @@ mod tests {
             "/tmp/wechat-source",
             "--archive",
             "/tmp/wechat-archive",
+            "--app-db",
+            "/tmp/app.sqlite",
             "--dry-run",
             "--json",
             "--jsonl-progress",
@@ -2010,6 +2351,7 @@ mod tests {
                 assert_eq!(media_types, vec![MediaType::Image]);
                 assert_eq!(args.source, PathBuf::from("/tmp/wechat-source"));
                 assert_eq!(args.archive, PathBuf::from("/tmp/wechat-archive"));
+                assert_eq!(args.app_db, Some(PathBuf::from("/tmp/app.sqlite")));
                 assert!(args.dry_run);
                 assert!(args.json);
                 assert!(args.jsonl_progress);
@@ -2551,6 +2893,118 @@ mod tests {
     }
 
     #[test]
+    fn extract_with_app_db_records_completed_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("app.sqlite");
+        SqliteTaskStore::open(&app_db).unwrap();
+        let source_dir = tmp.path().join("wechat-source");
+        let archive_dir = tmp.path().join("archive");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::write(source_dir.join("image.jpg"), b"fake jpg").unwrap();
+
+        let summary = run_image_extract(ImageExtractArgs {
+            source: source_dir.clone(),
+            archive: archive_dir.clone(),
+            app_db: Some(app_db.clone()),
+            dry_run: true,
+            image_aes_key: None,
+            image_xor_key: "0x88".to_string(),
+            wxgf_mode: WxgfMode::Off,
+            wxgf_ffmpeg_path: None,
+            json: true,
+            jsonl_progress: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.candidates, 1);
+        assert!(!archive_dir.exists());
+
+        let store = SqliteTaskStore::open_readonly(&app_db).unwrap();
+        let records = store.list_tasks(&TaskListQuery::default()).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.status, PersistentTaskStatus::Completed);
+        assert_eq!(record.task_name, "抽取图片");
+        assert_eq!(record.task_kind, "extract_images");
+        assert_eq!(record.source_dir.as_deref(), Some(source_dir.as_path()));
+        assert_eq!(record.archive_dir.as_deref(), Some(archive_dir.as_path()));
+        assert_eq!(record.params_summary_json["task_kind"], "extract_images");
+        assert_eq!(record.params_summary_json["media_types"][0], "image");
+        assert_eq!(record.params_summary_json["image_aes_key_provided"], false);
+        assert_eq!(record.params_summary_json["image_xor_key"], 136);
+        assert_eq!(record.params_summary_json["wxgf_mode"], "off");
+        assert_eq!(record.progress.scanned_files, 1);
+        assert_eq!(record.progress.candidates, 1);
+    }
+
+    #[test]
+    fn extract_with_missing_app_db_does_not_create_app_db_or_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("missing.sqlite");
+        let source_dir = tmp.path().join("wechat-source");
+        let archive_dir = tmp.path().join("archive");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::write(source_dir.join("image.jpg"), b"fake jpg").unwrap();
+
+        let result = run_image_extract(ImageExtractArgs {
+            source: source_dir,
+            archive: archive_dir.clone(),
+            app_db: Some(app_db.clone()),
+            dry_run: false,
+            image_aes_key: None,
+            image_xor_key: "0x88".to_string(),
+            wxgf_mode: WxgfMode::Off,
+            wxgf_ffmpeg_path: None,
+            json: true,
+            jsonl_progress: false,
+        });
+
+        assert!(result.is_err());
+        assert!(!app_db.exists());
+        assert!(!archive_dir.exists());
+    }
+
+    #[test]
+    fn extract_with_app_db_does_not_store_plain_aes_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_db = tmp.path().join("app.sqlite");
+        SqliteTaskStore::open(&app_db).unwrap();
+        let source_dir = tmp.path().join("wechat-source");
+        let archive_dir = tmp.path().join("archive");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::write(source_dir.join("image.jpg"), b"fake jpg").unwrap();
+        let plain_key = "plain-secret-aes-key";
+
+        run_image_extract(ImageExtractArgs {
+            source: source_dir,
+            archive: archive_dir,
+            app_db: Some(app_db.clone()),
+            dry_run: true,
+            image_aes_key: Some(plain_key.to_string()),
+            image_xor_key: "0x88".to_string(),
+            wxgf_mode: WxgfMode::Off,
+            wxgf_ffmpeg_path: None,
+            json: true,
+            jsonl_progress: false,
+        })
+        .unwrap();
+
+        let store = SqliteTaskStore::open_readonly(&app_db).unwrap();
+        let records = store.list_tasks(&TaskListQuery::default()).unwrap();
+        let record = &records[0];
+        let params = record.params_summary_json.to_string();
+        assert_eq!(record.params_summary_json["image_aes_key_provided"], true);
+        assert!(!params.contains(plain_key));
+
+        let candidate = store.retry_candidate(&record.task_id).unwrap().unwrap();
+        assert!(!candidate.retryable);
+        assert!(candidate
+            .reasons
+            .contains(&"params_summary_requires_image_aes_key".to_string()));
+    }
+
+    #[test]
     fn parses_extract_db_videos_command() {
         let cli = Cli::try_parse_from([
             "wechat-archiver",
@@ -2561,6 +3015,8 @@ mod tests {
             "/tmp/decrypted-message",
             "--archive",
             "/tmp/wechat-archive",
+            "--app-db",
+            "/tmp/app.sqlite",
             "--dry-run",
             "--json",
             "--jsonl-progress",
@@ -2572,6 +3028,7 @@ mod tests {
                 account,
                 message_db_dir,
                 archive,
+                app_db,
                 dry_run,
                 json,
                 jsonl_progress,
@@ -2582,6 +3039,7 @@ mod tests {
                     Some(PathBuf::from("/tmp/decrypted-message"))
                 );
                 assert_eq!(archive, PathBuf::from("/tmp/wechat-archive"));
+                assert_eq!(app_db, Some(PathBuf::from("/tmp/app.sqlite")));
                 assert!(dry_run);
                 assert!(json);
                 assert!(jsonl_progress);
@@ -2609,6 +3067,7 @@ mod tests {
                 account,
                 message_db_dir,
                 archive,
+                app_db,
                 dry_run,
                 json,
                 jsonl_progress,
@@ -2616,6 +3075,7 @@ mod tests {
                 assert_eq!(account, PathBuf::from("/tmp/xwechat_files/wxid"));
                 assert_eq!(message_db_dir, None);
                 assert_eq!(archive, PathBuf::from("/tmp/wechat-archive"));
+                assert_eq!(app_db, None);
                 assert!(dry_run);
                 assert!(json);
                 assert!(!jsonl_progress);
@@ -2645,6 +3105,7 @@ mod tests {
                 account,
                 message_db_dir,
                 archive,
+                app_db,
                 dry_run,
                 json,
                 jsonl_progress,
@@ -2655,6 +3116,7 @@ mod tests {
                     Some(PathBuf::from("/tmp/decrypted-message"))
                 );
                 assert_eq!(archive, PathBuf::from("/tmp/wechat-archive"));
+                assert_eq!(app_db, None);
                 assert!(dry_run);
                 assert!(json);
                 assert!(!jsonl_progress);
@@ -2704,6 +3166,7 @@ mod tests {
             ImageExtractArgs {
                 source,
                 archive: archive.clone(),
+                app_db: None,
                 dry_run: true,
                 image_aes_key: None,
                 image_xor_key: "0x88".to_string(),

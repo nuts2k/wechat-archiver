@@ -669,6 +669,8 @@ fn task_retry_candidate_from_record(record: &TaskRecord) -> TaskRetryCandidate {
 
     if record.task_kind.trim().is_empty() {
         reasons.push("missing_task_kind".to_string());
+    } else if !is_supported_retry_task_kind(&record.task_kind) {
+        reasons.push("unsupported_retry_task_kind".to_string());
     }
 
     if record.source_dir.is_none() {
@@ -716,16 +718,32 @@ fn retry_params_summary(record: &TaskRecord, reasons: &mut Vec<String>) -> Optio
         _ => reasons.push("params_summary_missing_task_kind".to_string()),
     }
 
-    if record.task_kind == "extract_images"
-        && params
-            .get("image_aes_key_provided")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false)
+    if matches!(
+        record.task_kind.as_str(),
+        "extract_images" | "extract_db_images"
+    ) && params
+        .get("image_aes_key_provided")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
     {
         reasons.push("params_summary_requires_image_aes_key".to_string());
     }
 
     Some(record.params_summary_json.clone())
+}
+
+fn is_supported_retry_task_kind(task_kind: &str) -> bool {
+    matches!(
+        task_kind,
+        "extract_images"
+            | "extract_videos"
+            | "extract_files"
+            | "extract_voices"
+            | "extract_db_images"
+            | "extract_db_videos"
+            | "extract_db_files"
+            | "extract_db_voices"
+    )
 }
 
 fn find_sensitive_param_key(value: &JsonValue) -> Option<String> {
@@ -1218,6 +1236,32 @@ mod tests {
             .contains(&"params_summary_requires_image_aes_key".to_string()));
         assert!(format!("{candidate:?}").contains("image_aes_key_sha256"));
         assert!(!format!("{candidate:?}").contains("plain-secret-aes-key"));
+    }
+
+    #[test]
+    fn retry_candidate_rejects_unsupported_task_kind() {
+        let store = SqliteTaskStore::open_in_memory().unwrap();
+        store
+            .create_task(&TaskCreate {
+                task_id: "unknown-kind".to_string(),
+                task_name: "未知任务".to_string(),
+                task_kind: "unknown_task".to_string(),
+                archive_dir: Some(PathBuf::from("/tmp/archive")),
+                source_dir: Some(PathBuf::from("/tmp/source")),
+                dry_run: false,
+                params_summary_json: json!({
+                    "task_kind": "unknown_task"
+                }),
+            })
+            .unwrap();
+        store.mark_failed("unknown-kind", "失败").unwrap();
+
+        let candidate = store.retry_candidate("unknown-kind").unwrap().unwrap();
+
+        assert!(!candidate.retryable);
+        assert!(candidate
+            .reasons
+            .contains(&"unsupported_retry_task_kind".to_string()));
     }
 
     #[test]
